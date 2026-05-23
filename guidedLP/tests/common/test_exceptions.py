@@ -9,7 +9,7 @@ and contextual information handling.
 import pytest
 from typing import Dict, Any
 
-from src.common.exceptions import (
+from guidedLP.common.exceptions import (
     NetworkAnalysisError,
     ValidationError,
     GraphConstructionError,

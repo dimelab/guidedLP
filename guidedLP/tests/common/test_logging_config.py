@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 from io import StringIO
 
-from src.common.logging_config import (
+from guidedLP.common.logging_config import (
     setup_logging,
     get_logger,
     configure_external_library_logging,
@@ -476,7 +476,7 @@ class TestLoggingTimer:
         """Test basic timer usage."""
         setup_logging(performance_logging=True, console=False, force_setup=True)
         
-        with patch('src.common.logging_config.log_performance_metric') as mock_log:
+        with patch('guidedLP.common.logging_config.log_performance_metric') as mock_log:
             with LoggingTimer("test_operation"):
                 time.sleep(0.01)  # Small delay
             
@@ -492,7 +492,7 @@ class TestLoggingTimer:
         
         details = {"nodes": 1000, "algorithm": "test"}
         
-        with patch('src.common.logging_config.log_performance_metric') as mock_log:
+        with patch('guidedLP.common.logging_config.log_performance_metric') as mock_log:
             with LoggingTimer("detailed_operation", details):
                 time.sleep(0.01)
             
@@ -506,7 +506,7 @@ class TestLoggingTimer:
         """Test that timer still logs even if exception occurs."""
         setup_logging(performance_logging=True, console=False, force_setup=True)
         
-        with patch('src.common.logging_config.log_performance_metric') as mock_log:
+        with patch('guidedLP.common.logging_config.log_performance_metric') as mock_log:
             with pytest.raises(ValueError):
                 with LoggingTimer("error_operation"):
                     raise ValueError("Test error")

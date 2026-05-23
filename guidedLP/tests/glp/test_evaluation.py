@@ -13,7 +13,7 @@ import numpy as np
 import polars as pl
 from unittest.mock import patch
 
-from src.glp.evaluation import (
+from guidedLP.glp.evaluation import (
     analyze_label_distribution,
     compare_directional_results,
     _validate_predictions_dataframe,
@@ -32,7 +32,7 @@ from src.glp.evaluation import (
     _calculate_probability_differences
 )
 
-from src.common.exceptions import ValidationError
+from guidedLP.common.exceptions import ValidationError
 
 
 class TestAnalyzeLabelDistribution:

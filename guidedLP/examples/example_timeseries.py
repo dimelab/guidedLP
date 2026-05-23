@@ -26,9 +26,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import polars as pl
 import numpy as np
-from src.timeseries.slicing import create_temporal_slices, align_node_ids_across_slices
-from src.timeseries.temporal_metrics import extract_temporal_metrics, calculate_temporal_statistics
-from src.timeseries.category_analysis import (
+from guidedLP.timeseries.slicing import create_temporal_slices, align_node_ids_across_slices
+from guidedLP.timeseries.temporal_metrics import extract_temporal_metrics, calculate_temporal_statistics
+from guidedLP.timeseries.category_analysis import (
     analyze_cross_category_connections, 
     calculate_category_segregation_index,
     analyze_category_centrality_by_time

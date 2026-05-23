@@ -17,22 +17,22 @@ import polars as pl
 import networkit as nk
 
 # Network construction and analysis
-from src.network.construction import build_graph_from_edgelist
-from src.network.analysis import extract_centrality
-from src.network.export import export_graph
+from guidedLP.network.construction import build_graph_from_edgelist
+from guidedLP.network.analysis import extract_centrality
+from guidedLP.network.export import export_graph
 
 # Guided Label Propagation
-from src.glp.propagation import guided_label_propagation
-from src.glp.validation import train_test_split_validation, get_validation_summary
-from src.glp.evaluation import analyze_label_distribution
+from guidedLP.glp.propagation import guided_label_propagation
+from guidedLP.glp.validation import train_test_split_validation, get_validation_summary
+from guidedLP.glp.evaluation import analyze_label_distribution
 
 # Timeseries analysis
-from src.timeseries.slicing import create_temporal_slices, align_node_ids_across_slices
-from src.timeseries.temporal_metrics import extract_temporal_metrics, calculate_temporal_statistics
-from src.timeseries.category_analysis import analyze_cross_category_connections
+from guidedLP.timeseries.slicing import create_temporal_slices, align_node_ids_across_slices
+from guidedLP.timeseries.temporal_metrics import extract_temporal_metrics, calculate_temporal_statistics
+from guidedLP.timeseries.category_analysis import analyze_cross_category_connections
 
 # Common utilities
-from src.common.id_mapper import IDMapper
+from guidedLP.common.id_mapper import IDMapper
 
 
 class TestIntegrationWorkflows:
@@ -561,7 +561,7 @@ class TestIntegrationErrorHandling:
         empty_edgelist.write_text("source,target,weight\n")  # Header only
         
         # Empty edge lists should raise ValidationError
-        from src.common.exceptions import ValidationError
+        from guidedLP.common.exceptions import ValidationError
         with pytest.raises(ValidationError, match="DataFrame is empty"):
             build_graph_from_edgelist(str(empty_edgelist))
     

@@ -16,7 +16,7 @@ import warnings
 import polars as pl
 import networkit as nk
 
-from src.timeseries.slicing import (
+from guidedLP.timeseries.slicing import (
     create_temporal_slices,
     align_node_ids_across_slices,
     _validate_temporal_inputs,
@@ -30,8 +30,8 @@ from src.timeseries.slicing import (
     _get_window_start
 )
 
-from src.common.exceptions import ValidationError, DataFormatError, ConfigurationError
-from src.common.id_mapper import IDMapper
+from guidedLP.common.exceptions import ValidationError, DataFormatError, ConfigurationError
+from guidedLP.common.id_mapper import IDMapper
 
 
 class TestCreateTemporalSlices:
@@ -614,7 +614,7 @@ class TestCreateStandardSlices:
             datetime(2024, 1, 2, 23, 59, 59, 999999)
         ]
         
-        with patch('src.timeseries.slicing.build_graph_from_edgelist') as mock_build:
+        with patch('guidedLP.timeseries.slicing.build_graph_from_edgelist') as mock_build:
             mock_graph = MagicMock(spec=nk.Graph)
             mock_mapper = MagicMock(spec=IDMapper)
             mock_build.return_value = (mock_graph, mock_mapper)
@@ -649,7 +649,7 @@ class TestCreateCumulativeSlices:
             datetime(2024, 1, 3, 23, 59, 59, 999999)
         ]
         
-        with patch('src.timeseries.slicing.build_graph_from_edgelist') as mock_build:
+        with patch('guidedLP.timeseries.slicing.build_graph_from_edgelist') as mock_build:
             mock_graph = MagicMock(spec=nk.Graph)
             mock_mapper = MagicMock(spec=IDMapper)
             mock_build.return_value = (mock_graph, mock_mapper)

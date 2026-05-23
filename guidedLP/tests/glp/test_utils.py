@@ -14,7 +14,7 @@ import numpy as np
 import networkit as nk
 from unittest.mock import patch, MagicMock
 
-from src.glp.utils import (
+from guidedLP.glp.utils import (
     create_balanced_seed_set,
     suggest_alpha_value,
     get_seed_statistics,
@@ -28,7 +28,7 @@ from src.glp.utils import (
     _alpha_from_seed_ratio
 )
 
-from src.common.exceptions import ValidationError, ConfigurationError
+from guidedLP.common.exceptions import ValidationError, ConfigurationError
 
 
 class TestCreateBalancedSeedSet:
@@ -224,7 +224,7 @@ class TestSuggestAlphaValue:
         # Should still return valid alpha
         assert 0.1 <= alpha <= 0.99
     
-    @patch('src.glp.utils.nk.centrality.LocalClusteringCoefficient')
+    @patch('guidedLP.glp.utils.nk.centrality.LocalClusteringCoefficient')
     def test_network_structure_exception_handling(self, mock_clustering):
         """Test exception handling in network structure method."""
         # Mock clustering coefficient to raise exception

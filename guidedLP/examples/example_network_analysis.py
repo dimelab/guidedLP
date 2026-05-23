@@ -23,10 +23,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import polars as pl
 import numpy as np
-from src.network.construction import build_graph_from_edgelist
-from src.network.analysis import extract_centrality
-from src.network.communities import detect_communities
-from src.network.export import export_graph
+from guidedLP.network.construction import build_graph_from_edgelist
+from guidedLP.network.analysis import extract_centrality
+from guidedLP.network.communities import detect_communities
+from guidedLP.network.export import export_graph
 
 
 def main():

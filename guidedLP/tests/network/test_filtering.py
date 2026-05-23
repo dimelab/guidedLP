@@ -11,13 +11,13 @@ import networkit as nk
 import numpy as np
 from typing import Dict, Any, List, Tuple
 
-from src.network.filtering import (
+from guidedLP.network.filtering import (
     filter_graph,
     apply_backbone,
     get_backbone_statistics
 )
-from src.common.id_mapper import IDMapper
-from src.common.exceptions import ValidationError, ComputationError
+from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.exceptions import ValidationError, ComputationError
 
 
 class TestFilterGraph:

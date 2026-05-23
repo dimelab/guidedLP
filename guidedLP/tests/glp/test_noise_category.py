@@ -13,9 +13,9 @@ import polars as pl
 import numpy as np
 from typing import Dict, List, Any
 
-from src.network.construction import build_graph_from_edgelist
-from src.glp.propagation import guided_label_propagation, _process_noise_category, _generate_noise_seeds, _apply_confidence_threshold
-from src.common.exceptions import ValidationError, ConfigurationError
+from guidedLP.network.construction import build_graph_from_edgelist
+from guidedLP.glp.propagation import guided_label_propagation, _process_noise_category, _generate_noise_seeds, _apply_confidence_threshold
+from guidedLP.common.exceptions import ValidationError, ConfigurationError
 
 
 class TestNoiseCategoryFeatures:

@@ -11,13 +11,13 @@ import networkit as nk
 import numpy as np
 from typing import Dict, Any, List
 
-from src.network.analysis import (
+from guidedLP.network.analysis import (
     extract_centrality,
     get_centrality_summary,
     identify_central_nodes
 )
-from src.common.id_mapper import IDMapper
-from src.common.exceptions import ValidationError, ComputationError
+from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.exceptions import ValidationError, ComputationError
 
 
 class TestExtractCentrality:

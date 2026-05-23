@@ -12,7 +12,7 @@ import polars as pl
 import networkit as nk
 from typing import Dict, List, Tuple, Any
 
-from src.glp.propagation import (
+from guidedLP.glp.propagation import (
     guided_label_propagation,
     get_propagation_info,
     _validate_inputs,
@@ -23,8 +23,8 @@ from src.glp.propagation import (
     _create_results_dataframe,
     _iterative_propagation
 )
-from src.common.id_mapper import IDMapper
-from src.common.exceptions import (
+from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.exceptions import (
     ValidationError,
     ConfigurationError,
     ConvergenceError,

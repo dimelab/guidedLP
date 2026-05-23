@@ -17,7 +17,7 @@ import polars as pl
 import networkit as nk
 import numpy as np
 
-from src.timeseries.temporal_metrics import (
+from guidedLP.timeseries.temporal_metrics import (
     extract_temporal_metrics,
     calculate_temporal_statistics,
     _validate_temporal_metrics_inputs,
@@ -27,8 +27,8 @@ from src.timeseries.temporal_metrics import (
     _calculate_trend_slope
 )
 
-from src.common.exceptions import ValidationError, ConfigurationError
-from src.common.id_mapper import IDMapper
+from guidedLP.common.exceptions import ValidationError, ConfigurationError
+from guidedLP.common.id_mapper import IDMapper
 
 
 class TestExtractTemporalMetrics:
@@ -554,7 +554,7 @@ class TestHelperFunctions:
 class TestIntegrationWithMockedMetrics:
     """Test integration with mocked centrality calculations."""
     
-    @patch('src.timeseries.temporal_metrics.extract_centrality')
+    @patch('guidedLP.timeseries.temporal_metrics.extract_centrality')
     def test_extract_temporal_metrics_with_mock(self, mock_extract_centrality):
         """Test temporal metrics extraction with mocked centrality function."""
         # Setup mock return values

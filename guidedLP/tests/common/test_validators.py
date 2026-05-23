@@ -12,8 +12,8 @@ from datetime import datetime, timedelta
 import warnings
 from typing import Dict, Any
 
-from src.common.exceptions import ValidationError
-from src.common.validators import (
+from guidedLP.common.exceptions import ValidationError
+from guidedLP.common.validators import (
     validate_edgelist_dataframe,
     validate_timestamps,
     validate_seed_labels,

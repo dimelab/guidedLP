@@ -15,12 +15,12 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, Any, List
 
-from src.network.export import (
+from guidedLP.network.export import (
     export_graph,
     get_export_info
 )
-from src.common.id_mapper import IDMapper
-from src.common.exceptions import ValidationError, ComputationError
+from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.exceptions import ValidationError, ComputationError
 
 
 class TestExportGraph:

@@ -1116,7 +1116,7 @@ def temporal_bipartite_to_unipartite(
     Convert user-item temporal interactions to user-user influence network:
     
     >>> import polars as pl
-    >>> from src.network.construction import temporal_bipartite_to_unipartite
+    >>> from guidedLP.network.construction import temporal_bipartite_to_unipartite
     >>> 
     >>> # Sample temporal bipartite data: users interacting with items over time
     >>> data = pl.DataFrame({

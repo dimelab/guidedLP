@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Any
 
-from src.network.construction import (
+from guidedLP.network.construction import (
     build_graph_from_edgelist,
     project_bipartite,
     get_graph_info,
@@ -29,8 +29,8 @@ from src.network.construction import (
     _identify_bipartite_partitions,
     _calculate_projection_weight
 )
-from src.common.id_mapper import IDMapper
-from src.common.exceptions import (
+from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.exceptions import (
     GraphConstructionError,
     ValidationError,
     DataFormatError,

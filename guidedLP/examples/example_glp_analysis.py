@@ -25,11 +25,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import polars as pl
 import numpy as np
-from src.network.construction import build_graph_from_edgelist
-from src.glp.propagation import guided_label_propagation
-from src.glp.validation import train_test_split_validation, cross_validate
-from src.glp.evaluation import analyze_label_distribution
-from src.glp.utils import create_balanced_seed_set, get_seed_statistics
+from guidedLP.network.construction import build_graph_from_edgelist
+from guidedLP.glp.propagation import guided_label_propagation
+from guidedLP.glp.validation import train_test_split_validation, cross_validate
+from guidedLP.glp.evaluation import analyze_label_distribution
+from guidedLP.glp.utils import create_balanced_seed_set, get_seed_statistics
 
 # Optional imports for visualization
 try:

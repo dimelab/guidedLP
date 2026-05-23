@@ -12,7 +12,7 @@ import polars as pl
 import networkit as nk
 from typing import Dict, List, Any
 
-from src.glp.validation import (
+from guidedLP.glp.validation import (
     train_test_split_validation,
     external_validation,
     cross_validate,
@@ -26,8 +26,8 @@ from src.glp.validation import (
     _aggregate_cv_results,
     _count_labels
 )
-from src.common.id_mapper import IDMapper
-from src.common.exceptions import (
+from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.exceptions import (
     ValidationError,
     ConfigurationError,
     ComputationError

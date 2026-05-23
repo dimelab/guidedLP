@@ -11,13 +11,13 @@ import networkit as nk
 import numpy as np
 from typing import Dict, Any, List
 
-from src.network.communities import (
+from guidedLP.network.communities import (
     detect_communities,
     get_community_summary,
     identify_stable_communities
 )
-from src.common.id_mapper import IDMapper
-from src.common.exceptions import ValidationError, ComputationError
+from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.exceptions import ValidationError, ComputationError
 
 
 class TestDetectCommunities:

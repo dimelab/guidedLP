@@ -9,12 +9,12 @@ from unittest.mock import patch, MagicMock
 import polars as pl
 import networkit as nk
 
-from src.timeseries.category_analysis import (
+from guidedLP.timeseries.category_analysis import (
     analyze_cross_category_connections,
     calculate_category_segregation_index,
     analyze_category_centrality_by_time
 )
-from src.common.id_mapper import IDMapper
+from guidedLP.common.id_mapper import IDMapper
 
 
 class TestAnalyzeCrossCategoryConnections:
@@ -334,7 +334,7 @@ class TestAnalyzeCategoryCentralityByTime:
     @pytest.fixture
     def mock_extract_centrality(self):
         """Mock the extract_centrality function."""
-        with patch('src.network.analysis.extract_centrality') as mock:
+        with patch('guidedLP.network.analysis.extract_centrality') as mock:
             # Return sample centrality data
             mock.return_value = pl.DataFrame({
                 "node_id": ["A", "B", "C", "D"],
@@ -402,7 +402,7 @@ class TestAnalyzeCategoryCentralityByTime:
     
     def test_centrality_calculation_failure(self, sample_metadata):
         """Test handling when centrality calculation fails."""
-        with patch('src.network.analysis.extract_centrality') as mock:
+        with patch('guidedLP.network.analysis.extract_centrality') as mock:
             mock.side_effect = Exception("Centrality calculation failed")
             
             graph = nk.Graph(4, weighted=False, directed=False)

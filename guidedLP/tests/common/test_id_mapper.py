@@ -13,7 +13,7 @@ import pytest
 from typing import Any, List
 import uuid
 
-from src.common.id_mapper import IDMapper
+from guidedLP.common.id_mapper import IDMapper
 
 
 class TestIDMapperBasic:
