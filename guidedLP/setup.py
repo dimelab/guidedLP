@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""
-Setup script for guidedLP package.
+"""Setup script for the guidedLP package.
 
-This setup.py provides maximum compatibility across different pip/setuptools versions.
+Canonical install:
+    cd guidedLP
+    pip install -e .
 """
 
-from setuptools import setup, find_packages
 from pathlib import Path
 
-# Read README for long description
+from setuptools import find_packages, setup
+
 readme_path = Path(__file__).parent / "README.md"
 long_description = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
 
@@ -26,14 +27,15 @@ setup(
         "Repository": "https://github.com/alterPublics/guidedLP.git",
         "Issues": "https://github.com/alterPublics/guidedLP/issues",
     },
-    packages=find_packages(where="guidedLP/src"),
-    package_dir={"": "guidedLP/src"},
+    package_dir={"": "src"},
+    packages=find_packages(where="src"),
     python_requires=">=3.9",
     install_requires=[
         "networkit>=11.0",
         "polars>=0.20.0",
         "numpy>=1.24.0",
         "scipy>=1.10.0",
+        "scikit-learn>=1.3.0",
     ],
     extras_require={
         "dev": [
