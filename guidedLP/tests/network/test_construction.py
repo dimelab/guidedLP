@@ -629,6 +629,84 @@ class TestIntegrationScenarios:
         assert graph.weight(smith_id, jones_id) == 2.0
 
 
+class TestBipartiteSourceTargetSemantics:
+    """Regression tests for the source/target partition labelling bug.
+
+    Before the fix, `_identify_bipartite_partitions` used BFS coloring and
+    arbitrarily labelled "partition containing internal node 0" as the source
+    partition. Since `build_graph_from_edgelist` assigns internal IDs in
+    alphabetical order, that could put target-column nodes in the "source"
+    partition, causing `project_bipartite(projection_mode="source")` to
+    project onto the wrong side.
+    """
+
+    def test_construction_records_partitions_on_mapper(self):
+        edges = pl.DataFrame({
+            "user":    ["u1", "u1", "u2", "u3"],
+            "hashtag": ["#a", "#b", "#a", "#b"],
+        })
+        graph, mapper = build_graph_from_edgelist(
+            edges, source_col="user", target_col="hashtag", bipartite=True,
+        )
+        assert mapper.has_bipartite_partitions()
+        assert mapper.source_partition_originals == {"u1", "u2", "u3"}
+        assert mapper.target_partition_originals == {"#a", "#b"}
+
+    def test_no_partitions_recorded_when_not_bipartite(self):
+        edges = pl.DataFrame({"source": ["a", "b"], "target": ["b", "c"]})
+        graph, mapper = build_graph_from_edgelist(edges, bipartite=False)
+        assert not mapper.has_bipartite_partitions()
+
+    def test_projection_uses_source_column_when_alphabet_disagrees(self):
+        """Hashtags sort alphabetically BEFORE users; without the fix, BFS would
+        have called hashtags the 'source partition' and projection_mode='source'
+        would have returned hashtags instead of users."""
+        edges = pl.DataFrame({
+            "user":    ["u1", "u1", "u2", "u2", "u3"],
+            "hashtag": ["#a", "#b", "#a", "#c", "#b"],
+            "count":   [3,    1,    2,    5,    1],
+        })
+        bipartite_graph, full_mapper = build_graph_from_edgelist(
+            edges,
+            source_col="user", target_col="hashtag", weight_col="count",
+            bipartite=True,
+        )
+
+        # Sanity-check the alphabetical-ID-order condition that triggers the bug:
+        # node 0 should be a hashtag (alphabetically '#a' < 'u1').
+        assert full_mapper.get_original(0).startswith("#")
+
+        user_graph, user_mapper = project_bipartite(
+            bipartite_graph, full_mapper,
+            projection_mode="source", weight_method="jaccard",
+        )
+        projected_originals = {
+            user_mapper.get_original(i) for i in range(user_graph.numberOfNodes())
+        }
+        assert projected_originals == {"u1", "u2", "u3"}, (
+            f"projection_mode='source' should project onto users (the source "
+            f"column), got {projected_originals}"
+        )
+
+    def test_projection_target_mode_returns_target_column(self):
+        edges = pl.DataFrame({
+            "user":    ["u1", "u1", "u2", "u2", "u3"],
+            "hashtag": ["#a", "#b", "#a", "#c", "#b"],
+        })
+        bipartite_graph, full_mapper = build_graph_from_edgelist(
+            edges, source_col="user", target_col="hashtag", bipartite=True,
+        )
+        hashtag_graph, hashtag_mapper = project_bipartite(
+            bipartite_graph, full_mapper,
+            projection_mode="target", weight_method="count",
+        )
+        projected_originals = {
+            hashtag_mapper.get_original(i)
+            for i in range(hashtag_graph.numberOfNodes())
+        }
+        assert projected_originals == {"#a", "#b", "#c"}
+
+
 class TestBipartiteProjection:
     """Test bipartite graph projection functionality."""
     

@@ -520,6 +520,49 @@ class TestIDMapperUtilities:
         assert mapper.size() == len(test_cases)
 
 
+class TestIDMapperBipartitePartitions:
+    """Test the optional bipartite partition tracking."""
+
+    def test_defaults_to_no_partitions(self):
+        mapper = IDMapper()
+        assert mapper.source_partition_originals is None
+        assert mapper.target_partition_originals is None
+        assert mapper.has_bipartite_partitions() is False
+
+    def test_set_and_query(self):
+        mapper = IDMapper()
+        mapper.set_bipartite_partitions(["u1", "u2", "u3"], ["#a", "#b"])
+        assert mapper.has_bipartite_partitions() is True
+        assert mapper.source_partition_originals == {"u1", "u2", "u3"}
+        assert mapper.target_partition_originals == {"#a", "#b"}
+
+    def test_overlap_rejected(self):
+        """Cannot record overlapping partitions — graph would not be bipartite."""
+        mapper = IDMapper()
+        with pytest.raises(ValueError, match="not bipartite"):
+            mapper.set_bipartite_partitions(["u1", "shared"], ["#a", "shared"])
+
+    def test_roundtrip_through_to_dict(self):
+        mapper = IDMapper()
+        mapper.add_mapping("u1", 0)
+        mapper.add_mapping("#a", 1)
+        mapper.set_bipartite_partitions(["u1"], ["#a"])
+
+        restored = IDMapper.from_dict(mapper.to_dict())
+        assert restored.has_bipartite_partitions() is True
+        assert restored.source_partition_originals == {"u1"}
+        assert restored.target_partition_originals == {"#a"}
+
+    def test_dict_without_partitions_still_loads(self):
+        """Older serialized mappers (no partition keys) must still deserialize."""
+        mapper = IDMapper()
+        mapper.add_mapping("u1", 0)
+        legacy_dict = mapper.to_dict()
+        assert "source_partition_originals" not in legacy_dict
+        restored = IDMapper.from_dict(legacy_dict)
+        assert restored.has_bipartite_partitions() is False
+
+
 class TestIDMapperTypeHints:
     """Test type checking and hint validation."""
     

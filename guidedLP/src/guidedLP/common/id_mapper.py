@@ -6,7 +6,7 @@ and internal NetworkIt integer IDs (0, 1, 2, ...). This is critical because Netw
 requires consecutive integer node IDs, but input data uses arbitrary identifiers.
 """
 
-from typing import Any, Dict, List, Union, Optional, TypeVar
+from typing import Any, Dict, Iterable, List, Optional, Set, TypeVar, Union
 import warnings
 
 # Type variable for original ID types
@@ -48,6 +48,14 @@ class IDMapper:
         """Initialize empty ID mapper."""
         self.original_to_internal: Dict[Any, int] = {}
         self.internal_to_original: Dict[int, Any] = {}
+        # Optional bipartite partition tracking. Populated by
+        # build_graph_from_edgelist(bipartite=True) so downstream projection
+        # functions can recover which original IDs came from the source vs.
+        # target column of the original edgelist. None means "not bipartite
+        # or partition info wasn't recorded — caller should fall back to
+        # BFS-based detection". See set_bipartite_partitions().
+        self.source_partition_originals: Optional[Set[Any]] = None
+        self.target_partition_originals: Optional[Set[Any]] = None
     
     def get_internal(self, original_id: Any) -> int:
         """
@@ -330,10 +338,14 @@ class IDMapper:
         The returned dictionary can be serialized to JSON or other formats
         for persistence. Use from_dict() to reconstruct the IDMapper.
         """
-        return {
+        result = {
             'original_to_internal': dict(self.original_to_internal),
             'internal_to_original': {str(k): v for k, v in self.internal_to_original.items()}
         }
+        if self.has_bipartite_partitions():
+            result['source_partition_originals'] = list(self.source_partition_originals)
+            result['target_partition_originals'] = list(self.target_partition_originals)
+        return result
     
     @classmethod
     def from_dict(cls, mapping: Dict[str, Dict]) -> 'IDMapper':
@@ -410,9 +422,64 @@ class IDMapper:
             
             mapper.original_to_internal[original_id] = internal_id
             mapper.internal_to_original[internal_id] = original_id
-        
+
+        # Restore bipartite partition info if present.
+        if (
+            'source_partition_originals' in mapping
+            and 'target_partition_originals' in mapping
+        ):
+            mapper.set_bipartite_partitions(
+                mapping['source_partition_originals'],
+                mapping['target_partition_originals'],
+            )
+
         return mapper
     
+    def set_bipartite_partitions(
+        self,
+        source_originals: Iterable[Any],
+        target_originals: Iterable[Any],
+    ) -> None:
+        """
+        Record which original IDs came from the source vs. target column.
+
+        Called by ``build_graph_from_edgelist`` when ``bipartite=True``. Lets
+        downstream functions like :func:`project_bipartite` recover the
+        user's original column semantics instead of relying on BFS coloring
+        (which produces arbitrary "side 0" / "side 1" labels).
+
+        Parameters
+        ----------
+        source_originals : Iterable[Any]
+            All original IDs that appeared in the source column.
+        target_originals : Iterable[Any]
+            All original IDs that appeared in the target column.
+
+        Raises
+        ------
+        ValueError
+            If the two sets overlap (which would mean the graph is not
+            actually bipartite).
+        """
+        source_set = set(source_originals)
+        target_set = set(target_originals)
+        overlap = source_set & target_set
+        if overlap:
+            sample = list(overlap)[:5]
+            raise ValueError(
+                f"Source and target partitions overlap on {len(overlap)} node(s) "
+                f"(sample: {sample}). Graph is not bipartite."
+            )
+        self.source_partition_originals = source_set
+        self.target_partition_originals = target_set
+
+    def has_bipartite_partitions(self) -> bool:
+        """Whether explicit bipartite partition info has been recorded."""
+        return (
+            self.source_partition_originals is not None
+            and self.target_partition_originals is not None
+        )
+
     def is_empty(self) -> bool:
         """
         Check if the mapper is empty.

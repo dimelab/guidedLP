@@ -157,12 +157,20 @@ def build_graph_from_edgelist(
             # Step 5: Create ID mapping
             id_mapper = _create_id_mapping(processed_df, source_col, target_col)
             
-            # Step 6: Validate bipartite structure if requested
+            # Step 6: Validate bipartite structure if requested, and record
+            # which original IDs came from the source vs. target column. This
+            # lets downstream projection functions recover the user's column
+            # semantics without resorting to BFS coloring (whose 0/1 labelling
+            # is arbitrary with respect to the original columns).
             if bipartite:
                 _validate_bipartite_structure(processed_df, source_col, target_col, id_mapper)
-            
+                id_mapper.set_bipartite_partitions(
+                    processed_df[source_col].unique().to_list(),
+                    processed_df[target_col].unique().to_list(),
+                )
+
             # Step 7: Construct NetworkIt graph
-            graph = _construct_graph(processed_df, id_mapper, source_col, target_col, 
+            graph = _construct_graph(processed_df, id_mapper, source_col, target_col,
                                    weight_col, directed, bipartite)
             
             logger.info("Graph construction completed: %d nodes, %d edges, directed=%s, weighted=%s",
@@ -768,13 +776,34 @@ def _identify_bipartite_partitions(graph: nk.Graph, id_mapper: IDMapper) -> Tupl
         If graph is not bipartite
     """
     logger.debug("Identifying bipartite partitions")
-    
+
     if graph.numberOfNodes() == 0:
         return [], []
-    
+
+    # Fast path: if build_graph_from_edgelist recorded the original source/
+    # target column membership on the mapper, use that directly. This keeps
+    # the projection aligned with the user's mental model of which side is
+    # which. Falls back to BFS coloring only when that info isn't available
+    # (e.g. graph wasn't built with bipartite=True).
+    if id_mapper.has_bipartite_partitions():
+        logger.debug(
+            "Using bipartite partitions recorded on IDMapper "
+            "(%d source nodes, %d target nodes)",
+            len(id_mapper.source_partition_originals),
+            len(id_mapper.target_partition_originals),
+        )
+        return (
+            list(id_mapper.source_partition_originals),
+            list(id_mapper.target_partition_originals),
+        )
+
     # Use NetworkIt's bipartiteness check if available, otherwise implement our own
     try:
-        # Try to detect bipartiteness by attempting 2-coloring
+        # Try to detect bipartiteness by attempting 2-coloring.
+        # NOTE: the "source"/"target" labels below are arbitrary — they reflect
+        # BFS color 0/1, not the original source/target columns of the
+        # edgelist. Callers wanting consistent semantics should construct
+        # the graph with build_graph_from_edgelist(bipartite=True).
         source_partition = []
         target_partition = []
         
@@ -793,7 +822,7 @@ def _identify_bipartite_partitions(graph: nk.Graph, id_mapper: IDMapper) -> Tupl
             current_color = colors[current]
             
             # Check all neighbors
-            for neighbor in graph.iterNeighborsOf(current):
+            for neighbor in graph.iterNeighbors(current):
                 if neighbor in colors:
                     # Check if coloring is consistent
                     if colors[neighbor] == current_color:
@@ -825,7 +854,7 @@ def _identify_bipartite_partitions(graph: nk.Graph, id_mapper: IDMapper) -> Tupl
                     current = queue.pop(0)
                     current_color = colors[current]
                     
-                    for neighbor in graph.iterNeighborsOf(current):
+                    for neighbor in graph.iterNeighbors(current):
                         if neighbor in colors:
                             if colors[neighbor] == current_color:
                                 raise GraphConstructionError(
@@ -893,7 +922,7 @@ def _build_neighbor_mapping(
         neighbors = set()
         
         # Find neighbors in the other partition
-        for neighbor_internal in graph.iterNeighborsOf(proj_node_internal):
+        for neighbor_internal in graph.iterNeighbors(proj_node_internal):
             neighbor_orig = id_mapper.get_original(neighbor_internal)
             if neighbor_orig in other_partition_set:
                 neighbors.add(neighbor_orig)
