@@ -43,15 +43,22 @@ def train_test_split_validation(
     random_seed: Optional[int] = None,
     seed_node_col: str = "node_id",
     seed_label_col: str = "label",
+    test_seeds: Optional[SeedInput] = None,
     **glp_kwargs
 ) -> Dict[str, Any]:
     """
-    Validate GLP performance using train/test split of seed nodes.
-    
-    This function splits the seed nodes into training and test sets, runs
-    guided label propagation on the training seeds only, and evaluates
-    the predictions on the held-out test seeds. This provides an assessment
-    of how well GLP can generalize beyond the training data.
+    Validate GLP performance using a held-out test set.
+
+    Operates in one of two modes:
+
+    1. **Random split** (default): split ``seed_labels`` into training and test
+       sets using sklearn's ``train_test_split``, train GLP on the training
+       portion, evaluate on the test portion.
+    2. **Custom test set**: when ``test_seeds`` is provided, use it directly as
+       the test set. Any node IDs that appear in both ``seed_labels`` and
+       ``test_seeds`` are removed from training before propagation — the test
+       set is treated as ground truth. ``test_size``, ``stratify``, and
+       ``random_seed`` are ignored in this mode.
     
     Mathematical Evaluation:
     - Accuracy: (TP + TN) / (TP + TN + FP + FN)
@@ -77,11 +84,19 @@ def train_test_split_validation(
     stratify : bool, default True
         Whether to maintain label proportions in train/test splits
     random_seed : Optional[int], default None
-        Random seed for reproducible splits
+        Random seed for reproducible splits. Ignored when ``test_seeds`` is provided.
     seed_node_col : str, default "node_id"
-        Column name for node IDs when ``seed_labels`` is a DataFrame.
+        Column name for node IDs when ``seed_labels`` (and ``test_seeds``) is a
+        DataFrame. Shared between both inputs.
     seed_label_col : str, default "label"
-        Column name for labels when ``seed_labels`` is a DataFrame.
+        Column name for labels when ``seed_labels`` (and ``test_seeds``) is a
+        DataFrame. Shared between both inputs.
+    test_seeds : Optional[SeedInput], default None
+        If provided, use this as the test set instead of randomly splitting
+        ``seed_labels``. Accepts the same shapes as ``seed_labels``. Any nodes
+        that overlap between ``seed_labels`` and ``test_seeds`` are removed
+        from training; if labels conflict on overlapping nodes, the test set's
+        label is kept and a ``UserWarning`` is emitted.
     **glp_kwargs
         Additional arguments passed to guided_label_propagation()
         
@@ -143,21 +158,29 @@ def train_test_split_validation(
     """
     seed_labels = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
 
-    logger.info(f"Starting train/test split validation with test_size={test_size}, "
-               f"stratify={stratify}, total_seeds={len(seed_labels)}")
+    mode = "custom_test_set" if test_seeds is not None else "random_split"
+    logger.info(
+        f"Starting train/test split validation (mode={mode}), "
+        f"total_seeds={len(seed_labels)}"
+    )
 
-    # Validate inputs
-    _validate_split_inputs(seed_labels, labels, test_size, stratify)
-    
-    with LoggingTimer("Train/test split validation"):
-        
-        # Step 1: Split seeds into train/test
-        train_seeds, test_seeds, train_labels_list, test_labels_list = _split_seed_data(
-            seed_labels, labels, test_size, stratify, random_seed
-        )
-        
+    with LoggingTimer(f"Train/test split validation ({mode})"):
+
+        # Step 1: Determine the train and test sets.
+        if test_seeds is None:
+            _validate_split_inputs(seed_labels, labels, test_size, stratify)
+            train_seeds, test_seeds, train_labels_list, test_labels_list = _split_seed_data(
+                seed_labels, labels, test_size, stratify, random_seed
+            )
+        else:
+            test_seeds = normalize_seed_input(test_seeds, seed_node_col, seed_label_col)
+            train_seeds, test_seeds = _resolve_custom_test_set(
+                seed_labels, test_seeds, labels
+            )
+            test_labels_list = None  # Will be aligned with test_predictions below.
+
         logger.info(f"Split: {len(train_seeds)} training seeds, {len(test_seeds)} test seeds")
-        
+
         # Step 2: Run GLP on training seeds only
         try:
             predictions = guided_label_propagation(
@@ -170,13 +193,20 @@ def train_test_split_validation(
                 error_type="propagation_failure",
                 cause=e
             )
-        
+
         # Step 3: Extract predictions for test nodes
         test_predictions = _extract_test_predictions(predictions, test_seeds)
-        
+
+        # When the user provided a custom test set, build the true-label list in
+        # the same order as test_predictions so metrics are correctly aligned.
+        if test_labels_list is None:
+            test_labels_list = [
+                test_seeds[nid] for nid in test_predictions["node_id"].to_list()
+            ]
+
         # Step 4: Calculate comprehensive metrics
         metrics = _calculate_validation_metrics(
-            test_labels_list, 
+            test_labels_list,
             test_predictions["dominant_label"].to_list(),
             labels
         )
@@ -240,6 +270,93 @@ def _validate_split_inputs(
                 f"Stratified split may fail: some labels have < 2 seeds. "
                 f"Label counts: {label_counts}. Consider setting stratify=False."
             )
+
+
+def _resolve_custom_test_set(
+    seed_labels: Dict[Any, str],
+    test_seeds: Dict[Any, str],
+    labels: List[str],
+) -> Tuple[Dict[Any, str], Dict[Any, str]]:
+    """Validate a user-supplied test set and remove its node IDs from training.
+
+    Any node that appears in both ``seed_labels`` (training) and ``test_seeds``
+    is removed from training — the test set is treated as ground truth. If a
+    node has different labels in the two sets, a UserWarning is emitted and
+    the test set's label wins.
+
+    Parameters
+    ----------
+    seed_labels : Dict[Any, str]
+        Training seeds (canonical form).
+    test_seeds : Dict[Any, str]
+        Custom test set (canonical form).
+    labels : List[str]
+        Full label space.
+
+    Returns
+    -------
+    train_seeds : Dict[Any, str]
+        ``seed_labels`` minus any keys present in ``test_seeds``.
+    test_seeds : Dict[Any, str]
+        Unchanged copy of the input test set.
+
+    Raises
+    ------
+    ValidationError
+        If ``test_seeds`` is empty, contains labels not in ``labels``, or
+        if removing overlap leaves training empty.
+    """
+    if not test_seeds:
+        raise ValidationError("test_seeds cannot be empty when provided")
+
+    unknown_test_labels = set(test_seeds.values()) - set(labels)
+    if unknown_test_labels:
+        raise ValidationError(
+            f"test_seeds contain labels not in the `labels` list: "
+            f"{sorted(unknown_test_labels)}",
+            details={"unknown_labels": sorted(unknown_test_labels), "valid_labels": labels},
+        )
+
+    overlap = set(seed_labels.keys()) & set(test_seeds.keys())
+    if overlap:
+        conflicts = {
+            node: (seed_labels[node], test_seeds[node])
+            for node in overlap
+            if seed_labels[node] != test_seeds[node]
+        }
+        if conflicts:
+            sample = dict(list(conflicts.items())[:3])
+            warnings.warn(
+                f"{len(conflicts)} of {len(overlap)} overlapping node(s) have "
+                f"different labels in train vs test; the test set's labels are kept. "
+                f"Sample (train_label, test_label): {sample}",
+                UserWarning,
+            )
+        logger.info(
+            f"Removed {len(overlap)} overlapping node(s) from training set "
+            f"({len(conflicts)} had conflicting labels)"
+        )
+        train_seeds = {k: v for k, v in seed_labels.items() if k not in overlap}
+    else:
+        train_seeds = dict(seed_labels)  # defensive copy
+
+    if not train_seeds:
+        raise ValidationError(
+            f"After removing test-set overlap, training set is empty "
+            f"(all {len(test_seeds)} test seeds also appeared in seed_labels)."
+        )
+
+    # Soft check: warn if the training set lost coverage of any label.
+    train_labels_present = set(train_seeds.values())
+    missing_in_train = set(labels) - train_labels_present
+    if missing_in_train:
+        warnings.warn(
+            f"After removing overlap, training set has no seeds for labels: "
+            f"{sorted(missing_in_train)}. GLP cannot propagate these labels.",
+            UserWarning,
+        )
+
+    return train_seeds, dict(test_seeds)
 
 
 def _split_seed_data(

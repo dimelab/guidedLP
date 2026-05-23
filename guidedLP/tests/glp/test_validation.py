@@ -214,6 +214,144 @@ class TestTrainTestSplitValidation:
         assert np.array_equal(results1["confusion_matrix"], results2["confusion_matrix"])
 
 
+class TestCustomTestSet:
+    """Test the test_seeds parameter of train_test_split_validation."""
+
+    def setup_method(self):
+        """Build an 8-node 2-cluster graph with a clean L/R split."""
+        self.graph = nk.Graph(8, weighted=True, directed=False)
+        for i in range(3):  # cluster L: 0-1-2-3
+            self.graph.addEdge(i, i + 1, 1.0)
+        self.graph.addEdge(0, 3, 1.0)
+        for i in range(4, 7):  # cluster R: 4-5-6-7
+            self.graph.addEdge(i, i + 1, 1.0)
+        self.graph.addEdge(4, 7, 1.0)
+        self.graph.addEdge(3, 4, 0.5)  # bridge
+
+        self.mapper = IDMapper()
+        for i in range(8):
+            self.mapper.add_mapping(f"n{i}", i)
+
+        self.train_seeds = {"n0": "L", "n1": "L", "n5": "R", "n6": "R"}
+        self.labels = ["L", "R"]
+
+    def test_no_overlap_happy_path(self):
+        """Custom test set with no overlap with training — both kept intact."""
+        custom_test = {"n2": "L", "n3": "L", "n4": "R", "n7": "R"}
+        results = train_test_split_validation(
+            self.graph, self.mapper, self.train_seeds, self.labels,
+            test_seeds=custom_test,
+        )
+        assert results["train_size"] == 4
+        assert results["test_size"] == 4
+        # 2-cluster graph → easy classification
+        assert results["accuracy"] >= 0.75
+
+    def test_same_label_overlap_removed_silently(self):
+        """Nodes in both with the same label are removed from training without a conflict warning."""
+        import warnings as _warnings
+        seeds = {"n0": "L", "n1": "L", "n2": "L", "n5": "R", "n6": "R", "n7": "R"}
+        custom_test = {"n0": "L", "n7": "R"}  # both already in seeds with same labels
+        with _warnings.catch_warnings(record=True) as warning_list:
+            _warnings.simplefilter("always")
+            results = train_test_split_validation(
+                self.graph, self.mapper, seeds, self.labels, test_seeds=custom_test,
+            )
+        # No "different labels" warning should be emitted (other unrelated warnings OK).
+        conflict_warnings = [
+            w for w in warning_list if "different labels" in str(w.message)
+        ]
+        assert len(conflict_warnings) == 0
+        # Two overlapping seeds removed → train shrinks from 6 to 4.
+        assert results["train_size"] == 4
+        assert results["test_size"] == 2
+
+    def test_conflicting_label_overlap_warns(self):
+        """Nodes in both with different labels emit a UserWarning."""
+        seeds = {"n0": "L", "n1": "L", "n5": "R", "n6": "R", "n7": "R"}
+        custom_test = {"n0": "R", "n7": "L"}  # labels flipped vs seeds
+        with pytest.warns(UserWarning, match="different labels"):
+            results = train_test_split_validation(
+                self.graph, self.mapper, seeds, self.labels, test_seeds=custom_test,
+            )
+        assert results["test_size"] == 2
+
+    def test_full_overlap_empties_training_and_raises(self):
+        """If every test-set node is also in seed_labels, training is empty → error."""
+        seeds = {"n0": "L", "n1": "L"}
+        with pytest.raises(ValidationError, match="training set is empty"):
+            train_test_split_validation(
+                self.graph, self.mapper, seeds, self.labels, test_seeds=seeds,
+            )
+
+    def test_empty_test_seeds_raises(self):
+        with pytest.raises(ValidationError, match="test_seeds cannot be empty"):
+            train_test_split_validation(
+                self.graph, self.mapper, self.train_seeds, self.labels, test_seeds={},
+            )
+
+    def test_unknown_test_label_raises(self):
+        with pytest.raises(ValidationError, match="labels not in the `labels` list"):
+            train_test_split_validation(
+                self.graph, self.mapper, self.train_seeds, self.labels,
+                test_seeds={"n2": "C"},
+            )
+
+    def test_test_seeds_as_polars_dataframe(self):
+        df_test = pl.DataFrame({"node_id": ["n2", "n3", "n4", "n7"], "label": ["L", "L", "R", "R"]})
+        results = train_test_split_validation(
+            self.graph, self.mapper, self.train_seeds, self.labels, test_seeds=df_test,
+        )
+        assert results["test_size"] == 4
+
+    def test_test_seeds_as_inverse_dict(self):
+        results = train_test_split_validation(
+            self.graph, self.mapper, self.train_seeds, self.labels,
+            test_seeds={"L": ["n2", "n3"], "R": ["n4", "n7"]},
+        )
+        assert results["test_size"] == 4
+
+    def test_missing_train_label_warns(self):
+        """If overlap removal strips all seeds of a label, warn about lost coverage."""
+        seeds = {"n0": "L", "n5": "R", "n6": "R"}
+        # Removing n0 leaves no L seeds in training.
+        with pytest.warns(UserWarning, match="no seeds for labels"):
+            train_test_split_validation(
+                self.graph, self.mapper, seeds, self.labels,
+                test_seeds={"n0": "L", "n7": "R"},
+            )
+
+    def test_test_size_ignored_when_test_seeds_given(self):
+        """Passing test_size alongside test_seeds shouldn't affect the result."""
+        custom_test = {"n2": "L", "n3": "L", "n4": "R", "n7": "R"}
+        r1 = train_test_split_validation(
+            self.graph, self.mapper, self.train_seeds, self.labels,
+            test_seeds=custom_test, test_size=0.5,
+        )
+        r2 = train_test_split_validation(
+            self.graph, self.mapper, self.train_seeds, self.labels,
+            test_seeds=custom_test, test_size=0.99,
+        )
+        # Same custom test set → identical sizes regardless of test_size.
+        assert r1["train_size"] == r2["train_size"] == 4
+        assert r1["test_size"] == r2["test_size"] == 4
+
+    def test_true_labels_aligned_with_predictions(self):
+        """The accuracy must be computed on aligned true/pred pairs.
+
+        Build a test set where the underlying-graph-correct labels are obvious;
+        verify accuracy matches what we'd compute by hand.
+        """
+        # n2,n3 should propagate as L (in cluster L); n5,n6 as R (in cluster R).
+        custom_test = {"n2": "L", "n3": "L", "n5": "R", "n6": "R"}
+        train_only = {"n0": "L", "n7": "R"}  # tiny but unambiguous seed set
+        results = train_test_split_validation(
+            self.graph, self.mapper, train_only, self.labels, test_seeds=custom_test,
+        )
+        # With this graph structure, accuracy should be 1.0.
+        assert results["accuracy"] == 1.0
+
+
 class TestInputValidation:
     """Test input validation for train/test split."""
     

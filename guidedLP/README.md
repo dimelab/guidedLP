@@ -197,7 +197,65 @@ src/
 
 ## Examples
 
-### 1. Political Affiliation Analysis
+### 1. Network Backboning Before Propagation
+
+For dense weighted networks, the **disparity filter** (Serrano et al., 2009) extracts the statistically significant subset of edges before label propagation. The propagation step then runs on a cleaner network where weak/incidental connections aren't diluting the signal.
+
+**When backboning helps:**
+- Edge weights span many orders of magnitude — a few strong ties, many incidental ones (e.g. one-off retweets vs. sustained interaction).
+- The network is dense enough that random walks mix categories quickly and confidence collapses.
+- You need to cut compute time on a very large network — fewer edges, fewer matrix–vector products per GLP iteration.
+
+**When to skip it:**
+- Network is unweighted, or already sparse.
+- Edge weight variance is small (all edges carry roughly equal information).
+- Weak edges *are* the signal you want to study.
+- You have plenty of seeds per category — propagation already has enough anchors to overwhelm noise.
+
+```python
+import polars as pl
+from guidedLP.network.construction import build_graph_from_edgelist
+from guidedLP.network.filtering import apply_backbone
+from guidedLP.glp.propagation import guided_label_propagation
+
+edges = pl.read_csv("interactions.csv")
+graph, id_mapper = build_graph_from_edgelist(
+    edges, source_col="user_a", target_col="user_b", weight_col="weight",
+)
+print(f"Full graph:   {graph.numberOfNodes():>6} nodes, {graph.numberOfEdges():>7} edges")
+
+# Disparity filter: keep edges whose normalized weight is statistically
+# significant against a null model of uniform weight distribution at each
+# node. Lower alpha = stricter backbone.
+backbone, backbone_mapper = apply_backbone(
+    graph, id_mapper,
+    method="disparity",
+    alpha=0.05,                # typical range 0.01–0.1
+    keep_disconnected=False,   # drop nodes that lost all their edges
+)
+print(f"Backbone:     {backbone.numberOfNodes():>6} nodes, {backbone.numberOfEdges():>7} edges")
+
+# IMPORTANT: apply_backbone returns a NEW id_mapper. Always pass it (not the
+# original) to downstream functions. Some seed nodes may also be dropped if
+# all their edges fell below significance — verify seeds are still present.
+seeds = {"@aoc": "left", "@berniesanders": "left",
+         "@realdonaldtrump": "right", "@tedcruz": "right"}
+seeds_in_backbone = {k: v for k, v in seeds.items() if backbone_mapper.has_original(k)}
+if len(seeds_in_backbone) < len(seeds):
+    dropped = set(seeds) - set(seeds_in_backbone)
+    print(f"WARNING: {len(dropped)} seed(s) dropped by backboning: {dropped}")
+
+results = guided_label_propagation(
+    graph=backbone,
+    id_mapper=backbone_mapper,
+    seed_labels=seeds_in_backbone,
+    labels=["left", "right"],
+)
+```
+
+Other `method` values: `"weight"` (simple weight threshold — use with `target_edges=N`) and `"degree"` (keep top-N nodes by degree — use with `target_nodes=N`).
+
+### 2. Political Affiliation Analysis
 
 ```python
 # Analyze political leaning in social networks
@@ -230,7 +288,7 @@ metrics = train_test_split_validation(
 print(f"Political classification accuracy: {metrics['accuracy']:.3f}")
 ```
 
-### 2. Temporal Network Analysis
+### 3. Temporal Network Analysis
 
 ```python
 # Track community evolution over time
@@ -259,7 +317,7 @@ for date, slice_edges in time_slices.items():
     print(f"{date}: {len(results)} nodes classified")
 ```
 
-### 3. Academic Collaboration Networks
+### 4. Academic Collaboration Networks
 
 ```python
 # Map research communities in citation networks
@@ -289,7 +347,7 @@ for row in low_confidence.iter_rows(named=True):
     print(f"{row['node_id']}: Likely interdisciplinary researcher")
 ```
 
-### 4. Temporal Bipartite-to-Unipartite Conversion
+### 5. Temporal Bipartite-to-Unipartite Conversion
 
 ```python
 # Convert user-item interactions to user influence networks  
