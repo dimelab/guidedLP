@@ -57,11 +57,8 @@ Documentation = "https://guided-label-propagation.readthedocs.io"
 Repository = "https://github.com/yourusername/guided-label-propagation.git"
 Issues = "https://github.com/yourusername/guided-label-propagation/issues"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-dir]
-"" = "src"
+[tool.setuptools]
+packages = ["network", "glp", "common", "timeseries"]
 
 [tool.ruff]
 line-length = 88

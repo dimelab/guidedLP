@@ -12,15 +12,15 @@ import networkit as nk
 import polars as pl
 from typing import Tuple
 
-from src.network.backboning import (
+from guidedLP.network.backboning import (
     apply_backbone,
     get_backbone_summary,
     _safe_power,
     AVAILABLE_METHODS
 )
-from src.network.construction import build_graph_from_edgelist
-from src.common.id_mapper import IDMapper
-from src.common.exceptions import ConfigurationError, ValidationError
+from guidedLP.network.construction import build_graph_from_edgelist
+from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.exceptions import ConfigurationError, ValidationError
 
 
 class TestDisparityFilter:
@@ -521,6 +521,216 @@ class TestPerformanceAndScaling:
         # Verify results are reasonable
         assert backbone_graph.numberOfNodes() <= graph.numberOfNodes()
         assert backbone_graph.numberOfEdges() <= graph.numberOfEdges()
+
+
+class TestGraphMapperSynchronization:
+    """Test that graph and mapper remain synchronized after backboning operations.
+
+    This test class addresses the bug report where numberOfNodes() didn't match
+    mapper.size() after applying backbone with keep_disconnected=False.
+    """
+
+    def test_node_count_matches_mapper_disparity(self):
+        """Test that numberOfNodes() equals mapper.size() for disparity filter."""
+        # Create graph with some edges that will be filtered out
+        edges = pl.DataFrame({
+            'source': ['A', 'B', 'C', 'D', 'E', 'F'],
+            'target': ['B', 'C', 'D', 'E', 'F', 'A'],
+            'weight': [10.0, 9.0, 8.0, 1.0, 1.0, 1.0]
+        })
+
+        graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
+
+        # Apply backbone with keep_disconnected=False
+        backbone_graph, backbone_mapper = apply_backbone(
+            graph, mapper, method="disparity", alpha=0.05, keep_disconnected=False
+        )
+
+        # CRITICAL: These MUST match
+        assert backbone_graph.numberOfNodes() == backbone_mapper.size(), \
+            f"Node count mismatch: graph has {backbone_graph.numberOfNodes()} nodes " \
+            f"but mapper has {backbone_mapper.size()} nodes"
+
+        # Verify all mapper entries reference valid graph nodes
+        for i in range(backbone_mapper.size()):
+            assert i < backbone_graph.numberOfNodes(), \
+                f"Mapper references node {i} but graph only has {backbone_graph.numberOfNodes()} nodes"
+
+    def test_node_count_matches_mapper_weight_threshold(self):
+        """Test synchronization for weight threshold method."""
+        edges = pl.DataFrame({
+            'source': ['A', 'B', 'C', 'D', 'E'],
+            'target': ['B', 'C', 'D', 'E', 'A'],
+            'weight': [10.0, 5.0, 3.0, 1.0, 0.5]
+        })
+
+        graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
+
+        # Filter with threshold that removes some edges/nodes
+        backbone_graph, backbone_mapper = apply_backbone(
+            graph, mapper, method="weight_threshold",
+            weight_threshold=4.0, keep_disconnected=False
+        )
+
+        assert backbone_graph.numberOfNodes() == backbone_mapper.size(), \
+            f"Weight threshold: Node count mismatch: {backbone_graph.numberOfNodes()} != {backbone_mapper.size()}"
+
+    def test_node_count_matches_mapper_degree_threshold(self):
+        """Test synchronization for degree threshold method."""
+        # Create graph where some nodes have low degree
+        edges = pl.DataFrame({
+            'source': ['A', 'A', 'A', 'B', 'C', 'D'],
+            'target': ['B', 'C', 'D', 'E', 'E', 'E'],
+            'weight': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        })
+
+        graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
+
+        # Filter by degree - target_nodes will filter to keep nodes with higher degree
+        backbone_graph, backbone_mapper = apply_backbone(
+            graph, mapper, method="degree_threshold",
+            target_nodes=3, keep_disconnected=False
+        )
+
+        assert backbone_graph.numberOfNodes() == backbone_mapper.size(), \
+            f"Degree threshold: Node count mismatch: {backbone_graph.numberOfNodes()} != {backbone_mapper.size()}"
+
+    def test_keep_disconnected_true_preserves_size(self):
+        """Test that keep_disconnected=True preserves original node count."""
+        edges = pl.DataFrame({
+            'source': ['A', 'B', 'C'],
+            'target': ['B', 'C', 'D'],
+            'weight': [10.0, 5.0, 1.0]
+        })
+
+        graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
+        original_nodes = graph.numberOfNodes()
+
+        # With keep_disconnected=True, should preserve all nodes
+        backbone_graph, backbone_mapper = apply_backbone(
+            graph, mapper, method="weight_threshold",
+            weight_threshold=6.0, keep_disconnected=True
+        )
+
+        # Should preserve original node count
+        assert backbone_graph.numberOfNodes() == original_nodes
+        assert backbone_mapper.size() == mapper.size()
+        assert backbone_graph.numberOfNodes() == backbone_mapper.size()
+
+    def test_keep_disconnected_false_removes_isolated(self):
+        """Test that keep_disconnected=False removes isolated nodes."""
+        edges = pl.DataFrame({
+            'source': ['A', 'B', 'C', 'D', 'E'],
+            'target': ['B', 'C', 'D', 'E', 'F'],
+            'weight': [10.0, 10.0, 1.0, 1.0, 1.0]
+        })
+
+        graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
+        original_nodes = graph.numberOfNodes()
+
+        # High threshold will disconnect some nodes
+        backbone_graph, backbone_mapper = apply_backbone(
+            graph, mapper, method="weight_threshold",
+            weight_threshold=5.0, keep_disconnected=False
+        )
+
+        # Should have fewer nodes than original
+        assert backbone_graph.numberOfNodes() < original_nodes
+        assert backbone_mapper.size() < mapper.size()
+
+        # But graph and mapper should match
+        assert backbone_graph.numberOfNodes() == backbone_mapper.size()
+
+    def test_all_mapper_nodes_exist_in_graph(self):
+        """Verify every node in mapper has a corresponding node in graph."""
+        edges = pl.DataFrame({
+            'source': ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'],
+            'target': ['B', 'C', 'D', 'E', 'F', 'G', 'H', 'A'],
+            'weight': [10.0, 9.0, 8.0, 7.0, 1.0, 1.0, 1.0, 1.0]
+        })
+
+        graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
+
+        backbone_graph, backbone_mapper = apply_backbone(
+            graph, mapper, method="disparity", alpha=0.1, keep_disconnected=False
+        )
+
+        # Every internal ID in the mapper should be a valid node ID in the graph
+        for internal_id in range(backbone_mapper.size()):
+            # Internal IDs should be consecutive starting from 0
+            assert internal_id < backbone_graph.numberOfNodes(), \
+                f"Mapper has internal ID {internal_id} but graph only has {backbone_graph.numberOfNodes()} nodes"
+
+            # Node should exist in graph
+            assert backbone_graph.hasNode(internal_id), \
+                f"Mapper references node {internal_id} but it doesn't exist in graph"
+
+    def test_edge_endpoints_in_mapper(self):
+        """Verify all edge endpoints can be translated through mapper."""
+        edges = pl.DataFrame({
+            'source': ['A', 'B', 'C', 'D', 'E'],
+            'target': ['B', 'C', 'D', 'E', 'A'],
+            'weight': [10.0, 8.0, 6.0, 4.0, 2.0]
+        })
+
+        graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
+
+        backbone_graph, backbone_mapper = apply_backbone(
+            graph, mapper, method="weight_threshold",
+            weight_threshold=5.0, keep_disconnected=False
+        )
+
+        # Check every edge in the backbone
+        for u, v in backbone_graph.iterEdges():
+            # Both endpoints should be valid internal IDs
+            assert u < backbone_mapper.size(), \
+                f"Edge endpoint {u} exceeds mapper size {backbone_mapper.size()}"
+            assert v < backbone_mapper.size(), \
+                f"Edge endpoint {v} exceeds mapper size {backbone_mapper.size()}"
+
+            # Both endpoints should have original IDs
+            assert backbone_mapper.has_internal(u), \
+                f"Edge endpoint {u} not in mapper"
+            assert backbone_mapper.has_internal(v), \
+                f"Edge endpoint {v} not in mapper"
+
+    def test_large_graph_synchronization(self):
+        """Test synchronization on larger graph (1000 nodes)."""
+        # Create a scale-free-like graph
+        edges_list = []
+        for i in range(1000):
+            # Each node connects to a few others with varying weights
+            for j in range(min(5, 1000 - i - 1)):
+                weight = np.random.uniform(0.1, 10.0)
+                edges_list.append((f'node_{i}', f'node_{i+j+1}', weight))
+
+        edges = pl.DataFrame({
+            'source': [e[0] for e in edges_list],
+            'target': [e[1] for e in edges_list],
+            'weight': [e[2] for e in edges_list]
+        })
+
+        graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
+
+        # Apply multiple backboning methods
+        for method in ['disparity', 'weight_threshold', 'degree_threshold']:
+            if method == 'disparity':
+                backbone_graph, backbone_mapper = apply_backbone(
+                    graph, mapper, method=method, alpha=0.05, keep_disconnected=False
+                )
+            elif method == 'weight_threshold':
+                backbone_graph, backbone_mapper = apply_backbone(
+                    graph, mapper, method=method, weight_threshold=5.0, keep_disconnected=False
+                )
+            else:  # degree_threshold
+                backbone_graph, backbone_mapper = apply_backbone(
+                    graph, mapper, method=method, target_nodes=500, keep_disconnected=False
+                )
+
+            # Verify synchronization for each method
+            assert backbone_graph.numberOfNodes() == backbone_mapper.size(), \
+                f"{method}: Large graph synchronization failed: " \
+                f"{backbone_graph.numberOfNodes()} != {backbone_mapper.size()}"
 
 
 if __name__ == "__main__":
