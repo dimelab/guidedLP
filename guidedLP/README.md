@@ -255,7 +255,66 @@ results = guided_label_propagation(
 
 Other `method` values: `"weight"` (simple weight threshold — use with `target_edges=N`) and `"degree"` (keep top-N nodes by degree — use with `target_nodes=N`).
 
-### 2. Political Affiliation Analysis
+### 2. Bipartite to Unipartite Projection
+
+Many computational social science datasets are naturally **bipartite** — users connected to hashtags, authors to papers, accounts to URLs they share. GLP works on a unipartite graph where seeds and unknown nodes live in the same partition, so the typical preprocessing step is to project: *connect two users if they share content, mediated by the items between them*.
+
+**When to project:**
+- Your edge list joins two distinct node types (user → hashtag, author → paper).
+- Your seeds live in one of the two partitions and you want propagation within that partition.
+- "Similarity" in your domain is defined by shared connections to the other partition.
+
+**Choose `weight_method` based on what "similarity" should mean:**
+- `"count"` — raw number of shared neighbors. Simple, but a single power-user who touches everything looks similar to everyone.
+- `"jaccard"` — |A ∩ B| / |A ∪ B|. Symmetric and normalized. Good default when node degrees vary widely.
+- `"overlap"` — |A ∩ B| / min(|A|, |B|). Asymmetric; favors "the small set is contained in the big one".
+
+```python
+import polars as pl
+from guidedLP.network.construction import build_graph_from_edgelist, project_bipartite
+from guidedLP.glp.propagation import guided_label_propagation
+
+# Edge list joining users to hashtags they used
+edges = pl.read_csv("user_hashtag_uses.csv")  # columns: user, hashtag, count
+bipartite, full_mapper = build_graph_from_edgelist(
+    edges,
+    source_col="user",
+    target_col="hashtag",
+    weight_col="count",
+    bipartite=True,             # validate that source/target are disjoint sets
+)
+print(f"Bipartite:  {bipartite.numberOfNodes()} nodes "
+      f"({sum(1 for _ in edges['user'].unique())} users + "
+      f"{sum(1 for _ in edges['hashtag'].unique())} hashtags)")
+
+# Project onto USERS: two users get connected if they share hashtags.
+# jaccard avoids high-degree users dominating the similarity.
+user_graph, user_mapper = project_bipartite(
+    bipartite, full_mapper,
+    projection_mode="source",   # users appear in the source column
+    weight_method="jaccard",
+)
+print(f"User-user:  {user_graph.numberOfNodes()} nodes, {user_graph.numberOfEdges()} edges")
+
+# user_mapper now contains ONLY users (the projected partition). Seeds must
+# refer to users — hashtag IDs from the original bipartite mapper won't be
+# found and would raise a validation error.
+seeds = {"@alice": "progressive", "@bob": "conservative"}
+results = guided_label_propagation(
+    graph=user_graph, id_mapper=user_mapper,
+    seed_labels=seeds, labels=["progressive", "conservative"],
+)
+```
+
+**Other directions:**
+- Set `projection_mode="target"` to project onto the *hashtag* partition instead — useful if your seeds are labelled hashtags and you want to classify unknown ones.
+- For temporal bipartite data where edge order matters (A shared the item *before* B → A may have influenced B), see Example #6 below — `temporal_bipartite_to_unipartite` produces a *directed* unipartite graph that preserves this causality.
+
+**Watch out for:**
+- Projections can blow up edge count: O(N² × D) worst case. On dense bipartite graphs, consider backboning either before projecting (sparsifies the bipartite layer) or after (sparsifies the projection itself).
+- Seeds must be in the projection partition; cross-check with `user_mapper.has_original(seed_id)` before propagation.
+
+### 3. Political Affiliation Analysis
 
 ```python
 # Analyze political leaning in social networks
@@ -288,7 +347,7 @@ metrics = train_test_split_validation(
 print(f"Political classification accuracy: {metrics['accuracy']:.3f}")
 ```
 
-### 3. Temporal Network Analysis
+### 4. Temporal Network Analysis
 
 ```python
 # Track community evolution over time
@@ -317,7 +376,7 @@ for date, slice_edges in time_slices.items():
     print(f"{date}: {len(results)} nodes classified")
 ```
 
-### 4. Academic Collaboration Networks
+### 5. Academic Collaboration Networks
 
 ```python
 # Map research communities in citation networks
@@ -347,37 +406,45 @@ for row in low_confidence.iter_rows(named=True):
     print(f"{row['node_id']}: Likely interdisciplinary researcher")
 ```
 
-### 5. Temporal Bipartite-to-Unipartite Conversion
+### 6. Temporal Bipartite-to-Unipartite Conversion
+
+When edge order matters — A shared an item *before* B did, so B may have been attributing to A — use `temporal_bipartite_to_unipartite`. It produces a **directed** unipartite graph using **citation convention**: edges point from the *later* sharer to the *earlier* one. Under this convention the earliest sharer accumulates the most incoming edges, and PageRank / HITS-Authority naturally surface them as the influential sources.
+
+**Important: this function does not sort.** It trusts the input row order. You must pre-sort the edgelist by intermediate column ascending, then by timestamp **descending** (latest first) within each item group:
 
 ```python
-# Convert user-item interactions to user influence networks  
 import polars as pl
 from guidedLP.network.construction import temporal_bipartite_to_unipartite
 
-# Load temporal bipartite data (users interacting with items over time)
 data = pl.DataFrame({
-    "user": ["Alice", "Bob", "Charlie", "Alice", "Bob"],
-    "item": ["item1", "item1", "item1", "item2", "item2"], 
+    "user":      ["Alice", "Bob",   "Charlie", "Alice", "Bob"],
+    "item":      ["item1", "item1", "item1",   "item2", "item2"],
     "timestamp": ["2024-01-01 09:00", "2024-01-01 11:00", "2024-01-01 13:00",
-                  "2024-01-02 10:00", "2024-01-02 15:00"]
-})
+                  "2024-01-02 10:00", "2024-01-02 15:00"],
+}).with_columns(pl.col("timestamp").str.to_datetime())
 
-# Convert to directed user-user influence network  
-influence_graph, user_mapper = temporal_bipartite_to_unipartite(
+# REQUIRED pre-sort. The function will use this row order as-is.
+data = data.sort(["item", "timestamp"], descending=[False, True])
+
+attribution_graph, user_mapper = temporal_bipartite_to_unipartite(
     data,
-    source_col="user",
-    target_col="item",
-    timestamp_col="timestamp",
-    intermediate_col="item",    # Items disappear
-    projected_col="user",       # Users get connected
-    add_edge_weights=True       # Include temporal decay
+    source_col="user", target_col="item", timestamp_col="timestamp",
+    intermediate_col="item",   # Items disappear in the projection
+    projected_col="user",      # Users remain, get connected
+    add_edge_weights=True,     # Weight decays with temporal gap between sharers
 )
 
-print(f"Created {influence_graph.numberOfNodes()} user influence network")
-print(f"Temporal relationships: {influence_graph.numberOfEdges()} edges")
+print(f"Graph: {attribution_graph.numberOfNodes()} nodes, "
+      f"{attribution_graph.numberOfEdges()} edges (directed)")
+# Citation-direction edges produced:
+#   item1: Charlie → Bob,  Charlie → Alice,  Bob → Alice
+#   item2: Bob → Alice                                       (collapses with item1's Bob→Alice)
+# Alice (earliest sharer of both items) ends up with the most incoming edges.
 
-# Expected edges: Alice → Bob → Charlie (temporal precedence preserved)
+# This makes PageRank / HITS-Authority surface Alice as the influential source.
 ```
+
+If your data isn't in the required order, the function silently produces wrong-direction edges — no validation is performed (the assumption is that callers working with large datasets pre-sort once and reuse). When in doubt, re-sort right before the call.
 
 ## Use Cases
 

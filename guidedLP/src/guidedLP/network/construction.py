@@ -1060,19 +1060,35 @@ def temporal_bipartite_to_unipartite(
     add_edge_weights: bool = True
 ) -> Tuple[nk.Graph, IDMapper]:
     """
-    Convert temporal bipartite edgelist to unipartite graph using temporal precedence.
-    
-    This function implements the temporal bipartite-to-unipartite conversion logic
-    where nodes sharing the same intermediate node are connected based on temporal
-    ordering. Uses ascending timestamp sort combined with upper triangular matrix
-    indexing to preserve temporal causality (earlier → later flow).
-    
+    Convert temporal bipartite edgelist to unipartite graph using citation-convention edges.
+
+    Two nodes that share the same intermediate node are connected by a directed
+    edge that points **from the later sharer to the earlier one** (citation /
+    attribution convention). Under this convention the earliest sharer of an
+    item accumulates incoming edges from everyone who shared it later, which is
+    how PageRank, HITS-Authority, and similar centrality metrics surface
+    influential sources.
+
+    .. note::
+        **Input order is trusted, not validated.** This function does NOT sort
+        the edgelist. The caller is responsible for sorting it so that, within
+        each ``intermediate_col`` group, rows are ordered by ``timestamp_col``
+        **DESCENDING** (latest first). If your data is not in this order the
+        edge directions will be wrong without any error being raised.
+
+        Pre-sort with::
+
+            edgelist = edgelist.sort([intermediate_col, timestamp_col],
+                                     descending=[False, True])
+
     The algorithm:
-    1. Groups edges by intermediate node (disappearing column)
-    2. Within each group, sorts by timestamp in ascending order
-    3. Creates directed edges using upper triangular matrix indices
-    4. Results in proper temporal flow: earlier events → later events
-    
+
+    1. Groups edges by intermediate node (the disappearing column).
+    2. Within each group, takes nodes in the order they appear (caller's
+       descending-timestamp order).
+    3. For every pair where ``i < j`` (later, earlier), emits a directed edge
+       ``unique_nodes[i] → unique_nodes[j]``.
+
     Parameters
     ----------
     edgelist : Union[str, pl.DataFrame]
@@ -1113,37 +1129,50 @@ def temporal_bipartite_to_unipartite(
         
     Examples
     --------
-    Convert user-item temporal interactions to user-user influence network:
-    
+    Convert user-item temporal interactions to a user-user attribution network:
+
     >>> import polars as pl
     >>> from guidedLP.network.construction import temporal_bipartite_to_unipartite
-    >>> 
-    >>> # Sample temporal bipartite data: users interacting with items over time
+    >>>
+    >>> # Raw temporal data — users interacting with items over time.
     >>> data = pl.DataFrame({
     ...     "user": ["Alice", "Bob", "Charlie", "Alice", "Bob"],
-    ...     "item": ["item1", "item1", "item1", "item2", "item2"], 
-    ...     "timestamp": ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]
+    ...     "item": ["item1", "item1", "item1", "item2", "item2"],
+    ...     "timestamp": pl.Series(
+    ...         ["2024-01-01", "2024-01-02", "2024-01-03",
+    ...          "2024-01-04", "2024-01-05"]
+    ...     ).str.to_datetime(),
     ... })
     >>>
-    >>> # Convert to user-user influence network
+    >>> # REQUIRED: pre-sort by intermediate_col, then timestamp DESCENDING.
+    >>> data = data.sort(["item", "timestamp"], descending=[False, True])
+    >>>
     >>> graph, mapper = temporal_bipartite_to_unipartite(
-    ...     data, 
-    ...     source_col="user",
-    ...     target_col="item",
-    ...     timestamp_col="timestamp",
+    ...     data,
+    ...     source_col="user", target_col="item", timestamp_col="timestamp",
     ...     intermediate_col="item",  # Items disappear
-    ...     projected_col="user"      # Users remain, get connected
+    ...     projected_col="user",     # Users remain, get connected
     ... )
-    
+    >>> # Resulting edges (citation direction, later → earlier):
+    >>> #   Charlie → Bob,  Charlie → Alice,  Bob → Alice          (from item1)
+    >>> #   Bob     → Alice                                         (from item2)
+    >>> # Alice (earliest sharer of both items) has the most incoming edges.
+
     Notes
     -----
-    The temporal logic ensures proper causality: if users A and B both interact
-    with item X, and A interacts first, then A → B edge is created (A influences B).
-    
-    This is particularly useful for:
-    - User-item → User-user influence networks
-    - Author-paper → Author-author citation networks  
-    - Social media user-content → User-user information flow
+    Use citation convention when:
+
+    - You want to run PageRank / HITS / eigenvector centrality on the result
+      and have "influential source" surface as high score.
+    - You're modelling attribution: "who did this late sharer learn from?"
+    - You want GLP's out-degree pass to answer "who did this node attribute
+      to?" and the in-degree pass to answer "who attributed to this node?".
+
+    Typical applications:
+
+    - User-item interactions → user-user attribution networks
+    - Author-paper records → author-author citation-like graphs
+    - Social-media share logs → information-source attribution
     """
     
     with LoggingTimer("temporal_bipartite_to_unipartite"):
@@ -1175,7 +1204,8 @@ def temporal_bipartite_to_unipartite(
         logger.info(f"Intermediate column: {intermediate_col}, Projected column: {projected_col}")
         
         try:
-            # Convert timestamp to datetime if needed
+            # Convert timestamp to datetime if needed (still needed for the
+            # temporal weight calculation below — does not change row order).
             if edgelist[timestamp_col].dtype != pl.Datetime:
                 try:
                     edgelist = edgelist.with_columns(
@@ -1183,18 +1213,25 @@ def temporal_bipartite_to_unipartite(
                     )
                 except Exception as e:
                     raise ValidationError(f"Cannot parse timestamp column '{timestamp_col}': {e}")
-            
-            # Sort by intermediate node, then by timestamp ascending (critical for temporal logic)
-            edgelist_sorted = edgelist.sort([intermediate_col, timestamp_col], descending=[False, False])
-            
-            logger.info(f"Sorted edgelist by {intermediate_col}, then {timestamp_col} (ascending)")
-            
-            # Group by intermediate node and create temporal edges
+
+            # NOTE: this function trusts the caller's row order. The input
+            # edgelist MUST be pre-sorted by intermediate_col (any order), then
+            # by timestamp_col DESCENDING (latest first) within each
+            # intermediate-node group. We do not re-sort because callers
+            # working with very large datasets often pre-sort once and reuse.
+            logger.info(
+                f"Assuming pre-sorted input: by {intermediate_col} (grouped), "
+                f"then {timestamp_col} DESCENDING within each group"
+            )
+
+            # Group by intermediate node and create temporal edges. preserve order
+            # so the user's descending-timestamp ordering inside each group is kept.
             projection_edges = []
             edge_weights = []
-            
-            for intermediate_node, group in edgelist_sorted.group_by(intermediate_col):
-                # Get projected nodes in temporal order (ascending timestamps)
+
+            for intermediate_node, group in edgelist.group_by(intermediate_col, maintain_order=True):
+                # Projected nodes in the order the user provided — descending by
+                # timestamp within this group (latest sharer first, earliest last).
                 projected_nodes = group[projected_col].to_list()
                 timestamps = group[timestamp_col].to_list()
                 weights = group[weight_col].to_list() if weight_col else [1.0] * len(projected_nodes)
@@ -1219,14 +1256,23 @@ def temporal_bipartite_to_unipartite(
                 if len(unique_nodes) <= 1:
                     continue
                     
-                # Create temporal edges using upper triangular indices
-                # This creates: earlier timestamp → later timestamp (proper temporal causality)
+                # Create temporal edges using upper triangular indices.
+                # With input sorted DESCENDING by timestamp within this group:
+                #   unique_nodes[0]   = latest sharer
+                #   unique_nodes[n-1] = earliest sharer
+                # np.triu_indices(n, k=1) gives pairs (i, j) with i < j, so:
+                #   unique_nodes[i] = later sharer  → source
+                #   unique_nodes[j] = earlier sharer → target
+                # This yields citation-convention edges (later → earlier): the
+                # original sharer accumulates incoming edges from everyone who
+                # shared the same item later, which is what PageRank / HITS
+                # Authority expect to read as "influential source".
                 n_nodes = len(unique_nodes)
                 upper_tri_indices = np.triu_indices(n_nodes, k=1)
-                
+
                 for i, j in zip(upper_tri_indices[0], upper_tri_indices[1]):
-                    source_node = unique_nodes[i]  # Earlier timestamp (due to ascending sort)
-                    target_node = unique_nodes[j]  # Later timestamp
+                    source_node = unique_nodes[i]  # Later sharer
+                    target_node = unique_nodes[j]  # Earlier sharer (the cited source)
                     
                     # Calculate edge weight based on temporal relationship
                     if add_edge_weights:
