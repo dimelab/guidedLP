@@ -34,6 +34,7 @@ from guidedLP.common.exceptions import (
     check_convergence
 )
 from guidedLP.common.logging_config import get_logger, LoggingTimer
+from guidedLP.common.seed_input import SeedInput, normalize_seed_input
 
 logger = get_logger(__name__)
 
@@ -41,7 +42,7 @@ logger = get_logger(__name__)
 def guided_label_propagation(
     graph: nk.Graph,
     id_mapper: IDMapper,
-    seed_labels: Dict[Any, str],
+    seed_labels: SeedInput,
     labels: List[str],
     alpha: float = 0.85,
     max_iterations: int = 100,
@@ -51,7 +52,9 @@ def guided_label_propagation(
     n_jobs: int = 1,
     enable_noise_category: bool = False,
     noise_ratio: float = 0.1,
-    confidence_threshold: float = 0.0
+    confidence_threshold: float = 0.0,
+    seed_node_col: str = "node_id",
+    seed_label_col: str = "label",
 ) -> Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]:
     """
     Propagate labels from seed nodes through network using guided label propagation.
@@ -76,9 +79,16 @@ def guided_label_propagation(
         NetworkIt graph (directed or undirected, must be weighted)
     id_mapper : IDMapper
         Bidirectional mapping between original and internal node IDs
-    seed_labels : Dict[Any, str]
-        Mapping from original node IDs to their known labels
-        Example: {"user_123": "left", "user_456": "right"}
+    seed_labels : SeedInput
+        Known seed labels in any of four supported shapes (see
+        :func:`guidedLP.common.normalize_seed_input`):
+
+        - ``Dict[Any, str]`` — node_id → label, e.g.
+          ``{"user_123": "left", "user_456": "right"}``
+        - ``Dict[str, List[Any]]`` — label → list of node_ids, e.g.
+          ``{"left": ["user_123"], "right": ["user_456"]}``
+        - polars.DataFrame with node_id and label columns
+        - pandas.DataFrame with node_id and label columns
     labels : List[str]
         Complete list of possible labels (must include all values in seed_labels)
     alpha : float, default 0.85
@@ -103,7 +113,11 @@ def guided_label_propagation(
     confidence_threshold : float, default 0.0
         Minimum probability threshold for classification. Nodes with max probability
         below this threshold are classified as "uncertain" (0.0-1.0).
-    
+    seed_node_col : str, default "node_id"
+        Column name for node IDs when ``seed_labels`` is a DataFrame.
+    seed_label_col : str, default "label"
+        Column name for labels when ``seed_labels`` is a DataFrame.
+
     Returns
     -------
     Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]
@@ -155,11 +169,15 @@ def guided_label_propagation(
     - Algorithm uses sparse matrix operations for memory efficiency on large graphs
     """
     
+    # Normalize the seed input shape to the canonical Dict[node, label] before
+    # any other processing — everything downstream assumes this shape.
+    seed_labels = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
+
     logger.info(f"Starting guided label propagation with {len(seed_labels)} seeds, "
                f"{len(labels)} labels, alpha={alpha}")
-    
+
     # Validate inputs
-    _validate_inputs(graph, id_mapper, seed_labels, labels, alpha, 
+    _validate_inputs(graph, id_mapper, seed_labels, labels, alpha,
                     max_iterations, convergence_threshold, enable_noise_category,
                     noise_ratio, confidence_threshold)
     
@@ -767,24 +785,31 @@ def _iterative_propagation(
 
 def get_propagation_info(
     graph: nk.Graph,
-    seed_labels: Dict[Any, str],
-    labels: List[str]
+    seed_labels: SeedInput,
+    labels: List[str],
+    seed_node_col: str = "node_id",
+    seed_label_col: str = "label",
 ) -> Dict[str, Any]:
     """
     Get information about a potential propagation run without executing it.
-    
+
     This utility function provides estimates and diagnostics for a guided label
     propagation run, helping users understand the computational requirements
     and potential issues before running the full algorithm.
-    
+
     Parameters
     ----------
     graph : nk.Graph
         NetworkIt graph to analyze
-    seed_labels : Dict[Any, str]
-        Mapping from node IDs to their labels
+    seed_labels : SeedInput
+        Seed labels in any of four supported shapes (see
+        :func:`guidedLP.common.normalize_seed_input`).
     labels : List[str]
         List of all possible labels
+    seed_node_col : str, default "node_id"
+        Column name for node IDs when ``seed_labels`` is a DataFrame.
+    seed_label_col : str, default "label"
+        Column name for labels when ``seed_labels`` is a DataFrame.
     
     Returns
     -------
@@ -803,7 +828,8 @@ def get_propagation_info(
     >>> if info['potential_issues']:
     ...     print("Warnings:", info['potential_issues'])
     """
-    
+    seed_labels = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
+
     n_nodes = graph.numberOfNodes()
     n_edges = graph.numberOfEdges()
     n_labels = len(labels)

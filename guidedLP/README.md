@@ -113,29 +113,32 @@ edges = pl.read_csv("network_data.csv")
 
 # Build network
 graph, id_mapper = build_graph_from_edgelist(
-    edges, 
-    source_col="user_a", 
+    edges,
+    source_col="user_a",
     target_col="user_b",
-    weight_col="weight"  # optional
+    weight_col="weight",  # optional
 )
 
-# Define seed nodes for each community
-seed_nodes = {
-    "progressive": ["user123", "user456", "user789"],
-    "conservative": ["user321", "user654", "user987"]
-}
+# Seed nodes can be supplied in any of four shapes — pick whichever is
+# convenient. They are normalized internally to {node_id: label}.
+#
+# (1) node_id -> label                              (canonical dict)
+# (2) label -> [node_ids]                           (label-keyed dict)
+# (3) polars.DataFrame  with `node_id` + `label`    columns
+# (4) pandas.DataFrame  with `node_id` + `label`    columns
+seeds = {"user123": "progressive", "user321": "conservative"}
 
 # Run Guided Label Propagation
 results = guided_label_propagation(
     graph=graph,
-    seeds=seed_nodes,
     id_mapper=id_mapper,
+    seed_labels=seeds,
+    labels=["progressive", "conservative"],
+    alpha=0.85,
     max_iterations=100,
-    threshold=0.01
+    convergence_threshold=1e-6,
 )
 
-# Export results
-export_results(results, "political_affiliation_scores.csv")
 print(f"Classified {len(results)} nodes with community probabilities")
 ```
 
@@ -152,18 +155,18 @@ from guidedLP.glp.propagation import guided_label_propagation
 # Load sample datasets
 edges = pl.read_csv("tests/fixtures/sample_edgelist.csv")
 with open("tests/fixtures/sample_seeds.json", "r") as f:
-    seeds = json.load(f)
-
-# Convert seeds to proper format
-seed_nodes = {}
-for node, community in seeds.items():
-    if community not in seed_nodes:
-        seed_nodes[community] = []
-    seed_nodes[community].append(node)
+    seeds = json.load(f)  # already {node_id: label}
 
 # Build graph and run GLP
-graph, id_mapper = build_graph_from_edgelist(edges, "source", "target", "weight")
-results = guided_label_propagation(graph, seed_nodes, id_mapper)
+graph, id_mapper = build_graph_from_edgelist(
+    edges, source_col="source", target_col="target", weight_col="weight"
+)
+results = guided_label_propagation(
+    graph=graph,
+    id_mapper=id_mapper,
+    seed_labels=seeds,
+    labels=sorted(set(seeds.values())),
+)
 
 print(f"Sample analysis complete: {len(results)} nodes classified")
 ```
@@ -207,21 +210,24 @@ graph, id_mapper = build_graph_from_edgelist(
     political_edges, "follower", "following"
 )
 
-# Define known political accounts as seeds
+# Define known political accounts as seeds.
+# Any of the four supported shapes works here — label-keyed dict is convenient
+# when you collected seeds in lists per category.
 political_seeds = {
     "progressive": ["@aoc", "@berniesanders", "@ewarren"],
-    "conservative": ["@realdonaldtrump", "@tedcruz", "@marcorubio"]
+    "conservative": ["@realdonaldtrump", "@tedcruz", "@marcorubio"],
 }
 
 # Run validation to test accuracy
-accuracy, metrics = train_test_split_validation(
+metrics = train_test_split_validation(
     graph=graph,
-    seeds=political_seeds,
     id_mapper=id_mapper,
-    test_size=0.2
+    seed_labels=political_seeds,
+    labels=["progressive", "conservative"],
+    test_size=0.2,
 )
 
-print(f"Political classification accuracy: {accuracy:.3f}")
+print(f"Political classification accuracy: {metrics['accuracy']:.3f}")
 ```
 
 ### 2. Temporal Network Analysis
@@ -244,10 +250,12 @@ time_slices = create_time_slices(
 # Analyze each time slice
 for date, slice_edges in time_slices.items():
     graph, id_mapper = build_graph_from_edgelist(
-        slice_edges, "source", "target", "weight"
+        slice_edges, source_col="source", target_col="target", weight_col="weight"
     )
-    
-    results = guided_label_propagation(graph, seeds, id_mapper)
+
+    results = guided_label_propagation(
+        graph=graph, id_mapper=id_mapper, seed_labels=seeds, labels=list(set(seeds.values()))
+    )
     print(f"{date}: {len(results)} nodes classified")
 ```
 
@@ -267,12 +275,18 @@ department_seeds = {
     "physics": ["researcher5", "researcher6"]
 }
 
-results = guided_label_propagation(graph, department_seeds, id_mapper)
+results = guided_label_propagation(
+    graph=graph,
+    id_mapper=id_mapper,
+    seed_labels=department_seeds,  # label-keyed dict works directly
+    labels=["computer_science", "biology", "physics"],
+)
 
-# Analyze interdisciplinary collaboration
-for node_id, probabilities in results.items():
-    if max(probabilities.values()) < 0.7:  # Low confidence
-        print(f"{node_id}: Likely interdisciplinary researcher")
+# Analyze interdisciplinary collaboration: rows where the dominant label
+# wins by a small margin are candidate cross-disciplinary researchers.
+low_confidence = results.filter(results["confidence"] < 0.7)
+for row in low_confidence.iter_rows(named=True):
+    print(f"{row['node_id']}: Likely interdisciplinary researcher")
 ```
 
 ### 4. Temporal Bipartite-to-Unipartite Conversion

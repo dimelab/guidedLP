@@ -28,6 +28,7 @@ from guidedLP.common.exceptions import (
     ComputationError
 )
 from guidedLP.common.logging_config import get_logger, LoggingTimer
+from guidedLP.common.seed_input import SeedInput, normalize_seed_input
 
 logger = get_logger(__name__)
 
@@ -35,11 +36,13 @@ logger = get_logger(__name__)
 def train_test_split_validation(
     graph: nk.Graph,
     id_mapper: IDMapper,
-    seed_labels: Dict[Any, str],
+    seed_labels: SeedInput,
     labels: List[str],
     test_size: float = 0.2,
     stratify: bool = True,
     random_seed: Optional[int] = None,
+    seed_node_col: str = "node_id",
+    seed_label_col: str = "label",
     **glp_kwargs
 ) -> Dict[str, Any]:
     """
@@ -63,8 +66,10 @@ def train_test_split_validation(
         NetworkIt graph for propagation
     id_mapper : IDMapper
         Mapping between original and internal node IDs
-    seed_labels : Dict[Any, str]
-        Complete seed node labels (will be split for validation)
+    seed_labels : SeedInput
+        Complete seed node labels (will be split for validation). Accepts dict,
+        polars.DataFrame, or pandas.DataFrame — see
+        :func:`guidedLP.common.normalize_seed_input`.
     labels : List[str]
         All possible labels
     test_size : float, default 0.2
@@ -73,6 +78,10 @@ def train_test_split_validation(
         Whether to maintain label proportions in train/test splits
     random_seed : Optional[int], default None
         Random seed for reproducible splits
+    seed_node_col : str, default "node_id"
+        Column name for node IDs when ``seed_labels`` is a DataFrame.
+    seed_label_col : str, default "label"
+        Column name for labels when ``seed_labels`` is a DataFrame.
     **glp_kwargs
         Additional arguments passed to guided_label_propagation()
         
@@ -132,10 +141,11 @@ def train_test_split_validation(
     - Metrics calculated using sklearn.metrics for consistency
     - For very small seed sets, consider using cross_validate() instead
     """
-    
+    seed_labels = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
+
     logger.info(f"Starting train/test split validation with test_size={test_size}, "
                f"stratify={stratify}, total_seeds={len(seed_labels)}")
-    
+
     # Validate inputs
     _validate_split_inputs(seed_labels, labels, test_size, stratify)
     
@@ -361,24 +371,31 @@ def _count_labels(labels: List[str]) -> Dict[str, int]:
 
 def external_validation(
     predictions: pl.DataFrame,
-    validation_labels: Dict[Any, str],
-    labels: List[str]
+    validation_labels: SeedInput,
+    labels: List[str],
+    seed_node_col: str = "node_id",
+    seed_label_col: str = "label",
 ) -> Dict[str, Any]:
     """
     Validate GLP results against independent labeled dataset.
-    
+
     This function compares GLP predictions against an external validation
     set (e.g., expert-coded data, ground truth from external source) to
     assess generalization beyond the seed set.
-    
+
     Parameters
     ----------
     predictions : pl.DataFrame
         Output from guided_label_propagation()
-    validation_labels : Dict[Any, str]
-        Independent labeled nodes (node_id -> label)
+    validation_labels : SeedInput
+        Independent labeled nodes in any of four supported shapes (see
+        :func:`guidedLP.common.normalize_seed_input`).
     labels : List[str]
         All possible labels
+    seed_node_col : str, default "node_id"
+        Column name for node IDs when ``validation_labels`` is a DataFrame.
+    seed_label_col : str, default "label"
+        Column name for labels when ``validation_labels`` is a DataFrame.
         
     Returns
     -------
@@ -398,9 +415,12 @@ def external_validation(
     - Uses dominant_label from predictions for comparison
     - Useful for assessing real-world performance
     """
-    
+    validation_labels = normalize_seed_input(
+        validation_labels, seed_node_col, seed_label_col
+    )
+
     logger.info(f"Starting external validation with {len(validation_labels)} validation nodes")
-    
+
     if not validation_labels:
         raise ValidationError("validation_labels cannot be empty")
     
@@ -485,12 +505,14 @@ def get_validation_summary(validation_results: Dict[str, Any]) -> str:
 def cross_validate(
     graph: nk.Graph,
     id_mapper: IDMapper,
-    seed_labels: Dict[Any, str],
+    seed_labels: SeedInput,
     labels: List[str],
     k_folds: int = 5,
     stratify: bool = True,
     random_seed: Optional[int] = None,
     n_jobs: int = 1,
+    seed_node_col: str = "node_id",
+    seed_label_col: str = "label",
     **glp_kwargs
 ) -> Dict[str, Any]:
     """
@@ -513,8 +535,10 @@ def cross_validate(
         NetworkIt graph for propagation
     id_mapper : IDMapper
         Mapping between original and internal node IDs
-    seed_labels : Dict[Any, str]
-        Complete seed node labels (will be split into k folds)
+    seed_labels : SeedInput
+        Complete seed node labels (will be split into k folds). Accepts dict,
+        polars.DataFrame, or pandas.DataFrame — see
+        :func:`guidedLP.common.normalize_seed_input`.
     labels : List[str]
         All possible labels
     k_folds : int, default 5
@@ -525,6 +549,10 @@ def cross_validate(
         Random seed for reproducible fold generation
     n_jobs : int, default 1
         Number of parallel jobs for fold processing (1 = sequential)
+    seed_node_col : str, default "node_id"
+        Column name for node IDs when ``seed_labels`` is a DataFrame.
+    seed_label_col : str, default "label"
+        Column name for labels when ``seed_labels`` is a DataFrame.
     **glp_kwargs
         Additional arguments passed to guided_label_propagation()
         
@@ -583,10 +611,11 @@ def cross_validate(
     - Results provide confidence intervals for performance estimates
     - Parallel processing (n_jobs > 1) can speed up computation for large k_folds
     """
-    
+    seed_labels = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
+
     logger.info(f"Starting {k_folds}-fold cross-validation with {len(seed_labels)} seeds, "
                f"stratify={stratify}, n_jobs={n_jobs}")
-    
+
     # Validate inputs
     _validate_cv_inputs(seed_labels, labels, k_folds, stratify)
     

@@ -12,6 +12,7 @@ from datetime import datetime
 import warnings
 
 from .exceptions import ValidationError
+from .seed_input import SeedInput, normalize_seed_input
 
 
 def validate_edgelist_dataframe(
@@ -324,22 +325,30 @@ def validate_timestamps(
 
 
 def validate_seed_labels(
-    seed_labels: Dict[Any, str],
+    seed_labels: SeedInput,
     labels: List[str],
     min_seeds_per_label: int = 1,
     check_balance: bool = True,
-    max_imbalance_ratio: float = 10.0
+    max_imbalance_ratio: float = 10.0,
+    seed_node_col: str = "node_id",
+    seed_label_col: str = "label",
 ) -> None:
     """
     Validate seed labels for Guided Label Propagation.
-    
+
     Checks that seed labels are properly formatted, contain valid labels,
     have sufficient representation per class, and are reasonably balanced.
-    
+
     Parameters
     ----------
-    seed_labels : Dict[Any, str]
-        Dictionary mapping node IDs to their labels
+    seed_labels : SeedInput
+        Seed labels in any of four supported shapes (see
+        :func:`guidedLP.common.normalize_seed_input`):
+
+        - ``Dict[Any, str]`` (node_id → label)
+        - ``Dict[str, List[Any]]`` (label → list of node_ids)
+        - polars.DataFrame with node_id and label columns
+        - pandas.DataFrame with node_id and label columns
     labels : List[str]
         List of all valid labels in the label space
     min_seeds_per_label : int, default 1
@@ -348,28 +357,34 @@ def validate_seed_labels(
         Whether to check for label balance and warn about imbalances
     max_imbalance_ratio : float, default 10.0
         Maximum ratio between most and least frequent labels before warning
-        
+    seed_node_col : str, default "node_id"
+        Column name for node IDs when ``seed_labels`` is a DataFrame.
+    seed_label_col : str, default "label"
+        Column name for labels when ``seed_labels`` is a DataFrame.
+
     Raises
     ------
     ValidationError
         If seed labels fail validation checks
-        
+
     Examples
     --------
     >>> seed_labels = {"user1": "left", "user2": "right", "user3": "left"}
     >>> labels = ["left", "right"]
     >>> validate_seed_labels(seed_labels, labels)  # Should pass
-    
+
     >>> invalid_seeds = {"user1": "invalid_label", "user2": "right"}
     >>> validate_seed_labels(invalid_seeds, labels)  # doctest: +SKIP
     ValidationError: Validation error in field 'seed_labels': Invalid labels found
-    
+
     Notes
     -----
     - All seed labels must be present in the labels list
     - Recommends balanced representation across labels for better performance
     - Node IDs must be hashable (same as edge list requirements)
     """
+    seed_labels = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
+
     if not seed_labels:
         raise ValidationError("Seed labels dictionary is empty", field="seed_labels")
     

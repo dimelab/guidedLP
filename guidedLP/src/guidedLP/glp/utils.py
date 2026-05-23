@@ -19,28 +19,32 @@ from guidedLP.common.exceptions import (
     ComputationError
 )
 from guidedLP.common.logging_config import get_logger, LoggingTimer
+from guidedLP.common.seed_input import SeedInput, normalize_seed_input
 
 logger = get_logger(__name__)
 
 
 def create_balanced_seed_set(
-    candidate_seeds: Dict[Any, str],
+    candidate_seeds: SeedInput,
     labels: List[str],
     n_per_label: Optional[int] = None,
     method: str = "undersample",
-    random_seed: Optional[int] = None
+    random_seed: Optional[int] = None,
+    seed_node_col: str = "node_id",
+    seed_label_col: str = "label",
 ) -> Dict[Any, str]:
     """
     Create balanced seed set from potentially imbalanced candidate data.
-    
+
     This function addresses class imbalance in seed node selection by creating
     a balanced set where each label has the same number of seed nodes. This
     prevents bias toward majority classes during label propagation.
-    
+
     Parameters
     ----------
-    candidate_seeds : Dict[Any, str]
-        All available labeled nodes (node_id -> label)
+    candidate_seeds : SeedInput
+        All available labeled nodes in any of four supported shapes (see
+        :func:`guidedLP.common.normalize_seed_input`).
     labels : List[str]
         All possible labels to balance
     n_per_label : Optional[int], default None
@@ -52,6 +56,10 @@ def create_balanced_seed_set(
         - "oversample": Allow duplicates in minority classes to reach n_per_label
     random_seed : Optional[int], default None
         Random seed for reproducible sampling
+    seed_node_col : str, default "node_id"
+        Column name for node IDs when ``candidate_seeds`` is a DataFrame.
+    seed_label_col : str, default "label"
+        Column name for labels when ``candidate_seeds`` is a DataFrame.
         
     Returns
     -------
@@ -90,10 +98,13 @@ def create_balanced_seed_set(
     - For very small seed sets, consider using all available seeds instead
     - Balanced seeds often improve propagation performance on imbalanced networks
     """
-    
+    candidate_seeds = normalize_seed_input(
+        candidate_seeds, seed_node_col, seed_label_col
+    )
+
     logger.info(f"Creating balanced seed set from {len(candidate_seeds)} candidates, "
                f"method={method}, n_per_label={n_per_label}")
-    
+
     # Validate inputs
     _validate_balance_inputs(candidate_seeds, labels, n_per_label, method)
     
@@ -439,20 +450,30 @@ def _alpha_from_seed_ratio(graph: nk.Graph, seed_count: int) -> float:
     return alpha
 
 
-def get_seed_statistics(seed_labels: Dict[Any, str], labels: List[str]) -> Dict[str, Any]:
+def get_seed_statistics(
+    seed_labels: SeedInput,
+    labels: List[str],
+    seed_node_col: str = "node_id",
+    seed_label_col: str = "label",
+) -> Dict[str, Any]:
     """
     Analyze seed set statistics and balance.
-    
+
     This utility function provides diagnostic information about a seed set,
     including distribution balance, coverage, and recommendations.
-    
+
     Parameters
     ----------
-    seed_labels : Dict[Any, str]
-        Seed nodes and their labels
+    seed_labels : SeedInput
+        Seed nodes and their labels in any of four supported shapes (see
+        :func:`guidedLP.common.normalize_seed_input`).
     labels : List[str]
         All possible labels
-        
+    seed_node_col : str, default "node_id"
+        Column name for node IDs when ``seed_labels`` is a DataFrame.
+    seed_label_col : str, default "label"
+        Column name for labels when ``seed_labels`` is a DataFrame.
+
     Returns
     -------
     Dict[str, Any]
@@ -462,7 +483,7 @@ def get_seed_statistics(seed_labels: Dict[Any, str], labels: List[str]) -> Dict[
         - balance_ratio: Ratio of min to max class size
         - is_balanced: Whether distribution is reasonably balanced
         - recommendations: Suggested improvements
-        
+
     Examples
     --------
     >>> stats = get_seed_statistics(seed_labels, ["A", "B", "C"])
@@ -470,7 +491,8 @@ def get_seed_statistics(seed_labels: Dict[Any, str], labels: List[str]) -> Dict[
     >>> if not stats['is_balanced']:
     ...     print("Recommendations:", stats['recommendations'])
     """
-    
+    seed_labels = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
+
     if not seed_labels:
         return {
             "label_counts": {},
