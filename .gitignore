@@ -202,3 +202,8 @@ benchmark_results/
 
 # Large test data
 tests/data/large/
+
+# Markdown files: ignore by default, only README.md (at any depth) may be pushed.
+# Add more exceptions below as needed (e.g. `!CONTRIBUTING.md`).
+*.md
+!README.md
