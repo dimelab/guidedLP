@@ -33,9 +33,18 @@ logger = get_logger(__name__)
 
 # Available filter types
 SUPPORTED_FILTER_TYPES = [
-    "min_degree", "max_degree", "min_weight", "giant_component_only",
-    "nodes", "exclude_nodes", "centrality"
+    "min_degree", "max_degree",
+    "min_source_degree", "max_source_degree",
+    "min_target_degree", "max_target_degree",
+    "min_weight", "giant_component_only",
+    "nodes", "exclude_nodes", "centrality",
 ]
+
+# Partition-aware degree filter keys (frame-friendly subset).
+PARTITION_DEGREE_FILTERS = {
+    "min_source_degree", "max_source_degree",
+    "min_target_degree", "max_target_degree",
+}
 
 # Seed-proximity methods
 SUPPORTED_PROXIMITY_METHODS = ["khop", "ppr", "lte"]
@@ -43,7 +52,12 @@ SUPPORTED_DIRECTIONS = ["out", "in", "both"]
 
 
 # Filter types that operate purely on the edge frame (no graph traversal).
-FRAME_FRIENDLY_FILTERS = {"min_degree", "max_degree", "min_weight", "nodes", "exclude_nodes"}
+FRAME_FRIENDLY_FILTERS = {
+    "min_degree", "max_degree",
+    "min_source_degree", "max_source_degree",
+    "min_target_degree", "max_target_degree",
+    "min_weight", "nodes", "exclude_nodes",
+}
 TRAVERSAL_REQUIRED_FILTERS = {"giant_component_only", "centrality"}
 
 
@@ -75,8 +89,16 @@ def filter_graph(
         (frames already use original IDs).
     filters : Dict[str, Any]
         Dictionary specifying filter criteria. Supported filters:
-        - "min_degree": int - Minimum degree threshold
-        - "max_degree": int - Maximum degree threshold
+        - "min_degree": int - Minimum total degree threshold
+        - "max_degree": int - Maximum total degree threshold
+        - "min_source_degree": int - Minimum count of distinct targets per
+          source node. Drops source nodes (and their edges) below the
+          threshold. For bipartite frames this is the natural source-side
+          partition filter; for unipartite directed graphs it's out-degree.
+        - "max_source_degree": int - Maximum count of distinct targets per
+          source node. Drops generic high-activity sources (e.g. spam users).
+        - "min_target_degree" / "max_target_degree": int - Same as
+          ``*_source_degree`` but for the target column / partition.
         - "min_weight": float - Minimum edge weight threshold
         - "giant_component_only": bool - Keep only largest connected component
           (**graph input only** — requires traversal)
@@ -198,6 +220,12 @@ def filter_graph(
                     mask = _apply_degree_filter(graph, filter_type, filter_value)
                     node_masks.append(mask)
 
+                elif filter_type in PARTITION_DEGREE_FILTERS:
+                    # Partition-aware degree is naturally an edge predicate:
+                    # only the failing role-side edges are dropped, not the node.
+                    mask = _apply_partition_degree_filter(graph, filter_type, filter_value)
+                    edge_masks.append(mask)
+
                 elif filter_type == "min_weight":
                     mask = _apply_weight_filter(graph, filter_value)
                     edge_masks.append(mask)
@@ -312,6 +340,22 @@ def _filter_edges_frame(
         elif filter_type == "max_degree":
             kept = set(degrees.filter(pl.col("degree") <= filter_value)["node"].to_list())
             surviving_node_sets.append(kept)
+        elif filter_type in PARTITION_DEGREE_FILTERS:
+            # Edge-level semantic: drop only edges where the failing node
+            # appears in its filtered role (source or target).
+            if filter_type in ("min_source_degree", "max_source_degree"):
+                proj_col, other_col = "source_id", "target_id"
+            else:
+                proj_col, other_col = "target_id", "source_id"
+            deg_df = (
+                df.group_by(proj_col)
+                  .agg(pl.col(other_col).n_unique().alias("d"))
+            )
+            if filter_type.startswith("min_"):
+                failing = deg_df.filter(pl.col("d") < filter_value)[proj_col].to_list()
+            else:
+                failing = deg_df.filter(pl.col("d") > filter_value)[proj_col].to_list()
+            edge_predicates.append(~pl.col(proj_col).is_in(failing))
         elif filter_type == "min_weight":
             edge_predicates.append(pl.col("weight") >= filter_value)
         elif filter_type == "nodes":
@@ -377,10 +421,26 @@ def _validate_filter_parameters(filters: Dict[str, Any], combine: str) -> None:
                 f"Supported types: {SUPPORTED_FILTER_TYPES}"
             )
 
-    # Check for conflicting degree filters
+    # Check for conflicting degree filters (total degree)
     if "min_degree" in filters and "max_degree" in filters:
         if filters["min_degree"] > filters["max_degree"]:
             raise ValidationError("min_degree cannot be greater than max_degree")
+
+    # Same conflict check on partition-aware degree pairs.
+    for side in ("source", "target"):
+        min_key, max_key = f"min_{side}_degree", f"max_{side}_degree"
+        if min_key in filters and max_key in filters:
+            if filters[min_key] > filters[max_key]:
+                raise ValidationError(f"{min_key} cannot be greater than {max_key}")
+
+    # Validate partition-aware degree thresholds are positive ints.
+    for key in PARTITION_DEGREE_FILTERS:
+        if key in filters:
+            v = filters[key]
+            if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                raise ValidationError(
+                    f"{key} threshold must be a non-negative integer, got {v!r}"
+                )
 
     # Validate centrality filter format
     if "centrality" in filters:
@@ -404,6 +464,44 @@ def _apply_degree_filter(graph: nk.Graph, filter_type: str, threshold: int) -> n
         return degrees <= threshold
     else:
         raise ValueError(f"Unknown degree filter type: {filter_type}")
+
+
+def _apply_partition_degree_filter(
+    graph: nk.Graph, filter_type: str, threshold: int
+) -> np.ndarray:
+    """Build an *edge* mask for the ``min/max_source/target_degree`` filters.
+
+    Counts distinct neighbors on the *other* side per node (the n_unique
+    semantic), then drops only the edges in which a failing node appears on
+    the filtered side. A node that fails as a source can still keep its
+    target-side edges, and vice versa — the filter is partition-aware. Nodes
+    that never appear on the filtered side are unaffected.
+    """
+    sources, targets, _ = _extract_edge_arrays(graph)
+    n_edges = sources.size
+    if n_edges == 0:
+        return np.ones(0, dtype=bool)
+
+    if filter_type in ("min_source_degree", "max_source_degree"):
+        proj_arr, other_arr = sources, targets
+    else:
+        proj_arr, other_arr = targets, sources
+
+    degrees = (
+        pl.DataFrame({"node": proj_arr, "other": other_arr})
+        .group_by("node")
+        .agg(pl.col("other").n_unique().alias("d"))
+    )
+
+    if filter_type.startswith("min_"):
+        failing_nodes = set(degrees.filter(pl.col("d") < threshold)["node"].to_list())
+    else:
+        failing_nodes = set(degrees.filter(pl.col("d") > threshold)["node"].to_list())
+
+    if not failing_nodes:
+        return np.ones(n_edges, dtype=bool)
+
+    return np.array([int(n) not in failing_nodes for n in proj_arr], dtype=bool)
 
 
 def _apply_weight_filter(graph: nk.Graph, min_weight: float) -> np.ndarray:

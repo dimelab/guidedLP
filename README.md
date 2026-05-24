@@ -234,6 +234,7 @@ The pipeline below mirrors a common social-CSS preprocessing chain — **prune l
 
 ```python
 import polars as pl
+from guidedLP.network.filtering import filter_graph
 from guidedLP.network.backboning import apply_backbone
 from guidedLP.network.construction import build_graph_from_edgelist, project_bipartite
 from guidedLP.glp.propagation import guided_label_propagation
@@ -249,16 +250,9 @@ edges = pl.read_csv("user_hashtag_counts.csv").rename({
 })
 
 # ── Step 1: min_source_degree filter ──────────────────────────────────────
-# Drop users with fewer than 5 distinct hashtags. There isn't a partition-
-# aware filter in `filter_graph` (its `min_degree` counts both sides), so we
-# just express it directly in Polars — this is the kind of glue step the
-# frame-native pipeline makes painless.
-src_deg = (
-    edges.group_by("source_id")
-        .agg(pl.col("target_id").n_unique().alias("deg"))
-)
-high_deg_users = src_deg.filter(pl.col("deg") >= 5)["source_id"].to_list()
-edges = edges.filter(pl.col("source_id").is_in(high_deg_users))
+# Drop users with fewer than 5 distinct hashtags. The matching
+# *_target_degree filters exist too, for trimming low-activity hashtags.
+edges = filter_graph(edges, filters={"min_source_degree": 5})
 
 # ── Step 2: bipartite backbone ────────────────────────────────────────────
 # Remove edges to generic high-frequency hashtags. SVN returns the per-edge
