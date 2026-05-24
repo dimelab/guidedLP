@@ -323,6 +323,130 @@ class TestDegreeThreshold:
         assert backbone_graph.numberOfEdges() <= 4  # Max possible edges between 2 nodes
 
 
+class TestNoiseCorrected:
+    """Test the Coscia & Neffke noise-corrected backbone."""
+
+    def test_noise_corrected_basic(self):
+        """The highest-lift edge (largest deviation from configuration-model
+        expectation) should be ranked highest by score, even when another edge
+        has greater raw weight."""
+        # Strengths under this edgelist: A=12 (1+1+10), B=2, C=2, D=10.
+        # The configuration-model normalization uses n.. = Σ s_i = 2m = 26.
+        # Expected vs. observed:
+        #   A-B: E=12*2/26≈0.92, obs=1  → kappa*w=13/12, score=1/25
+        #   A-C: same as A-B    → score=1/25
+        #   A-D: E=12*10/26≈4.6, obs=10 → kappa*w=13/6,  score=7/19
+        #   B-C: E=2*2/26≈0.15,  obs=1  → kappa*w=13/2,  score=11/15  (highest lift)
+        edges = pl.DataFrame({
+            'source': ['A', 'A', 'A', 'B'],
+            'target': ['B', 'C', 'D', 'C'],
+            'weight': [1.0, 1.0, 10.0, 1.0],
+        })
+        graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
+
+        backbone_graph, _, edge_details = apply_backbone(
+            graph, mapper, method="noise_corrected", threshold=0.5,
+            return_filtered_edges=True,
+        )
+
+        assert edge_details.height == 4
+        assert {'score', 'sdev_cij', 'kept'}.issubset(set(edge_details.columns))
+
+        bc = edge_details.filter(
+            ((pl.col('source_id') == 'B') & (pl.col('target_id') == 'C'))
+            | ((pl.col('source_id') == 'C') & (pl.col('target_id') == 'B'))
+        )
+        ad = edge_details.filter(
+            ((pl.col('source_id') == 'A') & (pl.col('target_id') == 'D'))
+            | ((pl.col('source_id') == 'D') & (pl.col('target_id') == 'A'))
+        )
+        assert bc.height == 1 and ad.height == 1
+
+        # Score ranking reflects lift, not raw weight.
+        assert float(bc['score'][0]) == pytest.approx(11.0 / 15.0, rel=1e-6)
+        assert float(ad['score'][0]) == pytest.approx(7.0 / 19.0, rel=1e-6)
+        assert float(bc['score'][0]) == float(edge_details['score'].max())
+
+        # Returned graph must agree with the `kept` column.
+        assert backbone_graph.numberOfEdges() == int(edge_details['kept'].sum())
+
+    def test_threshold_monotonic(self):
+        """Raising the threshold can only keep fewer (or equal) edges."""
+        np.random.seed(7)
+        n_edges = 200
+        srcs = np.random.randint(0, 30, n_edges)
+        tgts = np.random.randint(0, 30, n_edges)
+        valid = srcs != tgts
+        srcs, tgts = srcs[valid], tgts[valid]
+        weights = np.random.exponential(2.0, srcs.size)
+
+        edges = pl.DataFrame({
+            'source': [f'n{s}' for s in srcs],
+            'target': [f'n{t}' for t in tgts],
+            'weight': weights,
+        })
+        graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
+
+        kept_counts = []
+        for thr in [0.5, 1.0, 2.0, 4.0]:
+            bb, _ = apply_backbone(
+                graph, mapper, method="noise_corrected",
+                threshold=thr, keep_disconnected=True,
+            )
+            kept_counts.append(bb.numberOfEdges())
+
+        # Strictly non-increasing in threshold.
+        assert kept_counts == sorted(kept_counts, reverse=True)
+
+    def test_directed_vs_undirected(self):
+        """Noise-corrected runs on both graph types and produces sensible output."""
+        edges = pl.DataFrame({
+            'source': ['A', 'B', 'C', 'A'],
+            'target': ['B', 'C', 'A', 'C'],
+            'weight': [1.0, 5.0, 2.0, 3.0],
+        })
+
+        for directed in (False, True):
+            graph, mapper = build_graph_from_edgelist(
+                edges, weight_col='weight', directed=directed
+            )
+            _, _, edge_details = apply_backbone(
+                graph, mapper, method="noise_corrected",
+                threshold=1.0, return_filtered_edges=True,
+            )
+            # One row per edge in the original graph.
+            assert edge_details.height == graph.numberOfEdges()
+            # Scores live in [-1, 1] by construction.
+            assert float(edge_details['score'].min()) >= -1.0 - 1e-9
+            assert float(edge_details['score'].max()) <= 1.0 + 1e-9
+            # sdev is non-negative.
+            assert float(edge_details['sdev_cij'].min()) >= -1e-12
+
+    def test_empty_graph(self):
+        """Empty graphs return an empty backbone without error."""
+        empty_graph = nk.Graph(0, weighted=True)
+        empty_mapper = IDMapper()
+        bb, _ = apply_backbone(empty_graph, empty_mapper, method="noise_corrected")
+        assert bb.numberOfNodes() == 0
+        assert bb.numberOfEdges() == 0
+
+    def test_invalid_threshold(self):
+        """threshold must be strictly positive."""
+        edges = pl.DataFrame({
+            'source': ['A'], 'target': ['B'], 'weight': [1.0],
+        })
+        graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
+
+        with pytest.raises(ValidationError, match="threshold must be > 0"):
+            apply_backbone(graph, mapper, method="noise_corrected", threshold=0.0)
+        with pytest.raises(ValidationError, match="threshold must be > 0"):
+            apply_backbone(graph, mapper, method="noise_corrected", threshold=-1.0)
+
+    def test_noise_corrected_in_available_methods(self):
+        """The method name must be advertised in AVAILABLE_METHODS."""
+        assert "noise_corrected" in AVAILABLE_METHODS
+
+
 class TestBackboneValidation:
     """Test parameter validation and error handling."""
     
@@ -713,10 +837,14 @@ class TestGraphMapperSynchronization:
         graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
 
         # Apply multiple backboning methods
-        for method in ['disparity', 'weight_threshold', 'degree_threshold']:
+        for method in ['disparity', 'noise_corrected', 'weight_threshold', 'degree_threshold']:
             if method == 'disparity':
                 backbone_graph, backbone_mapper = apply_backbone(
                     graph, mapper, method=method, alpha=0.05, keep_disconnected=False
+                )
+            elif method == 'noise_corrected':
+                backbone_graph, backbone_mapper = apply_backbone(
+                    graph, mapper, method=method, threshold=1.0, keep_disconnected=False
                 )
             elif method == 'weight_threshold':
                 backbone_graph, backbone_mapper = apply_backbone(

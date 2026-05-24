@@ -236,28 +236,27 @@ print(f"Bipartite:   {bipartite.numberOfNodes():>6} nodes, {bipartite.numberOfEd
 # Statistically Validated Network filter on the bipartite layer.
 # For each edge (u, item), test whether the observed weight is more than
 # expected under a configuration-model null preserving node strengths.
-# - alpha       = significance cutoff (0.01–0.05 typical)
+# - alpha       = per-edge significance cutoff (0.01–0.05 typical)
 # - correction  = multiple-testing correction:
 #                 "fdr_bh" (default): Benjamini-Hochberg FDR — scales to
 #                                     millions of edges; recommended.
 #                 "bonferroni":       very conservative — at |E| ≥ ~10⁵
 #                                     even α = 0.99 can filter everything.
 #                 "none":             use α directly; most permissive.
-# - node_level  = whether the test decides edges or whole nodes:
-#                 False (default): per-edge test; edges with high p-values are
-#                                  dropped. Generic high-degree nodes usually
-#                                  keep many edges and survive trimmed.
-#                 True:  per-NODE test via Fisher's combined p-value
-#                        (−2·Σ log p_i ~ χ²(2k)); entire nodes whose overall
-#                        connectivity is unremarkable are removed. Use this
-#                        when you want to *eliminate* generic items rather
-#                        than just trim them.
+# - min_node_retention = optional post-filter that drops whole nodes whose
+#                        share of surviving edges falls below the threshold.
+#                        Use this to *eliminate* generic items rather than
+#                        just trim their fringes. Captures the intuition
+#                        "if most of a node's edges were noise, the node is
+#                        noise." Typical values: 0.5 (lost >half ⇒ drop),
+#                        0.3 (lost >70% ⇒ drop). Leave as None for no
+#                        node-level filtering.
 backbone, backbone_mapper = apply_backbone(
     bipartite, full_mapper,
     method="bipartite_svn",
     alpha=0.05,
     correction="fdr_bh",
-    node_level=True,          # set False for the lighter edge-only filter
+    min_node_retention=0.5,   # leave None for per-edge SVN only
     keep_disconnected=False,
 )
 print(f"Backbone:    {backbone.numberOfNodes():>6} nodes, {backbone.numberOfEdges():>8} edges")
@@ -282,15 +281,15 @@ results = guided_label_propagation(
 )
 ```
 
-The `bipartite_svn` filter exposes three knobs — `alpha`, `correction`, and `node_level` — all with sensible defaults:
+The `bipartite_svn` filter exposes three knobs — `alpha`, `correction`, and `min_node_retention`:
 
 | Flag | Default | What it does |
 |---|---|---|
-| `alpha` | `0.05` | Significance cutoff. Tighter (e.g. `0.01`) keeps fewer edges/nodes. |
-| `correction` | `"fdr_bh"` | Benjamini-Hochberg FDR. Use `"bonferroni"` only on small graphs (thousands of edges); on millions it filters everything. `"none"` disables correction entirely. |
-| `node_level` | `False` | When `True`, combines each node's incident edges' p-values via Fisher's method and tests *nodes* for significance. Drops entire generic-noise nodes rather than just trimming them. Recommended when you want to eliminate the generic items, not just thin their fringes. |
+| `alpha` | `0.05` | Significance cutoff for per-edge p-values. Tighter (e.g. `0.01`) keeps fewer edges. |
+| `correction` | `"fdr_bh"` | Multiple-testing correction across the per-edge tests. Benjamini-Hochberg FDR is the right default. `"bonferroni"` is only sensible for small graphs (thousands of edges) — on millions it filters everything. `"none"` disables correction. |
+| `min_node_retention` | `None` | Optional post-filter. After per-edge SVN, each node's `surviving_edges / original_edges` ratio is computed; nodes below the threshold are removed entirely along with their remaining edges. Use this to eliminate generic items that survived per-edge SVN with a fraction of their edges. Typical values: `0.5` (drop nodes that lost more than half), `0.3` (more aggressive). |
 
-Generic targets get filtered out automatically because high-degree nodes have high *expected* weight under the null — no degree threshold to tune. The `node_level=True` mode is the stronger option: a generic item whose every edge has a high p-value will have a non-significant Fisher-combined p and gets removed entirely.
+The per-edge test naturally drops edges to generic items (their expected weight under the null is high), but a generic item that's connected to thousands of users typically still keeps hundreds of edges and stays in the graph. The `min_node_retention` post-filter catches those: a generic item whose 1000-edge connectivity got pruned to 100 edges has retention `0.1` and gets removed at `min_node_retention=0.5`.
 
 #### Unipartite case — `disparity` (Serrano et al. 2009)
 
