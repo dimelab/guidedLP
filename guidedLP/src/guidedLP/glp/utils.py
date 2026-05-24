@@ -13,6 +13,7 @@ import random
 import numpy as np
 import networkit as nk
 
+from guidedLP.common.id_mapper import IDMapper
 from guidedLP.common.exceptions import (
     ValidationError,
     ConfigurationError,
@@ -543,4 +544,163 @@ def get_seed_statistics(
         "balance_ratio": balance_ratio,
         "is_balanced": is_balanced,
         "recommendations": recommendations
+    }
+
+
+def check_seed_coverage(
+    id_mapper: IDMapper,
+    seeds: SeedInput,
+    test_seeds: Optional[SeedInput] = None,
+    seed_node_col: str = "node_id",
+    seed_label_col: str = "label",
+    missing_sample_size: int = 10,
+) -> Dict[str, Any]:
+    """
+    Diagnose how many seed nodes are actually present in a graph's IDMapper.
+
+    Useful after preprocessing steps that can drop nodes — backboning, bipartite
+    projection, giant-component filtering — to verify the surviving seed set is
+    still adequate before running propagation. Returns a structured report
+    rather than printing; callers can pretty-print as they see fit.
+
+    Parameters
+    ----------
+    id_mapper : IDMapper
+        Mapper for the graph you intend to propagate over.
+    seeds : SeedInput
+        Training seeds in any of the four supported shapes (see
+        :func:`guidedLP.common.normalize_seed_input`).
+    test_seeds : Optional[SeedInput], default None
+        If provided, the returned report also covers the test set and the
+        train/test overlap.
+    seed_node_col : str, default "node_id"
+        Column name for node IDs when an input is a DataFrame.
+    seed_label_col : str, default "label"
+        Column name for labels when an input is a DataFrame.
+    missing_sample_size : int, default 10
+        Cap on how many missing node IDs to include in each ``missing_sample``
+        list. Set to 0 to disable sampling.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Always contains a ``"train"`` subdict. When ``test_seeds`` is supplied,
+        also contains ``"test"`` and ``"overlap"`` subdicts.
+
+        ``train`` / ``test`` subdict::
+
+            {
+                "total":          int,      # number of seeds passed in
+                "present":        int,      # how many are in the mapper
+                "missing":        int,      # how many are not
+                "coverage":       float,    # present / total, or 0.0 if total == 0
+                "by_label": {
+                    label: {
+                        "total":    int,
+                        "present":  int,
+                        "missing":  int,
+                        "coverage": float,
+                    },
+                    ...
+                },
+                "missing_sample": List[Any],  # up to missing_sample_size IDs
+            }
+
+        ``overlap`` subdict::
+
+            {
+                "count":       int,                       # nodes in both train and test
+                "conflicting": int,                       # of which have different labels
+                "sample":      List[Tuple[node, train_label, test_label]],
+            }
+
+    Examples
+    --------
+    >>> # After backboning, check how many seeds survived
+    >>> report = check_seed_coverage(backbone_mapper, seeds)
+    >>> if report["train"]["coverage"] < 0.8:
+    ...     print(f"Only {report['train']['present']}/{report['train']['total']} "
+    ...           f"seeds survived. Missing sample: {report['train']['missing_sample']}")
+
+    >>> # Verify both train and test before validation
+    >>> report = check_seed_coverage(mapper, train, test_seeds=test)
+    >>> if report["overlap"]["conflicting"] > 0:
+    ...     print(f"Warning: {report['overlap']['conflicting']} nodes have "
+    ...           f"different train/test labels")
+    """
+    train_normalized = normalize_seed_input(seeds, seed_node_col, seed_label_col)
+    train_report = _coverage_report(
+        train_normalized, id_mapper, missing_sample_size
+    )
+
+    result: Dict[str, Any] = {"train": train_report}
+
+    if test_seeds is None:
+        return result
+
+    test_normalized = normalize_seed_input(
+        test_seeds, seed_node_col, seed_label_col
+    )
+    result["test"] = _coverage_report(
+        test_normalized, id_mapper, missing_sample_size
+    )
+
+    # Overlap analysis between train and test (independent of mapper membership).
+    overlap_nodes = set(train_normalized) & set(test_normalized)
+    conflicts = [
+        (node, train_normalized[node], test_normalized[node])
+        for node in overlap_nodes
+        if train_normalized[node] != test_normalized[node]
+    ]
+    overlap_sample_cap = missing_sample_size if missing_sample_size > 0 else 0
+    overlap_sample = (
+        conflicts[:overlap_sample_cap] if conflicts else list(overlap_nodes)[:overlap_sample_cap]
+    )
+    result["overlap"] = {
+        "count": len(overlap_nodes),
+        "conflicting": len(conflicts),
+        "sample": overlap_sample,
+    }
+
+    return result
+
+
+def _coverage_report(
+    seed_dict: Dict[Any, str],
+    id_mapper: IDMapper,
+    missing_sample_size: int,
+) -> Dict[str, Any]:
+    """Build the per-side coverage subdict for a normalized seed dict."""
+    total = len(seed_dict)
+    present_nodes = [n for n in seed_dict if id_mapper.has_original(n)]
+    missing_nodes = [n for n in seed_dict if not id_mapper.has_original(n)]
+    present_count = len(present_nodes)
+    missing_count = len(missing_nodes)
+    coverage = present_count / total if total > 0 else 0.0
+
+    # Per-label breakdown.
+    by_label: Dict[str, Dict[str, Any]] = {}
+    for node, label in seed_dict.items():
+        bucket = by_label.setdefault(
+            label,
+            {"total": 0, "present": 0, "missing": 0, "coverage": 0.0},
+        )
+        bucket["total"] += 1
+        if id_mapper.has_original(node):
+            bucket["present"] += 1
+        else:
+            bucket["missing"] += 1
+    for bucket in by_label.values():
+        bucket["coverage"] = (
+            bucket["present"] / bucket["total"] if bucket["total"] > 0 else 0.0
+        )
+
+    cap = missing_sample_size if missing_sample_size > 0 else 0
+    return {
+        "total": total,
+        "present": present_count,
+        "missing": missing_count,
+        "coverage": coverage,
+        "by_label": by_label,
+        "missing_sample": missing_nodes[:cap],
     }

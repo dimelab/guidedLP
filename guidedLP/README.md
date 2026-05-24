@@ -237,13 +237,21 @@ print(f"Backbone:     {backbone.numberOfNodes():>6} nodes, {backbone.numberOfEdg
 
 # IMPORTANT: apply_backbone returns a NEW id_mapper. Always pass it (not the
 # original) to downstream functions. Some seed nodes may also be dropped if
-# all their edges fell below significance — verify seeds are still present.
+# all their edges fell below significance — use check_seed_coverage to verify
+# what survived (per label) before propagation.
+from guidedLP.glp.utils import check_seed_coverage
+
 seeds = {"@aoc": "left", "@berniesanders": "left",
          "@realdonaldtrump": "right", "@tedcruz": "right"}
+report = check_seed_coverage(backbone_mapper, seeds)
+if report["train"]["coverage"] < 1.0:
+    print(f"WARNING: {report['train']['missing']} seed(s) dropped by backboning: "
+          f"{report['train']['missing_sample']}")
+    for label, stats in report["train"]["by_label"].items():
+        print(f"  {label}: {stats['present']}/{stats['total']} survived")
+
+# Keep only seeds that are still in the backbone for the propagation call.
 seeds_in_backbone = {k: v for k, v in seeds.items() if backbone_mapper.has_original(k)}
-if len(seeds_in_backbone) < len(seeds):
-    dropped = set(seeds) - set(seeds_in_backbone)
-    print(f"WARNING: {len(dropped)} seed(s) dropped by backboning: {dropped}")
 
 results = guided_label_propagation(
     graph=backbone,
@@ -312,7 +320,7 @@ results = guided_label_propagation(
 
 **Watch out for:**
 - Projections can blow up edge count: O(N² × D) worst case. On dense bipartite graphs, consider backboning either before projecting (sparsifies the bipartite layer) or after (sparsifies the projection itself).
-- Seeds must be in the projection partition; cross-check with `user_mapper.has_original(seed_id)` before propagation.
+- Seeds must be in the projection partition; verify with `check_seed_coverage(user_mapper, seeds)` before propagation.
 
 ### 3. Political Affiliation Analysis
 

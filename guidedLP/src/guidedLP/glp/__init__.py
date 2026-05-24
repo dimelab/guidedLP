@@ -29,7 +29,8 @@ from .validation import (
 from .utils import (
     create_balanced_seed_set,
     suggest_alpha_value,
-    get_seed_statistics
+    get_seed_statistics,
+    check_seed_coverage,
 )
 
 # Evaluation functions

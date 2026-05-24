@@ -18,6 +18,7 @@ from guidedLP.glp.utils import (
     create_balanced_seed_set,
     suggest_alpha_value,
     get_seed_statistics,
+    check_seed_coverage,
     _validate_balance_inputs,
     _validate_alpha_inputs,
     _group_seeds_by_label,
@@ -28,7 +29,10 @@ from guidedLP.glp.utils import (
     _alpha_from_seed_ratio
 )
 
+from guidedLP.common.id_mapper import IDMapper
 from guidedLP.common.exceptions import ValidationError, ConfigurationError
+
+import polars as pl
 
 
 class TestCreateBalancedSeedSet:
@@ -369,6 +373,115 @@ class TestGetSeedStatistics:
         # Should recommend more seeds
         recommendations = stats["recommendations"]
         assert any("more seeds" in rec for rec in recommendations)
+
+
+class TestCheckSeedCoverage:
+    """Test the check_seed_coverage diagnostic."""
+
+    def _make_mapper(self, originals):
+        m = IDMapper()
+        for i, orig in enumerate(originals):
+            m.add_mapping(orig, i)
+        return m
+
+    def test_train_only_all_present(self):
+        mapper = self._make_mapper(["u1", "u2", "u3", "u4"])
+        seeds = {"u1": "A", "u2": "B", "u3": "A"}
+        report = check_seed_coverage(mapper, seeds)
+        assert "train" in report
+        assert "test" not in report
+        assert "overlap" not in report
+
+        train = report["train"]
+        assert train["total"] == 3
+        assert train["present"] == 3
+        assert train["missing"] == 0
+        assert train["coverage"] == 1.0
+        assert train["missing_sample"] == []
+        assert train["by_label"]["A"] == {
+            "total": 2, "present": 2, "missing": 0, "coverage": 1.0,
+        }
+        assert train["by_label"]["B"] == {
+            "total": 1, "present": 1, "missing": 0, "coverage": 1.0,
+        }
+
+    def test_train_some_missing(self):
+        mapper = self._make_mapper(["u1", "u3"])
+        seeds = {"u1": "A", "u2": "A", "u3": "B", "u4": "B"}
+        report = check_seed_coverage(mapper, seeds)
+        train = report["train"]
+        assert train["total"] == 4
+        assert train["present"] == 2
+        assert train["missing"] == 2
+        assert train["coverage"] == 0.5
+        assert set(train["missing_sample"]) == {"u2", "u4"}
+        assert train["by_label"]["A"]["coverage"] == 0.5
+        assert train["by_label"]["B"]["coverage"] == 0.5
+
+    def test_empty_seeds_does_not_divide_by_zero(self):
+        mapper = self._make_mapper(["u1", "u2"])
+        report = check_seed_coverage(mapper, {})
+        assert report["train"] == {
+            "total": 0, "present": 0, "missing": 0, "coverage": 0.0,
+            "by_label": {}, "missing_sample": [],
+        }
+
+    def test_test_set_separately_reported(self):
+        mapper = self._make_mapper(["u1", "u2", "u3", "u4"])
+        train = {"u1": "A", "u2": "B"}
+        test = {"u3": "A", "u4": "B", "u5": "A"}  # u5 missing
+        report = check_seed_coverage(mapper, train, test_seeds=test)
+        assert report["train"]["coverage"] == 1.0
+        assert report["test"]["total"] == 3
+        assert report["test"]["present"] == 2
+        assert report["test"]["missing"] == 1
+        assert report["test"]["missing_sample"] == ["u5"]
+
+    def test_overlap_detection_no_conflict(self):
+        mapper = self._make_mapper(["u1", "u2", "u3"])
+        train = {"u1": "A", "u2": "B", "u3": "A"}
+        test = {"u2": "B", "u3": "A"}  # both overlap with same labels
+        report = check_seed_coverage(mapper, train, test_seeds=test)
+        assert report["overlap"]["count"] == 2
+        assert report["overlap"]["conflicting"] == 0
+
+    def test_overlap_detection_with_conflict(self):
+        mapper = self._make_mapper(["u1", "u2", "u3"])
+        train = {"u1": "A", "u2": "A"}
+        test = {"u1": "B", "u2": "A"}  # u1 has conflicting label
+        report = check_seed_coverage(mapper, train, test_seeds=test)
+        assert report["overlap"]["count"] == 2
+        assert report["overlap"]["conflicting"] == 1
+        # Sample should include the conflicting node with both labels
+        sample_nodes = [t[0] for t in report["overlap"]["sample"]]
+        assert "u1" in sample_nodes
+
+    def test_accepts_dataframe_input(self):
+        mapper = self._make_mapper(["u1", "u2", "u3"])
+        train_df = pl.DataFrame({"node_id": ["u1", "u2"], "label": ["A", "B"]})
+        test_df = pl.DataFrame({"node_id": ["u3", "missing"], "label": ["A", "B"]})
+        report = check_seed_coverage(mapper, train_df, test_seeds=test_df)
+        assert report["train"]["coverage"] == 1.0
+        assert report["test"]["missing"] == 1
+
+    def test_accepts_inverse_dict(self):
+        mapper = self._make_mapper(["u1", "u2"])
+        seeds_inverse = {"A": ["u1"], "B": ["u2", "u3"]}  # u3 missing
+        report = check_seed_coverage(mapper, seeds_inverse)
+        assert report["train"]["total"] == 3
+        assert report["train"]["missing"] == 1
+
+    def test_missing_sample_size_cap(self):
+        mapper = self._make_mapper(["u1"])
+        seeds = {f"missing_{i}": "A" for i in range(20)}
+        report = check_seed_coverage(mapper, seeds, missing_sample_size=5)
+        assert len(report["train"]["missing_sample"]) == 5
+
+    def test_missing_sample_size_zero_disables_sampling(self):
+        mapper = self._make_mapper(["u1"])
+        seeds = {f"missing_{i}": "A" for i in range(5)}
+        report = check_seed_coverage(mapper, seeds, missing_sample_size=0)
+        assert report["train"]["missing_sample"] == []
 
 
 class TestInputValidation:
