@@ -35,7 +35,7 @@ SUPPORTED_FILTER_TYPES = [
 ]
 
 # Available backbone methods
-AVAILABLE_BACKBONE_METHODS = ["disparity", "weight", "degree"]
+AVAILABLE_BACKBONE_METHODS = ["disparity", "weight", "degree", "bipartite_svn"]
 
 
 def filter_graph(
@@ -213,6 +213,7 @@ def apply_backbone(
     target_edges: Optional[int] = None,
     alpha: float = 0.05,
     keep_disconnected: bool = False,
+    bonferroni: bool = True,
     verbose: bool = True,
 ) -> Tuple[nk.Graph, IDMapper]:
     """
@@ -231,17 +232,32 @@ def apply_backbone(
         Bidirectional mapping between original and internal node IDs
     method : str, default "disparity"
         Backbone extraction method:
-        - "disparity": Disparity filter (Serrano et al.) for weighted graphs
-        - "weight": Simple weight threshold filtering
-        - "degree": Node degree threshold filtering
+        - "disparity": Disparity filter (Serrano et al.) for weighted graphs.
+        - "weight": Simple weight threshold filtering.
+        - "degree": Node degree threshold filtering.
+        - "bipartite_svn": Statistically Validated Network filter for bipartite
+          graphs (Tumminello et al. 2011). For each bipartite edge, asks
+          whether the observed (or higher) weight is statistically surprising
+          under a configuration-model null preserving node strengths. Edges
+          to/from "generic" high-degree nodes naturally fall out because
+          their expected weight is high. Auto-detects weighted vs unweighted
+          input (treats binary 0/1 edges as unweighted Poisson and weighted
+          edges as continuous Poisson on the observed weight).
     target_nodes : int, optional
         Target number of nodes to keep (conflicts with target_edges)
     target_edges : int, optional
         Target number of edges to keep
     alpha : float, default 0.05
-        Significance level for disparity filter (typical range: 0.01-0.1)
+        Significance level. For ``method="disparity"`` it's the disparity
+        threshold; for ``method="bipartite_svn"`` it's the per-edge p-value
+        cutoff (typical range: 0.01–0.05).
     keep_disconnected : bool, default False
         Whether to keep isolated nodes after edge filtering
+    bonferroni : bool, default True
+        Only used by ``method="bipartite_svn"``. When True, the effective
+        per-edge cutoff is ``alpha / |E|`` (Bonferroni correction for the
+        |E| simultaneous hypothesis tests). Set to False to use ``alpha``
+        directly (more permissive, more edges kept).
     
     Returns
     -------
@@ -335,6 +351,10 @@ def apply_backbone(
             elif method == "degree":
                 backbone_graph, updated_mapper = _apply_degree_threshold(
                     graph, id_mapper, target_nodes, keep_disconnected
+                )
+            elif method == "bipartite_svn":
+                backbone_graph, updated_mapper = _apply_bipartite_svn_filter(
+                    graph, id_mapper, alpha, bonferroni, keep_disconnected
                 )
             else:
                 raise ValidationError(f"Unsupported backbone method: {method}")
@@ -807,6 +827,165 @@ def _apply_weight_threshold(
                 pass
     
     return backbone_graph, updated_mapper
+
+
+def _apply_bipartite_svn_filter(
+    graph: nk.Graph,
+    id_mapper: IDMapper,
+    alpha: float,
+    bonferroni: bool,
+    keep_disconnected: bool,
+) -> Tuple[nk.Graph, IDMapper]:
+    """
+    Tumminello et al. (2011) Statistically Validated Network filter for
+    bipartite graphs.
+
+    For each bipartite edge ``(u, v)`` with observed weight ``w``:
+
+      μ        = strength(u) · strength(v) / W_total      (null expectation
+                                                          under the weighted
+                                                          configuration model)
+      p_value  = P[ X ≥ w  |  X ~ Poisson(μ) ]
+
+    The edge is kept iff ``p_value ≤ alpha_eff``, where ``alpha_eff = alpha /
+    |E|`` (Bonferroni-corrected for the |E| simultaneous tests) when
+    ``bonferroni=True``, else ``alpha_eff = alpha``.
+
+    Auto-detects unweighted input: if ``graph.isWeighted()`` is False, or
+    every edge weight equals 1.0, the observed weight is treated as 1 and
+    the test reduces to ``p_value = 1 − exp(−μ)`` (the standard Bernoulli /
+    "edge exists at all" test under a sparse Poisson approximation).
+
+    Notes
+    -----
+    The Poisson model is the standard sparse limit of the bipartite
+    configuration model and matches Tumminello et al.'s null. For weighted
+    integer-valued edges (e.g. share counts) this is exact in expectation;
+    for very dense graphs the approximation slightly under-states tail
+    probabilities. Bonferroni is the conservative default because |E| can
+    easily reach 10⁶+ and uncorrected α would let through millions of
+    spurious edges.
+    """
+    from scipy.stats import poisson
+
+    n_nodes = graph.numberOfNodes()
+    if graph.numberOfEdges() == 0:
+        return graph, id_mapper
+
+    # Collect edges and weights into numpy arrays.
+    edges_list = list(graph.iterEdges())
+    n_edges = len(edges_list)
+    u_arr = np.empty(n_edges, dtype=np.int64)
+    v_arr = np.empty(n_edges, dtype=np.int64)
+    w_arr = np.empty(n_edges, dtype=np.float64)
+    for i, (u, v) in enumerate(edges_list):
+        u_arr[i] = u
+        v_arr[i] = v
+        w_arr[i] = graph.weight(u, v) if graph.isWeighted() else 1.0
+
+    # Auto-detect: treat as unweighted if all weights are 1.0 (within tol).
+    is_weighted_effective = graph.isWeighted() and not np.allclose(w_arr, 1.0)
+
+    # Node strengths: sum of incident edge weights. For undirected bipartite,
+    # each edge contributes its weight to both endpoints' strength.
+    strengths = np.zeros(n_nodes, dtype=np.float64)
+    np.add.at(strengths, u_arr, w_arr)
+    np.add.at(strengths, v_arr, w_arr)
+
+    # Total weight in the bipartite layer. For undirected this is sum(w).
+    W_total = w_arr.sum()
+    if W_total <= 0:
+        logger.warning("Bipartite SVN filter received zero total weight; returning empty graph.")
+        return _build_empty_like(graph), IDMapper()
+
+    # Expected weight under the bipartite configuration model.
+    #
+    # For a bipartite graph each edge has one endpoint in each partition, so
+    # the partition-wise strength sums are both equal to W_total. The null
+    # expectation is then μ = s_u · s_v / W_total — *not* divided by 2*W_total,
+    # which would be the right normalisation only for *unipartite* undirected
+    # graphs where every edge contributes to two strengths in the same node
+    # set (giving a total strength of 2·W_total).
+    mu = strengths[u_arr] * strengths[v_arr] / W_total
+
+    # Per-edge p-value.
+    if is_weighted_effective:
+        # Continuous-weighted edges: ceil(w) so we're computing
+        # P(X ≥ w) on integer support; works for both integer and float w.
+        p_values = poisson.sf(np.ceil(w_arr) - 1, mu)
+    else:
+        # Unweighted: observed weight is 1, so P(X ≥ 1) = 1 - exp(-μ).
+        p_values = -np.expm1(-mu)  # numerically stable 1 - exp(-mu)
+
+    # Apply Bonferroni correction if requested.
+    if bonferroni:
+        alpha_effective = alpha / n_edges
+    else:
+        alpha_effective = alpha
+
+    keep_mask = p_values <= alpha_effective
+    n_kept = int(keep_mask.sum())
+
+    logger.info(
+        "Bipartite SVN filter: weighted=%s, alpha=%.3g, bonferroni=%s, "
+        "alpha_eff=%.3e — kept %d/%d edges (%.1f%%)",
+        is_weighted_effective, alpha, bonferroni, alpha_effective,
+        n_kept, n_edges, 100.0 * n_kept / n_edges if n_edges else 0.0,
+    )
+
+    # Build the backbone graph.
+    backbone_graph = nk.Graph(
+        directed=graph.isDirected(), weighted=graph.isWeighted()
+    )
+    for _ in range(n_nodes):
+        backbone_graph.addNode()
+    for u, v, w in zip(u_arr[keep_mask], v_arr[keep_mask], w_arr[keep_mask]):
+        if graph.isWeighted():
+            backbone_graph.addEdge(int(u), int(v), float(w))
+        else:
+            backbone_graph.addEdge(int(u), int(v))
+
+    # Drop isolated nodes unless asked to keep them.
+    if not keep_disconnected:
+        nodes_to_remove = [
+            node for node in range(backbone_graph.numberOfNodes())
+            if backbone_graph.degree(node) == 0
+        ]
+        for node in nodes_to_remove:
+            backbone_graph.removeNode(node)
+
+    # Build the updated id_mapper, preserving bipartite partition info from
+    # the original mapper (the projection / downstream code relies on it).
+    updated_mapper = IDMapper()
+    surviving_originals = []
+    for internal_id in range(graph.numberOfNodes()):
+        if backbone_graph.hasNode(internal_id):
+            try:
+                original_id = id_mapper.get_original(internal_id)
+            except KeyError:
+                continue
+            updated_mapper.add_mapping(original_id, internal_id)
+            surviving_originals.append(original_id)
+
+    if id_mapper.has_bipartite_partitions():
+        survivors = set(surviving_originals)
+        new_src = id_mapper.source_partition_originals & survivors
+        new_tgt = id_mapper.target_partition_originals & survivors
+        # If the two partitions remained disjoint (the usual case) use the
+        # validated setter; otherwise fall back to direct attribute assignment
+        # so the "warn" overlap mode is preserved through the filter.
+        if new_src.isdisjoint(new_tgt):
+            updated_mapper.set_bipartite_partitions(new_src, new_tgt)
+        else:
+            updated_mapper.source_partition_originals = new_src
+            updated_mapper.target_partition_originals = new_tgt
+
+    return backbone_graph, updated_mapper
+
+
+def _build_empty_like(graph: nk.Graph) -> nk.Graph:
+    """Create an empty graph with the same directed/weighted flags."""
+    return nk.Graph(0, weighted=graph.isWeighted(), directed=graph.isDirected())
 
 
 def _apply_degree_threshold(

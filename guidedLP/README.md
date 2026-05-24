@@ -199,69 +199,96 @@ src/
 
 ### 1. Network Backboning Before Propagation
 
-For dense weighted networks, the **disparity filter** (Serrano et al., 2009) extracts the statistically significant subset of edges before label propagation. The propagation step then runs on a cleaner network where weak/incidental connections aren't diluting the signal.
+Both **bipartite** and **unipartite** graphs can be backboned, but the right statistical test is different for each because the null hypothesis you're testing against differs.
 
-**When backboning helps:**
-- Edge weights span many orders of magnitude — a few strong ties, many incidental ones (e.g. one-off retweets vs. sustained interaction).
+| Graph type | Recommended method | What it filters |
+|---|---|---|
+| **Bipartite** (users ↔ items, authors ↔ papers, …) | `method="bipartite_svn"` | Edges to "generic" high-degree items get dropped because their expected weight under a configuration-model null is high. No degree threshold to tune. |
+| **Unipartite weighted** (user ↔ user, etc.) | `method="disparity"` | Within each node's edges, keeps the statistically over-weighted ties and drops the diluted ones (Serrano et al. 2009). Useful when weights span many orders of magnitude. |
+
+**When backboning helps in general:**
+- Many edges carry incidental / noise mass that dilutes propagation.
 - The network is dense enough that random walks mix categories quickly and confidence collapses.
 - You need to cut compute time on a very large network — fewer edges, fewer matrix–vector products per GLP iteration.
 
-**When to skip it:**
-- Network is unweighted, or already sparse.
-- Edge weight variance is small (all edges carry roughly equal information).
-- Weak edges *are* the signal you want to study.
-- You have plenty of seeds per category — propagation already has enough anchors to overwhelm noise.
+**When to skip:** the network is already sparse, edge weights are roughly uniform, weak edges *are* the signal you want to study, or you have plenty of seeds per category.
+
+#### Bipartite case — `bipartite_svn` (Tumminello et al. 2011)
+
+Filter generic items *before* projecting, so the user-user projection is cheaper and cleaner.
 
 ```python
 import polars as pl
-from guidedLP.network.construction import build_graph_from_edgelist
+from guidedLP.network.construction import build_graph_from_edgelist, project_bipartite
 from guidedLP.network.filtering import apply_backbone
 from guidedLP.glp.propagation import guided_label_propagation
-
-edges = pl.read_csv("interactions.csv")
-graph, id_mapper = build_graph_from_edgelist(
-    edges, source_col="user_a", target_col="user_b", weight_col="weight",
-)
-print(f"Full graph:   {graph.numberOfNodes():>6} nodes, {graph.numberOfEdges():>7} edges")
-
-# Disparity filter: keep edges whose normalized weight is statistically
-# significant against a null model of uniform weight distribution at each
-# node. Lower alpha = stricter backbone.
-backbone, backbone_mapper = apply_backbone(
-    graph, id_mapper,
-    method="disparity",
-    alpha=0.05,                # typical range 0.01–0.1
-    keep_disconnected=False,   # drop nodes that lost all their edges
-)
-print(f"Backbone:     {backbone.numberOfNodes():>6} nodes, {backbone.numberOfEdges():>7} edges")
-
-# IMPORTANT: apply_backbone returns a NEW id_mapper. Always pass it (not the
-# original) to downstream functions. Some seed nodes may also be dropped if
-# all their edges fell below significance — use check_seed_coverage to verify
-# what survived (per label) before propagation.
 from guidedLP.glp.utils import check_seed_coverage
 
+# user-hashtag bipartite from share logs
+edges = pl.read_csv("user_hashtag_uses.csv")  # columns: user, hashtag, count
+bipartite, full_mapper = build_graph_from_edgelist(
+    edges,
+    source_col="user", target_col="hashtag", weight_col="count",
+    bipartite=True,
+)
+print(f"Bipartite:   {bipartite.numberOfNodes():>6} nodes, {bipartite.numberOfEdges():>8} edges")
+
+# Statistically Validated Network filter on the bipartite layer.
+# For each edge (u, item), test whether the observed weight is more than
+# expected under a configuration-model null preserving node strengths.
+# - alpha     = per-edge p-value cutoff (0.01–0.05 typical)
+# - bonferroni= True corrects for |E| simultaneous tests (recommended at scale)
+backbone, backbone_mapper = apply_backbone(
+    bipartite, full_mapper,
+    method="bipartite_svn",
+    alpha=0.01,
+    bonferroni=True,          # set False for small graphs / exploratory work
+    keep_disconnected=False,
+)
+print(f"Backbone:    {backbone.numberOfNodes():>6} nodes, {backbone.numberOfEdges():>8} edges")
+
+# Now the project step is much cheaper.
+user_graph, user_mapper = project_bipartite(
+    backbone, backbone_mapper, projection_mode="source", weight_method="jaccard",
+)
+
+# Always check seed survival — backboning drops nodes whose edges weren't
+# significant. check_seed_coverage handles all SeedInput shapes and gives a
+# per-label breakdown.
 seeds = {"@aoc": "left", "@berniesanders": "left",
          "@realdonaldtrump": "right", "@tedcruz": "right"}
-report = check_seed_coverage(backbone_mapper, seeds)
-if report["train"]["coverage"] < 1.0:
-    print(f"WARNING: {report['train']['missing']} seed(s) dropped by backboning: "
-          f"{report['train']['missing_sample']}")
-    for label, stats in report["train"]["by_label"].items():
-        print(f"  {label}: {stats['present']}/{stats['total']} survived")
-
-# Keep only seeds that are still in the backbone for the propagation call.
-seeds_in_backbone = {k: v for k, v in seeds.items() if backbone_mapper.has_original(k)}
+report = check_seed_coverage(user_mapper, seeds)
+print(f"Seeds surviving: {report['train']['present']}/{report['train']['total']}")
+seeds = {k: v for k, v in seeds.items() if user_mapper.has_original(k)}
 
 results = guided_label_propagation(
-    graph=backbone,
-    id_mapper=backbone_mapper,
-    seed_labels=seeds_in_backbone,
-    labels=["left", "right"],
+    graph=user_graph, id_mapper=user_mapper,
+    seed_labels=seeds, labels=["left", "right"],
 )
 ```
 
-Other `method` values: `"weight"` (simple weight threshold — use with `target_edges=N`) and `"degree"` (keep top-N nodes by degree — use with `target_nodes=N`).
+The `bipartite_svn` filter has only one knob (`alpha`) plus the optional Bonferroni toggle. Generic targets get filtered out automatically because high-degree nodes have high *expected* weight under the null — no degree threshold to tune.
+
+#### Unipartite case — `disparity` (Serrano et al. 2009)
+
+When you already have a unipartite weighted graph (e.g. retweet network, collaboration network), the disparity filter is the right tool. It evaluates each edge from each endpoint's perspective: is this edge's weight a meaningful share of the node's total, or is it just noise?
+
+```python
+graph, mapper = build_graph_from_edgelist(
+    pl.read_csv("retweets.csv"),
+    source_col="user_a", target_col="user_b", weight_col="weight",
+)
+backbone, backbone_mapper = apply_backbone(
+    graph, mapper,
+    method="disparity",
+    alpha=0.05,                # typical range 0.01–0.1; lower → stricter
+    keep_disconnected=False,
+)
+```
+
+The disparity filter needs **weighted** input with meaningful weight variance. On uniformly-weighted graphs it has very little to discriminate on and barely filters anything.
+
+Other `method` values: `"weight"` (threshold by edge weight — use with `target_edges=N`) and `"degree"` (keep top-N nodes by degree — use with `target_nodes=N`).
 
 ### 2. Bipartite to Unipartite Projection
 
@@ -291,9 +318,15 @@ bipartite, full_mapper = build_graph_from_edgelist(
     weight_col="count",
     bipartite=True,             # validate that source/target are disjoint sets
 )
+# Count unique users / hashtags as actually present in the constructed
+# graph (null-row drop, degree filters, and bipartite overlap policy can
+# all change what survives, so the raw input columns aren't a reliable
+# proxy). build_graph_from_edgelist(bipartite=True) records the surviving
+# source and target node sets on the IDMapper:
+n_users = len(full_mapper.source_partition_originals)
+n_hashtags = len(full_mapper.target_partition_originals)
 print(f"Bipartite:  {bipartite.numberOfNodes()} nodes "
-      f"({sum(1 for _ in edges['user'].unique())} users + "
-      f"{sum(1 for _ in edges['hashtag'].unique())} hashtags)")
+      f"({n_users} users + {n_hashtags} hashtags)")
 
 # Project onto USERS: two users get connected if they share hashtags.
 # jaccard avoids high-degree users dominating the similarity.
