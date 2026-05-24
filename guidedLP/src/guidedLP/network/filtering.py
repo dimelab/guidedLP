@@ -212,7 +212,8 @@ def apply_backbone(
     target_nodes: Optional[int] = None,
     target_edges: Optional[int] = None,
     alpha: float = 0.05,
-    keep_disconnected: bool = False
+    keep_disconnected: bool = False,
+    verbose: bool = True,
 ) -> Tuple[nk.Graph, IDMapper]:
     """
     Extract network backbone by filtering edges using statistical methods.
@@ -307,13 +308,18 @@ def apply_backbone(
         target_edges=target_edges,
         alpha=alpha
     )
-    
+
+    import time as _time
+    _t_start = _time.perf_counter()
+
     # Validate parameters
     _validate_backbone_parameters(method, target_nodes, target_edges, alpha, graph)
-    
+
     # Handle empty graph
     if graph.numberOfNodes() == 0:
         logger.warning("Empty graph provided. Returning empty graph.")
+        from guidedLP.network.construction import _print_backbone_summary
+        _print_backbone_summary(verbose, _t_start, graph, graph, method)
         return graph, id_mapper
     
     with LoggingTimer("apply_backbone", {"method": method, "nodes": graph.numberOfNodes(), "edges": graph.numberOfEdges()}):
@@ -344,7 +350,9 @@ def apply_backbone(
                 f"Backbone extraction completed: {graph.numberOfEdges()} → {backbone_graph.numberOfEdges()} edges, "
                 f"{graph.numberOfNodes()} → {backbone_graph.numberOfNodes()} nodes"
             )
-            
+
+            from guidedLP.network.construction import _print_backbone_summary
+            _print_backbone_summary(verbose, _t_start, graph, backbone_graph, method)
             return backbone_graph, updated_mapper
             
         except Exception as e:

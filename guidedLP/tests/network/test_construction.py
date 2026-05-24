@@ -464,7 +464,7 @@ class TestHelperFunctions:
             "target": ["B", "C", "A"]
         })
         
-        id_mapper = _create_id_mapping(edges, "source", "target")
+        id_mapper, _, _ = _create_id_mapping(edges, "source", "target")
         
         assert id_mapper.size() == 3
         assert id_mapper.has_original("A")
@@ -483,7 +483,7 @@ class TestHelperFunctions:
             "source": ["A", "B"],
             "target": ["X", "Y"]
         })
-        id_mapper = _create_id_mapping(edges, "source", "target")
+        id_mapper, _, _ = _create_id_mapping(edges, "source", "target")
         
         # Should not raise exception
         _validate_bipartite_structure(edges, "source", "target", id_mapper)
@@ -494,7 +494,7 @@ class TestHelperFunctions:
             "source": ["A", "B"],
             "target": ["B", "C"]  # B appears in both
         })
-        id_mapper = _create_id_mapping(edges, "source", "target")
+        id_mapper, _, _ = _create_id_mapping(edges, "source", "target")
         
         with pytest.raises(GraphConstructionError, match="not bipartite"):
             _validate_bipartite_structure(edges, "source", "target", id_mapper)
@@ -687,6 +687,117 @@ class TestIntegrationScenarios:
         smith_id = id_mapper.get_internal("Smith")
         jones_id = id_mapper.get_internal("Jones")
         assert graph.weight(smith_id, jones_id) == 2.0
+
+
+class TestMinDegreeFilter:
+    """Test the min_source_degree / min_target_degree filters on
+    build_graph_from_edgelist.
+
+    Fixture has hand-checkable degree distribution:
+      sources (source-column counts):  u1=4, u2=2, u3=3, u4=1
+      targets (target-column counts):  #a=4, #b=3, #c=2, #d=1
+    """
+
+    def _edges(self):
+        return pl.DataFrame({
+            "user": ["u1", "u1", "u1", "u1", "u2", "u2", "u3", "u3", "u3", "u4"],
+            "tag":  ["#a", "#b", "#c", "#d", "#a", "#b", "#a", "#b", "#c", "#a"],
+        })
+
+    def test_no_filter_when_none(self):
+        """Both kwargs None ⇒ no filter applied, no warning."""
+        edges = self._edges()
+        import warnings as _warnings
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            graph, mapper = build_graph_from_edgelist(
+                edges, source_col="user", target_col="tag",
+                bipartite=True, verbose=False,
+            )
+        degree_warnings = [wi for wi in w if "Degree filter" in str(wi.message)]
+        assert degree_warnings == []
+        assert mapper.size() == 8  # all 4 users + 4 hashtags survive
+
+    def test_min_source_degree_3(self):
+        """Only u1 (deg 4) and u3 (deg 3) survive."""
+        edges = self._edges()
+        with pytest.warns(UserWarning, match="Degree filter dropped"):
+            graph, mapper = build_graph_from_edgelist(
+                edges, source_col="user", target_col="tag",
+                bipartite=True, min_source_degree=3, verbose=False,
+            )
+        survivors = set(mapper.original_to_internal.keys())
+        assert "u1" in survivors and "u3" in survivors
+        assert "u2" not in survivors and "u4" not in survivors
+        # All 4 targets still represented because u1 + u3 collectively touch them all.
+        for t in ("#a", "#b", "#c", "#d"):
+            assert t in survivors
+
+    def test_min_target_degree_3(self):
+        """Only #a (deg 4) and #b (deg 3) survive."""
+        edges = self._edges()
+        with pytest.warns(UserWarning, match="Degree filter dropped"):
+            graph, mapper = build_graph_from_edgelist(
+                edges, source_col="user", target_col="tag",
+                bipartite=True, min_target_degree=3, verbose=False,
+            )
+        survivors = set(mapper.original_to_internal.keys())
+        assert "#a" in survivors and "#b" in survivors
+        assert "#c" not in survivors and "#d" not in survivors
+        # All 4 sources still represented (each touches at least one of #a/#b).
+        for s in ("u1", "u2", "u3", "u4"):
+            assert s in survivors
+
+    def test_both_thresholds(self):
+        """Both filters apply independently to the original counts."""
+        edges = self._edges()
+        with pytest.warns(UserWarning, match="Degree filter dropped"):
+            graph, mapper = build_graph_from_edgelist(
+                edges, source_col="user", target_col="tag",
+                bipartite=True,
+                min_source_degree=2, min_target_degree=2,
+                verbose=False,
+            )
+        survivors = set(mapper.original_to_internal.keys())
+        # Surviving sources by source-degree ≥ 2: u1, u2, u3
+        # Surviving targets by target-degree ≥ 2: #a, #b, #c
+        assert survivors == {"u1", "u2", "u3", "#a", "#b", "#c"}
+
+    def test_threshold_of_1_is_noop(self):
+        """A threshold of 1 keeps everyone (every present node has degree ≥ 1)."""
+        edges = self._edges()
+        graph, mapper = build_graph_from_edgelist(
+            edges, source_col="user", target_col="tag",
+            bipartite=True,
+            min_source_degree=1, min_target_degree=1,
+            verbose=False,
+        )
+        assert mapper.size() == 8
+
+    def test_threshold_above_max_drops_everything(self):
+        """Threshold higher than the highest degree → empty graph (warns)."""
+        edges = self._edges()
+        with pytest.warns(UserWarning):
+            graph, mapper = build_graph_from_edgelist(
+                edges, source_col="user", target_col="tag",
+                bipartite=True, min_source_degree=100, verbose=False,
+            )
+        assert graph.numberOfNodes() == 0
+        assert graph.numberOfEdges() == 0
+        assert mapper.is_empty()
+
+    def test_edges_only_between_surviving_nodes(self):
+        """No edges should reference a dropped node."""
+        edges = self._edges()
+        graph, mapper = build_graph_from_edgelist(
+            edges, source_col="user", target_col="tag",
+            bipartite=True, min_source_degree=3, verbose=False,
+        )
+        # u1 has 4 original edges + u3 has 3 = 7 surviving edges
+        assert graph.numberOfEdges() == 7
+        # Every endpoint in every edge is in the mapper
+        for u, v in graph.iterEdges():
+            assert mapper.has_internal(u) and mapper.has_internal(v)
 
 
 class TestBipartiteOverlapPolicy:
