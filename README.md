@@ -255,15 +255,15 @@ edges = pl.read_csv("user_hashtag_counts.csv").rename({
 edges = filter_graph(edges, filters={"min_source_degree": 5})
 
 # ── Step 2: bipartite backbone ────────────────────────────────────────────
-# Remove edges to generic high-frequency hashtags. SVN returns the per-edge
-# frame with a `kept` column; advance to the next step with only the kept
-# rows.
+# Remove edges to generic high-frequency hashtags. Returns a lean frame
+# (source_id / target_id / weight, kept rows only) — score columns are
+# dropped to keep the chain memory-light. Pass include_scores=True if you
+# want the diagnostic columns.
 edges = apply_backbone(
     edges,
     method="bipartite_svn", alpha=0.05, correction="fdr_bh",
     directed=False,
 )
-edges = edges.filter(pl.col("kept"))
 
 # ── Step 3: project bipartite → unipartite ────────────────────────────────
 # Connect users who share hashtags. Jaccard normalises so a power user
@@ -281,7 +281,6 @@ user_edges = apply_backbone(
     user_edges,
     method="disparity", alpha=0.05, directed=False,
 )
-user_edges = user_edges.filter(pl.col("kept"))
 
 # ── Step 5: build the graph (only now!) and run GLP ───────────────────────
 user_graph, user_mapper = build_graph_from_edgelist(
@@ -304,15 +303,21 @@ results = guided_label_propagation(
 )
 ```
 
-**Mixing shapes within a pipeline.** If you already have a graph but want to peek at an intermediate result as a frame, pass `output_format="dataframe"`:
+**Mixing shapes within a pipeline.** If you already have a graph but want to peek at an intermediate result as a frame, pass `output_format="dataframe"`. The default return is a lean frame (only `source_id` / `target_id` / `weight`, kept rows only); add `include_scores=True` when you want the diagnostic columns to inspect:
 
 ```python
-# Inspect a backbone without losing the original graph
+# Lean — ready to chain into the next pipeline stage.
 edges_df = apply_backbone(
     graph, id_mapper, method="disparity", alpha=0.05,
     output_format="dataframe",
 )
-strongest = edges_df.filter(pl.col("kept")).sort("alpha_score").head(20)
+
+# Full diagnostic frame — all edges with score columns and the `kept` boolean.
+diag_df = apply_backbone(
+    graph, id_mapper, method="disparity", alpha=0.05,
+    output_format="dataframe", include_scores=True,
+)
+strongest = diag_df.filter(pl.col("kept")).sort("alpha_score").head(20)
 ```
 
 And to go the other way — from an existing graph into the dataframe pipeline — use `graph_to_edges`:

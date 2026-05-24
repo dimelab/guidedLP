@@ -66,6 +66,7 @@ def apply_backbone(
     verbose: bool = True,
     directed: bool = False,
     output_format: Optional[str] = None,
+    include_scores: bool = False,
 ) -> Union[
     Tuple[nk.Graph, IDMapper],
     Tuple[nk.Graph, IDMapper, pl.DataFrame],
@@ -169,6 +170,16 @@ def apply_backbone(
         ``(graph, mapper, df)``), ``"dataframe"`` (returns the per-edge
         results frame), or ``None`` (default — matches input type).
         ``output_format="graph"`` with a frame input is not supported.
+    include_scores : bool, default False
+        Only relevant when the function returns a DataFrame
+        (frame-in or ``output_format="dataframe"``). Default
+        (``False``) returns a lean frame: only ``source_id``,
+        ``target_id``, ``weight`` columns, filtered to surviving edges.
+        Set ``True`` to keep the full diagnostic frame (all edges, with
+        method-specific score columns and the ``kept`` boolean).
+        Independent of ``return_filtered_edges`` — that flag's graph-mode
+        third-element frame is always the full diagnostic shape, regardless
+        of ``include_scores``.
 
     Returns
     -------
@@ -176,10 +187,13 @@ def apply_backbone(
         Graph-output path; the backbone graph and the updated ID mapper.
     Tuple[nk.Graph, IDMapper, pl.DataFrame]
         If ``return_filtered_edges=True``, additionally a per-edge results
-        DataFrame.
+        DataFrame (always the full diagnostic shape — all edges, all score
+        columns, plus ``kept``).
     pl.DataFrame
-        DataFrame-output path; one row per (oriented) edge with method-
-        specific score columns and a ``kept`` boolean.
+        DataFrame-output path. Default: lean frame
+        (``source_id``/``target_id``/``weight``, kept rows only). With
+        ``include_scores=True``: full diagnostic frame, all edges, with
+        method-specific score columns and ``kept``.
 
     Raises
     ------
@@ -244,6 +258,7 @@ def apply_backbone(
             min_node_retention=min_node_retention,
             verbose=verbose,
             t_start=_t_start,
+            include_scores=include_scores,
         )
 
     if not isinstance(edges, nk.Graph):
@@ -298,7 +313,8 @@ def apply_backbone(
         empty_mapper = id_mapper if graph.numberOfNodes() > 0 else IDMapper()
         _print_backbone_summary(verbose, _t_start, graph, empty_graph, method)
         if want_df_only:
-            return _empty_edges_df(method)
+            empty_df = _empty_edges_df(method)
+            return empty_df if include_scores else _slim_edges_df(empty_df)
         if return_filtered_edges:
             return empty_graph, empty_mapper, _empty_edges_df(method)
         return empty_graph, empty_mapper
@@ -353,7 +369,7 @@ def apply_backbone(
             _print_backbone_summary(verbose, _t_start, graph, backbone_graph, method)
 
             if want_df_only:
-                return edge_results_df
+                return edge_results_df if include_scores else _slim_edges_df(edge_results_df)
             return result
 
         except (ConfigurationError, ComputationError, ValidationError):
@@ -383,12 +399,14 @@ def _apply_backbone_frame_path(
     min_node_retention: Optional[float],
     verbose: bool,
     t_start: float,
+    include_scores: bool = False,
 ) -> pl.DataFrame:
     """Frame-input branch of :func:`apply_backbone`.
 
-    Dispatches to the appropriate ``_*_on_edges`` helper. Returns the per-edge
-    results frame (including the ``kept`` column) — the caller does any
-    further filtering or graph construction.
+    Dispatches to the appropriate ``_*_on_edges`` helper. Returns either the
+    lean filtered frame (``include_scores=False``, default) or the full
+    diagnostic frame with score columns and the ``kept`` boolean
+    (``include_scores=True``).
     """
     # Validate parameters that don't depend on a graph object.
     _validate_frame_input(edges_df, method)
@@ -409,7 +427,7 @@ def _apply_backbone_frame_path(
         warnings.warn("Empty edge frame provided. Returning empty result.")
         result_df = _empty_edges_df(method)
         _print_backbone_frame_summary(verbose, t_start, n_in, 0, method)
-        return result_df
+        return result_df if include_scores else _slim_edges_df(result_df)
 
     with LoggingTimer("apply_backbone", {"method": method, "edges": n_in, "input": "frame"}):
         try:
@@ -437,7 +455,7 @@ def _apply_backbone_frame_path(
                 n_in, n_kept,
             )
             _print_backbone_frame_summary(verbose, t_start, n_in, n_kept, method)
-            return result_df
+            return result_df if include_scores else _slim_edges_df(result_df)
 
         except (ConfigurationError, ComputationError, ValidationError):
             raise
@@ -1584,6 +1602,23 @@ def _translate_edges_to_originals(
         pl.Series("source_id", src_originals),
         pl.Series("target_id", tgt_originals),
     ])
+
+
+def _slim_edges_df(df: pl.DataFrame) -> pl.DataFrame:
+    """Trim a per-edge results frame to the lean
+    (``source_id``, ``target_id``, ``weight``) shape, keeping only kept rows.
+
+    Used to honour ``include_scores=False`` (the default) on the
+    DataFrame-output paths of :func:`apply_backbone`, so callers can chain
+    into the next pipeline stage without carrying score columns or the
+    ``kept`` boolean. The dropped columns become garbage-collectable on the
+    next reference, which is the point of trimming here rather than asking
+    callers to do it after the fact.
+    """
+    if "kept" in df.columns:
+        df = df.filter(pl.col("kept"))
+    keep_cols = [c for c in ("source_id", "target_id", "weight") if c in df.columns]
+    return df.select(keep_cols)
 
 
 def _empty_edges_df(method: str) -> pl.DataFrame:
