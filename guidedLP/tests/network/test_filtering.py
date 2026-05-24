@@ -6,8 +6,9 @@ Backbone-extraction tests now live in test_backboning.py.
 
 import pytest
 import networkit as nk
+import polars as pl
 
-from guidedLP.network.filtering import filter_graph
+from guidedLP.network.filtering import filter_graph, filter_by_seed_proximity
 from guidedLP.common.id_mapper import IDMapper
 from guidedLP.common.exceptions import ValidationError, ComputationError
 
@@ -378,3 +379,331 @@ class TestEdgeCases:
 
         assert filtered.numberOfNodes() == 4
         assert filtered.numberOfEdges() == 6
+
+
+# ---------------------------------------------------------------------------
+# Seed-proximity filtering tests
+# ---------------------------------------------------------------------------
+
+
+def _collect_originals(graph: nk.Graph, mapper: IDMapper) -> set:
+    """Helper: collect all original IDs present in a filtered graph."""
+    return {mapper.get_original(i) for i in graph.iterNodes()}
+
+
+class TestFilterBySeedProximityKhop:
+    """k-hop BFS expansion from seed nodes."""
+
+    def setup_method(self):
+        # Path graph: A - B - C - D - E plus a tail X off B and an isolated I
+        # Distances from seed A: A=0, B=1, C=2, D=3, E=4, X=2, I=∞
+        self.graph = nk.Graph(7)
+        self.graph.addEdge(0, 1)  # A-B
+        self.graph.addEdge(1, 2)  # B-C
+        self.graph.addEdge(2, 3)  # C-D
+        self.graph.addEdge(3, 4)  # D-E
+        self.graph.addEdge(1, 5)  # B-X
+        # node 6 (I) is isolated
+
+        self.mapper = IDMapper()
+        for i, name in enumerate(["A", "B", "C", "D", "E", "X", "I"]):
+            self.mapper.add_mapping(name, i)
+
+    def test_hops_one_keeps_immediate_neighbors(self):
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["A"], method="khop", hops=1
+        )
+        assert _collect_originals(g2, m2) == {"A", "B"}
+
+    def test_hops_two_expands_further(self):
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["A"], method="khop", hops=2
+        )
+        assert _collect_originals(g2, m2) == {"A", "B", "C", "X"}
+
+    def test_hops_zero_returns_only_seeds(self):
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["A", "C"], method="khop", hops=0
+        )
+        assert _collect_originals(g2, m2) == {"A", "C"}
+        # No edges between them, so graph has 0 edges
+        assert g2.numberOfEdges() == 0
+
+    def test_multiple_seeds_union(self):
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["A", "E"], method="khop", hops=1
+        )
+        # A's 1-hop: {A, B}; E's 1-hop: {E, D}
+        assert _collect_originals(g2, m2) == {"A", "B", "D", "E"}
+
+    def test_contiguous_internal_ids(self):
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["A"], method="khop", hops=2
+        )
+        # Internal IDs should be exactly 0..K-1
+        assert set(g2.iterNodes()) == set(range(g2.numberOfNodes()))
+
+    def test_edges_preserved_in_subgraph(self):
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["A"], method="khop", hops=2
+        )
+        # Edges A-B, B-C, B-X all live within the kept set
+        assert g2.numberOfEdges() == 3
+
+    def test_seeds_as_dataframe(self):
+        seeds_df = pl.DataFrame({"node_id": ["A"]})
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, seeds_df, method="khop", hops=1
+        )
+        assert _collect_originals(g2, m2) == {"A", "B"}
+
+    def test_dataframe_missing_column_raises(self):
+        seeds_df = pl.DataFrame({"wrong_col": ["A"]})
+        with pytest.raises(ValidationError, match="missing column"):
+            filter_by_seed_proximity(
+                self.graph, self.mapper, seeds_df, method="khop"
+            )
+
+    def test_include_seeds_keeps_isolated_seed(self):
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["I"], method="khop", hops=2
+        )
+        # Isolated seed should still appear
+        assert "I" in _collect_originals(g2, m2)
+
+    def test_directed_direction_out(self):
+        # Build a directed chain: A -> B -> C
+        dg = nk.Graph(3, directed=True)
+        dg.addEdge(0, 1)
+        dg.addEdge(1, 2)
+        dm = IDMapper()
+        for i, name in enumerate(["A", "B", "C"]):
+            dm.add_mapping(name, i)
+
+        g2, m2 = filter_by_seed_proximity(
+            dg, dm, ["A"], method="khop", hops=2, direction="out"
+        )
+        assert _collect_originals(g2, m2) == {"A", "B", "C"}
+
+        g2, m2 = filter_by_seed_proximity(
+            dg, dm, ["A"], method="khop", hops=2, direction="in"
+        )
+        # A has no in-neighbors
+        assert _collect_originals(g2, m2) == {"A"}
+
+        g2, m2 = filter_by_seed_proximity(
+            dg, dm, ["C"], method="khop", hops=2, direction="in"
+        )
+        assert _collect_originals(g2, m2) == {"A", "B", "C"}
+
+
+class TestFilterBySeedProximityPPR:
+    """Personalized PageRank-based seed filtering."""
+
+    def setup_method(self):
+        # Two clusters connected by a bridge:
+        # cluster_a = {0,1,2} complete; cluster_b = {3,4,5} complete; bridge 2-3
+        self.graph = nk.Graph(6)
+        # Cluster A
+        self.graph.addEdge(0, 1)
+        self.graph.addEdge(1, 2)
+        self.graph.addEdge(0, 2)
+        # Cluster B
+        self.graph.addEdge(3, 4)
+        self.graph.addEdge(4, 5)
+        self.graph.addEdge(3, 5)
+        # Bridge
+        self.graph.addEdge(2, 3)
+
+        self.mapper = IDMapper()
+        for i, name in enumerate(["a0", "a1", "a2", "b0", "b1", "b2"]):
+            self.mapper.add_mapping(name, i)
+
+    def test_top_n_keeps_nodes_close_to_seed(self):
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["a0"], method="ppr", top_n=3
+        )
+        kept = _collect_originals(g2, m2)
+        # The three closest nodes to a0 should all be in cluster A
+        assert kept == {"a0", "a1", "a2"}
+
+    def test_top_n_larger_than_graph(self):
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["a0"], method="ppr", top_n=100
+        )
+        # All 6 nodes returned
+        assert g2.numberOfNodes() == 6
+
+    def test_min_ppr_threshold(self):
+        # Set a high threshold so only the seed itself survives
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["a0"], method="ppr", min_ppr=0.5,
+            include_seeds=True,
+        )
+        # With include_seeds=True at least the seed is kept
+        assert "a0" in _collect_originals(g2, m2)
+
+    def test_requires_top_n_or_min_ppr(self):
+        with pytest.raises(ValidationError, match="top_n or min_ppr"):
+            filter_by_seed_proximity(
+                self.graph, self.mapper, ["a0"], method="ppr"
+            )
+
+    def test_invalid_alpha(self):
+        with pytest.raises(ValidationError, match="ppr_alpha"):
+            filter_by_seed_proximity(
+                self.graph, self.mapper, ["a0"], method="ppr",
+                top_n=2, ppr_alpha=1.5,
+            )
+
+
+class TestFilterBySeedProximityLTE:
+    """Local Tightness Expansion-based seed filtering."""
+
+    def setup_method(self):
+        # Two communities of 4 nodes each, lightly bridged.
+        # Community A: 0-1-2-3 complete; Community B: 4-5-6-7 complete; bridge 3-4
+        self.graph = nk.Graph(8)
+        for u in range(4):
+            for v in range(u + 1, 4):
+                self.graph.addEdge(u, v)
+        for u in range(4, 8):
+            for v in range(u + 1, 8):
+                self.graph.addEdge(u, v)
+        self.graph.addEdge(3, 4)
+
+        self.mapper = IDMapper()
+        for i in range(8):
+            self.mapper.add_mapping(f"n{i}", i)
+
+    def test_lte_stays_in_seed_community(self):
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["n0"], method="lte"
+        )
+        kept = _collect_originals(g2, m2)
+        # LTE should pick community A; should not pull in the entire community B
+        assert "n0" in kept
+        # We expect cluster A to be (mostly) preserved, cluster B (mostly) excluded
+        community_a = {"n0", "n1", "n2", "n3"}
+        community_b = {"n4", "n5", "n6", "n7"}
+        assert len(kept & community_a) >= 3
+        assert len(kept & community_b) <= 1
+
+    def test_lte_on_directed_graph(self):
+        # Directed version of same structure — should still expand on undirected view.
+        dg = nk.Graph(8, directed=True)
+        for u in range(4):
+            for v in range(u + 1, 4):
+                dg.addEdge(u, v)
+        for u in range(4, 8):
+            for v in range(u + 1, 8):
+                dg.addEdge(u, v)
+        dg.addEdge(3, 4)
+
+        dm = IDMapper()
+        for i in range(8):
+            dm.add_mapping(f"n{i}", i)
+
+        g2, m2 = filter_by_seed_proximity(dg, dm, ["n0"], method="lte")
+        # Result graph stays directed
+        assert g2.isDirected()
+        assert "n0" in _collect_originals(g2, m2)
+
+
+class TestFilterBySeedProximityChaining:
+    """Methods can be stacked by feeding the output back in."""
+
+    def setup_method(self):
+        # Same two-community graph as LTE tests but with an extra distant tail
+        # off the bridge so k-hop expansion would reach it but LTE should trim it.
+        self.graph = nk.Graph(10)
+        for u in range(4):
+            for v in range(u + 1, 4):
+                self.graph.addEdge(u, v)
+        for u in range(4, 8):
+            for v in range(u + 1, 8):
+                self.graph.addEdge(u, v)
+        self.graph.addEdge(3, 4)
+        # Long tail dangling off node 4: 4 - 8 - 9
+        self.graph.addEdge(4, 8)
+        self.graph.addEdge(8, 9)
+
+        self.mapper = IDMapper()
+        for i in range(10):
+            self.mapper.add_mapping(f"n{i}", i)
+
+    def test_khop_then_lte(self):
+        # Step 1: 3 hops from n0 reaches everything except n9
+        g_hop, m_hop = filter_by_seed_proximity(
+            self.graph, self.mapper, ["n0"], method="khop", hops=3
+        )
+        hop_kept = _collect_originals(g_hop, m_hop)
+        assert "n0" in hop_kept
+        assert "n9" not in hop_kept  # 4 hops away, excluded
+
+        # Step 2: LTE on the bounded graph trims to the tight community
+        g_core, m_core = filter_by_seed_proximity(
+            g_hop, m_hop, ["n0"], method="lte"
+        )
+        core_kept = _collect_originals(g_core, m_core)
+        assert "n0" in core_kept
+        assert len(core_kept) <= len(hop_kept)
+        # Internal IDs are still contiguous after chaining
+        assert set(g_core.iterNodes()) == set(range(g_core.numberOfNodes()))
+
+    def test_khop_then_ppr(self):
+        g_hop, m_hop = filter_by_seed_proximity(
+            self.graph, self.mapper, ["n0"], method="khop", hops=2
+        )
+        g_ppr, m_ppr = filter_by_seed_proximity(
+            g_hop, m_hop, ["n0"], method="ppr", top_n=3
+        )
+        assert g_ppr.numberOfNodes() <= g_hop.numberOfNodes()
+        assert "n0" in _collect_originals(g_ppr, m_ppr)
+
+
+class TestFilterBySeedProximityValidation:
+    """Parameter validation and edge cases."""
+
+    def setup_method(self):
+        self.graph = nk.Graph(3)
+        self.graph.addEdge(0, 1)
+        self.graph.addEdge(1, 2)
+        self.mapper = IDMapper()
+        for i, name in enumerate(["a", "b", "c"]):
+            self.mapper.add_mapping(name, i)
+
+    def test_unknown_method_raises(self):
+        with pytest.raises(ValidationError, match="Unsupported method"):
+            filter_by_seed_proximity(
+                self.graph, self.mapper, ["a"], method="not_a_method"
+            )
+
+    def test_unknown_direction_raises(self):
+        with pytest.raises(ValidationError, match="Unsupported direction"):
+            filter_by_seed_proximity(
+                self.graph, self.mapper, ["a"], method="khop", direction="sideways"
+            )
+
+    def test_negative_hops_raises(self):
+        with pytest.raises(ValidationError, match="hops"):
+            filter_by_seed_proximity(
+                self.graph, self.mapper, ["a"], method="khop", hops=-1
+            )
+
+    def test_empty_seeds_raises(self):
+        with pytest.raises(ValidationError, match="non-empty"):
+            filter_by_seed_proximity(self.graph, self.mapper, [], method="khop")
+
+    def test_all_seeds_missing_raises(self):
+        with pytest.raises(ValidationError, match="None of the supplied seeds"):
+            filter_by_seed_proximity(
+                self.graph, self.mapper, ["does_not_exist"], method="khop"
+            )
+
+    def test_partial_seed_miss_warns_but_works(self):
+        g2, m2 = filter_by_seed_proximity(
+            self.graph, self.mapper, ["a", "missing"], method="khop", hops=1
+        )
+        # Filter ran using only the resolvable seed "a"
+        assert "a" in _collect_originals(g2, m2)

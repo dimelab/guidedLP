@@ -35,7 +35,7 @@ from .communities import (
 )
 
 # Network filtering
-from .filtering import filter_graph
+from .filtering import filter_graph, filter_by_seed_proximity
 
 # Network backboning
 from .backboning import (

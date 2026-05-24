@@ -24,6 +24,7 @@ This project provides efficient network analysis capabilities with a focus on **
 - **Graph construction**: Unipartite and bipartite networks from edge lists
 - **Temporal bipartite projection**: Convert temporal bipartite to directed unipartite with causality preservation
 - **Network backboning**: Statistical significance filtering
+- **Seed-centered filtering**: Prune to a neighborhood around your seeds via k-hop, Personalized PageRank, or Local Tightness Expansion
 - **Centrality measures**: Degree, betweenness, closeness, eigenvector centrality
 - **Community detection**: Louvain algorithm integration
 - **Temporal analysis**: Time-sliced network evolution
@@ -312,7 +313,71 @@ The disparity filter needs **weighted** input with meaningful weight variance. O
 
 Other `method` values: `"weight"` (threshold by edge weight — use with `target_edges=N`) and `"degree"` (keep top-N nodes by degree — use with `target_nodes=N`).
 
-### 2. Bipartite to Unipartite Projection
+### 2. Seed-Centered Filtering Before Propagation
+
+`filter_by_seed_proximity` prunes a graph to a neighborhood around your seed set. It complements backboning: backboning sparsifies *globally* by statistical significance, while seed-proximity filtering trims *locally* by relevance to the labelled nodes.
+
+**When this helps:**
+- Your seeds cover one part of a much larger graph and irrelevant subgraphs are diluting propagation.
+- You want to run GLP on a manageable region of a huge network without losing the structure around your seeds.
+- You're doing exploratory analysis and want a graph small enough to inspect visually.
+
+**When to skip:** seeds are dispersed across the whole network, or you specifically want the long-tail propagation behavior of GLP across the full graph.
+
+Three methods are supported, each returning `(graph, id_mapper)` so they can be chained:
+
+| Method | What it does | When to pick |
+|---|---|---|
+| `"khop"` (default) | BFS up to `hops` levels from the seed set. | Predictable size, fast. Watch out for hub nodes — one celebrity seed can pull in millions of nodes at 2 hops. |
+| `"ppr"` | Personalized PageRank from seeds; keep `top_n` and/or above `min_ppr`. | Theoretically aligned with GLP itself (same `αPF + (1−α)Y` propagation kernel). The most natural pre-filter when you're about to run GLP. |
+| `"lte"` | NetworkIt's `LocalTightnessExpansion` grown from the seed set. | Adaptive — stops at community boundaries automatically. No size knob to tune, so result size depends on graph structure. |
+
+```python
+from guidedLP.network.filtering import filter_by_seed_proximity
+
+seeds = ["@aoc", "@berniesanders", "@realdonaldtrump", "@tedcruz"]
+
+# Two-hop BFS neighborhood
+g_sub, m_sub = filter_by_seed_proximity(
+    graph, mapper, seeds, method="khop", hops=2,
+)
+
+# Personalized PageRank keeping the top 5000 nodes by PPR mass.
+# Set min_ppr=<threshold> instead (or alongside) to filter by mass.
+g_sub, m_sub = filter_by_seed_proximity(
+    graph, mapper, seeds,
+    method="ppr",
+    top_n=5000,
+    ppr_alpha=0.85,   # higher → mass spreads further from seeds
+)
+
+# Local Tightness Expansion — adaptive, no size knob
+g_sub, m_sub = filter_by_seed_proximity(
+    graph, mapper, seeds, method="lte",
+)
+```
+
+**Chaining methods.** Each call returns a fresh graph with contiguous internal IDs `0..K-1`, so methods can be stacked:
+
+```python
+# Step 1: bound size with a 3-hop frontier (prevents hub explosion).
+g_hop, m_hop = filter_by_seed_proximity(
+    graph, mapper, seeds, method="khop", hops=3,
+)
+# Step 2: within that frontier, keep only the tightly-connected core.
+g_core, m_core = filter_by_seed_proximity(
+    g_hop, m_hop, seeds, method="lte",
+)
+# g_core is ready to feed into guided_label_propagation.
+```
+
+**Seed input.** Accepts a list/tuple/set of original node IDs or a polars DataFrame (column name configurable via `seed_column`, default `"node_id"`). Labels aren't required — only the set of seeds.
+
+**Directed graphs.** Use `direction={"out", "in", "both"}` (default `"both"`) to control which edges to follow for `"khop"` and `"ppr"`. `"lte"` always operates on an undirected view but preserves the original direction in the returned graph.
+
+**Tip.** `include_seeds=True` (the default) guarantees seeds survive the filter, but run `check_seed_coverage(m_sub, seeds)` afterwards if seeds are mapped via a label dict — it's a cheap sanity check before launching GLP.
+
+### 3. Bipartite to Unipartite Projection
 
 Many computational social science datasets are naturally **bipartite** — users connected to hashtags, authors to papers, accounts to URLs they share. GLP works on a unipartite graph where seeds and unknown nodes live in the same partition, so the typical preprocessing step is to project: *connect two users if they share content, mediated by the items between them*.
 
@@ -377,7 +442,7 @@ results = guided_label_propagation(
 - Projections can blow up edge count: O(N² × D) worst case. On dense bipartite graphs, consider backboning either before projecting (sparsifies the bipartite layer) or after (sparsifies the projection itself).
 - Seeds must be in the projection partition; verify with `check_seed_coverage(user_mapper, seeds)` before propagation.
 
-### 3. Political Affiliation Analysis
+### 4. Political Affiliation Analysis
 
 ```python
 # Analyze political leaning in social networks
@@ -410,7 +475,7 @@ metrics = train_test_split_validation(
 print(f"Political classification accuracy: {metrics['accuracy']:.3f}")
 ```
 
-### 4. Temporal Network Analysis
+### 5. Temporal Network Analysis
 
 ```python
 # Track community evolution over time
@@ -439,7 +504,7 @@ for date, slice_edges in time_slices.items():
     print(f"{date}: {len(results)} nodes classified")
 ```
 
-### 5. Academic Collaboration Networks
+### 6. Academic Collaboration Networks
 
 ```python
 # Map research communities in citation networks
@@ -469,7 +534,7 @@ for row in low_confidence.iter_rows(named=True):
     print(f"{row['node_id']}: Likely interdisciplinary researcher")
 ```
 
-### 6. Temporal Bipartite-to-Unipartite Conversion
+### 7. Temporal Bipartite-to-Unipartite Conversion
 
 When edge order matters — A shared an item *before* B did, so B may have been attributing to A — use `temporal_bipartite_to_unipartite`. It produces a **directed** unipartite graph using **citation convention**: edges point from the *later* sharer to the *earlier* one. Under this convention the earliest sharer accumulates the most incoming edges, and PageRank / HITS-Authority naturally surface them as the influential sources.
 

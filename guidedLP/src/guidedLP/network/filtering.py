@@ -1,17 +1,25 @@
 """
 Network filtering module for the Guided Label Propagation library.
 
-This module provides :func:`filter_graph`, which applies one or more filters
-(degree bounds, weight bounds, component selection, node inclusion/exclusion,
-centrality thresholds) to a NetworkIt graph. Backbone-extraction methods
-live in :mod:`guidedLP.network.backboning`.
+Provides two complementary filtering interfaces:
+
+- :func:`filter_graph` applies one or more global criteria (degree bounds,
+  weight bounds, component selection, node inclusion/exclusion, centrality
+  thresholds) using mask combinations.
+- :func:`filter_by_seed_proximity` prunes the graph to a neighborhood
+  centered on a set of seed nodes via k-hop BFS, Personalized PageRank, or
+  NetworkIt's Local Tightness Expansion. Each call returns ``(graph,
+  id_mapper)`` so methods can be chained (e.g. ``khop`` then ``lte``).
+
+Backbone-extraction methods live in :mod:`guidedLP.network.backboning`.
 """
 
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union, Set
 
 import polars as pl
 import networkit as nk
 import numpy as np
+import scipy.sparse as sp
 
 from guidedLP.common.id_mapper import IDMapper
 from guidedLP.common.exceptions import (
@@ -27,6 +35,10 @@ SUPPORTED_FILTER_TYPES = [
     "min_degree", "max_degree", "min_weight", "giant_component_only",
     "nodes", "exclude_nodes", "centrality"
 ]
+
+# Seed-proximity methods
+SUPPORTED_PROXIMITY_METHODS = ["khop", "ppr", "lte"]
+SUPPORTED_DIRECTIONS = ["out", "in", "both"]
 
 
 def filter_graph(
@@ -413,3 +425,555 @@ def _apply_masks_to_graph(
                 pass
 
     return filtered_graph, updated_mapper
+
+
+# ---------------------------------------------------------------------------
+# Seed-proximity filtering
+# ---------------------------------------------------------------------------
+
+
+def filter_by_seed_proximity(
+    graph: nk.Graph,
+    id_mapper: IDMapper,
+    seeds: Union[List[Any], pl.DataFrame],
+    method: str = "khop",
+    *,
+    # khop parameters
+    hops: int = 2,
+    direction: str = "both",
+    # ppr parameters
+    ppr_alpha: float = 0.85,
+    top_n: Optional[int] = None,
+    min_ppr: Optional[float] = None,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+    # lte parameters
+    lte_alpha: float = 1.0,
+    # common
+    include_seeds: bool = True,
+    seed_column: str = "node_id",
+) -> Tuple[nk.Graph, IDMapper]:
+    """
+    Filter a graph to a neighborhood centered on a set of seed nodes.
+
+    Three selection methods are supported. Each returns a fresh graph with
+    contiguous internal IDs and a matching ``IDMapper``, so calls can be
+    chained — e.g. run ``"khop"`` first to bound size, then ``"lte"`` on
+    the result to keep only tightly-connected expansions.
+
+    Parameters
+    ----------
+    graph : nk.Graph
+        NetworkIt graph to filter.
+    id_mapper : IDMapper
+        Bidirectional mapping between original and internal node IDs.
+    seeds : list or polars.DataFrame
+        Seed nodes (original IDs). If a ``DataFrame``, the column named by
+        ``seed_column`` is used. Duplicates are deduplicated.
+    method : {"khop", "ppr", "lte"}, default "khop"
+        Selection method:
+
+        - ``"khop"``: BFS up to ``hops`` levels from the seed set.
+          Predictable size, ignores edge strength.
+        - ``"ppr"``: Personalized PageRank from the seed set. Keep nodes
+          with top ``top_n`` mass and/or mass above ``min_ppr``. Aligned
+          with the GLP propagation kernel — useful when filtering before
+          running GLP.
+        - ``"lte"``: NetworkIt's Local Tightness Expansion
+          (``nk.scd.LocalTightnessExpansion``) expanded from the seed set
+          as a single community. Adaptive; size depends on graph structure.
+
+    hops : int, default 2
+        Number of BFS hops for ``method="khop"``. ``hops=0`` keeps only
+        the seed set itself.
+    direction : {"out", "in", "both"}, default "both"
+        Edge direction for ``"khop"`` and ``"ppr"`` on directed graphs.
+        Ignored for undirected graphs and for ``"lte"`` (which always
+        treats the graph as undirected).
+    ppr_alpha : float, default 0.85
+        Damping factor for Personalized PageRank. Higher values let mass
+        spread further from seeds.
+    top_n : int, optional
+        For ``"ppr"``: keep at most this many nodes ranked by PPR mass.
+    min_ppr : float, optional
+        For ``"ppr"``: keep nodes with PPR mass at or above this threshold.
+        At least one of ``top_n`` or ``min_ppr`` must be given.
+    max_iter : int, default 100
+        Maximum PPR iterations.
+    tol : float, default 1e-6
+        L∞ convergence tolerance for PPR.
+    lte_alpha : float, default 1.0
+        ``alpha`` parameter passed to ``nk.scd.LocalTightnessExpansion``.
+    include_seeds : bool, default True
+        Always retain seed nodes in the result, even when a method would
+        otherwise exclude them (e.g. an isolated seed under ``"lte"``).
+    seed_column : str, default "node_id"
+        Column name used to pull seed IDs from a polars DataFrame.
+
+    Returns
+    -------
+    Tuple[nk.Graph, IDMapper]
+        Filtered graph with contiguous internal IDs ``0..K-1`` and a new
+        ``IDMapper`` mapping original IDs to those contiguous IDs.
+
+    Raises
+    ------
+    ValidationError
+        If parameters are missing or out of range, seeds are empty, or all
+        seeds are missing from the graph.
+    ComputationError
+        If filtering produces an empty graph or the underlying method fails.
+
+    Examples
+    --------
+    Two-hop neighborhood from a list of seed IDs:
+
+    >>> g2, m2 = filter_by_seed_proximity(
+    ...     graph, mapper, ["alice", "bob"], method="khop", hops=2
+    ... )
+
+    Personalized PageRank keeping the top 500 nodes:
+
+    >>> g2, m2 = filter_by_seed_proximity(
+    ...     graph, mapper, seed_df, method="ppr", top_n=500
+    ... )
+
+    Chain k-hop with LTE — bound by 3 hops, then trim to the tight core:
+
+    >>> g_hop, m_hop = filter_by_seed_proximity(
+    ...     graph, mapper, seeds, method="khop", hops=3
+    ... )
+    >>> g_core, m_core = filter_by_seed_proximity(
+    ...     g_hop, m_hop, seeds, method="lte"
+    ... )
+
+    Notes
+    -----
+    Time complexity:
+        - ``khop``: ``O(|V'| + |E'|)`` where ``V'/E'`` are nodes/edges
+          within the explored frontier.
+        - ``ppr``: ``O(max_iter · nnz(A))`` for the sparse iteration.
+        - ``lte``: depends on NetworkIt's SCD implementation; sublinear in
+          ``|V|`` for typical seed-local expansions.
+
+    The returned graph is rebuilt with contiguous internal IDs (0..K-1) so
+    downstream matrix operations (e.g. GLP) work directly.
+    """
+    log_function_entry(
+        "filter_by_seed_proximity",
+        graph_nodes=graph.numberOfNodes(),
+        graph_edges=graph.numberOfEdges(),
+        method=method,
+        n_seeds=(len(seeds) if hasattr(seeds, "__len__") else None),
+    )
+
+    _validate_proximity_parameters(
+        method=method,
+        hops=hops,
+        direction=direction,
+        ppr_alpha=ppr_alpha,
+        top_n=top_n,
+        min_ppr=min_ppr,
+        max_iter=max_iter,
+        tol=tol,
+        lte_alpha=lte_alpha,
+    )
+
+    if graph.numberOfNodes() == 0:
+        logger.warning("Empty graph provided. Returning empty graph.")
+        return graph, id_mapper
+
+    seed_originals = _normalize_seeds(seeds, seed_column)
+    seed_internals = _resolve_seed_internals(seed_originals, id_mapper, graph)
+
+    with LoggingTimer(
+        "filter_by_seed_proximity",
+        {"method": method, "nodes": graph.numberOfNodes(), "seeds": len(seed_internals)},
+    ):
+        try:
+            if method == "khop":
+                kept = _khop_select(graph, seed_internals, hops, direction)
+            elif method == "ppr":
+                kept = _ppr_select(
+                    graph,
+                    seed_internals,
+                    alpha=ppr_alpha,
+                    top_n=top_n,
+                    min_ppr=min_ppr,
+                    max_iter=max_iter,
+                    tol=tol,
+                    direction=direction,
+                )
+            elif method == "lte":
+                kept = _lte_select(graph, seed_internals, lte_alpha)
+            else:
+                # Already validated, but be explicit.
+                raise ValidationError(f"Unsupported method: {method}")
+
+            if include_seeds:
+                kept = kept | seed_internals
+
+            new_graph, new_mapper = _rebuild_subgraph(graph, id_mapper, kept)
+
+            if new_graph.numberOfNodes() == 0:
+                raise ComputationError(
+                    "Seed-proximity filtering produced an empty graph. "
+                    "Try relaxing the method's parameters or supplying more seeds.",
+                    context={"operation": "filter_by_seed_proximity", "method": method},
+                )
+
+            logger.info(
+                f"Seed-proximity filter ({method}): "
+                f"{graph.numberOfNodes()} → {new_graph.numberOfNodes()} nodes, "
+                f"{graph.numberOfEdges()} → {new_graph.numberOfEdges()} edges, "
+                f"{len(seed_internals)} seeds"
+            )
+
+            return new_graph, new_mapper
+
+        except (ValidationError, ComputationError):
+            raise
+        except Exception as e:
+            raise ComputationError(
+                f"Seed-proximity filtering failed: {e}",
+                context={
+                    "operation": "filter_by_seed_proximity",
+                    "method": method,
+                    "error_type": "computation",
+                },
+            ) from e
+
+
+# Validation ----------------------------------------------------------------
+
+
+def _validate_proximity_parameters(
+    *,
+    method: str,
+    hops: int,
+    direction: str,
+    ppr_alpha: float,
+    top_n: Optional[int],
+    min_ppr: Optional[float],
+    max_iter: int,
+    tol: float,
+    lte_alpha: float,
+) -> None:
+    if method not in SUPPORTED_PROXIMITY_METHODS:
+        raise ValidationError(
+            f"Unsupported method: {method!r}. "
+            f"Supported: {SUPPORTED_PROXIMITY_METHODS}"
+        )
+
+    if direction not in SUPPORTED_DIRECTIONS:
+        raise ValidationError(
+            f"Unsupported direction: {direction!r}. "
+            f"Supported: {SUPPORTED_DIRECTIONS}"
+        )
+
+    if method == "khop":
+        if not isinstance(hops, int) or hops < 0:
+            raise ValidationError("hops must be a non-negative integer")
+
+    if method == "ppr":
+        if not (0.0 < ppr_alpha < 1.0):
+            raise ValidationError("ppr_alpha must be in the open interval (0, 1)")
+        if top_n is None and min_ppr is None:
+            raise ValidationError(
+                "For method='ppr', supply at least one of top_n or min_ppr."
+            )
+        if top_n is not None and top_n <= 0:
+            raise ValidationError("top_n must be a positive integer")
+        if min_ppr is not None and min_ppr < 0:
+            raise ValidationError("min_ppr must be non-negative")
+        if max_iter <= 0:
+            raise ValidationError("max_iter must be positive")
+        if tol <= 0:
+            raise ValidationError("tol must be positive")
+
+    if method == "lte":
+        if lte_alpha <= 0:
+            raise ValidationError("lte_alpha must be positive")
+
+
+# Seed normalization --------------------------------------------------------
+
+
+def _normalize_seeds(
+    seeds: Union[List[Any], pl.DataFrame],
+    seed_column: str,
+) -> List[Any]:
+    """Extract a deduplicated list of original seed IDs from list or DataFrame."""
+    if isinstance(seeds, pl.DataFrame):
+        if seed_column not in seeds.columns:
+            raise ValidationError(
+                f"Seed DataFrame is missing column {seed_column!r}. "
+                f"Available columns: {seeds.columns}"
+            )
+        values = seeds.get_column(seed_column).to_list()
+    elif isinstance(seeds, (list, tuple, set)):
+        values = list(seeds)
+    else:
+        raise ValidationError(
+            f"seeds must be a list, tuple, set, or polars.DataFrame; got {type(seeds).__name__}"
+        )
+
+    if not values:
+        raise ValidationError("seeds must be non-empty")
+
+    seen: Set[Any] = set()
+    deduped: List[Any] = []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            deduped.append(v)
+    return deduped
+
+
+def _resolve_seed_internals(
+    seed_originals: List[Any],
+    id_mapper: IDMapper,
+    graph: nk.Graph,
+) -> Set[int]:
+    """Translate original seed IDs to internal IDs, warning on unknown seeds."""
+    resolved: Set[int] = set()
+    missing: List[Any] = []
+    for original in seed_originals:
+        try:
+            internal = id_mapper.get_internal(original)
+        except KeyError:
+            missing.append(original)
+            continue
+        if graph.hasNode(internal):
+            resolved.add(internal)
+        else:
+            missing.append(original)
+
+    if missing:
+        preview = missing[:5]
+        logger.warning(
+            f"{len(missing)} of {len(seed_originals)} seeds not present in graph "
+            f"(first few: {preview})"
+        )
+
+    if not resolved:
+        raise ValidationError(
+            "None of the supplied seeds are present in the graph."
+        )
+
+    return resolved
+
+
+# Selection methods ---------------------------------------------------------
+
+
+def _iter_neighbors_directional(
+    graph: nk.Graph,
+    node: int,
+    direction: str,
+):
+    """Yield neighbors of ``node`` according to ``direction``.
+
+    For undirected graphs the direction is ignored. For directed graphs:
+
+    - ``"out"``: outgoing neighbors only
+    - ``"in"``:  incoming neighbors only
+    - ``"both"``: union of both
+    """
+    if not graph.isDirected() or direction == "out":
+        yield from graph.iterNeighbors(node)
+        return
+
+    if direction == "in":
+        yield from graph.iterInNeighbors(node)
+        return
+
+    # direction == "both" on a directed graph
+    seen: Set[int] = set()
+    for v in graph.iterNeighbors(node):
+        if v not in seen:
+            seen.add(v)
+            yield v
+    for v in graph.iterInNeighbors(node):
+        if v not in seen:
+            seen.add(v)
+            yield v
+
+
+def _khop_select(
+    graph: nk.Graph,
+    seed_internals: Set[int],
+    hops: int,
+    direction: str,
+) -> Set[int]:
+    """BFS frontier expansion up to ``hops`` levels from the seed set."""
+    visited: Set[int] = set(seed_internals)
+    if hops == 0:
+        return visited
+
+    frontier: Set[int] = set(seed_internals)
+    for _ in range(hops):
+        next_frontier: Set[int] = set()
+        for u in frontier:
+            for v in _iter_neighbors_directional(graph, u, direction):
+                if v not in visited:
+                    next_frontier.add(v)
+        if not next_frontier:
+            break
+        visited |= next_frontier
+        frontier = next_frontier
+
+    return visited
+
+
+def _ppr_select(
+    graph: nk.Graph,
+    seed_internals: Set[int],
+    *,
+    alpha: float,
+    top_n: Optional[int],
+    min_ppr: Optional[float],
+    max_iter: int,
+    tol: float,
+    direction: str,
+) -> Set[int]:
+    """Personalized PageRank from the seed set, then threshold."""
+    n_nodes = graph.numberOfNodes()
+
+    # Build adjacency in COO form. For directed graphs we respect direction;
+    # for undirected we always symmetrize (matching GLP convention).
+    rows: List[int] = []
+    cols: List[int] = []
+    weights: List[float] = []
+    is_directed = graph.isDirected()
+    is_weighted = graph.isWeighted()
+
+    for u, v in graph.iterEdges():
+        w = graph.weight(u, v) if is_weighted else 1.0
+        if not is_directed:
+            rows.append(u); cols.append(v); weights.append(w)
+            rows.append(v); cols.append(u); weights.append(w)
+        elif direction == "out":
+            rows.append(u); cols.append(v); weights.append(w)
+        elif direction == "in":
+            rows.append(v); cols.append(u); weights.append(w)
+        else:  # both -> symmetrize
+            rows.append(u); cols.append(v); weights.append(w)
+            rows.append(v); cols.append(u); weights.append(w)
+
+    if not rows:
+        # No edges: PPR mass concentrates entirely on seeds.
+        return set(seed_internals)
+
+    adj = sp.coo_matrix(
+        (weights, (rows, cols)),
+        shape=(n_nodes, n_nodes),
+        dtype=np.float64,
+    ).tocsr()
+
+    # Row-normalize: P = D^{-1} A. Handle dangling rows by leaving them zero
+    # (their mass is preserved by the teleport term).
+    row_sums = np.asarray(adj.sum(axis=1)).ravel()
+    nonzero = row_sums > 0
+    inv = np.zeros_like(row_sums)
+    inv[nonzero] = 1.0 / row_sums[nonzero]
+    P = sp.diags(inv).dot(adj)
+
+    # Seed distribution: uniform over the seed set, sums to 1.
+    s = np.zeros(n_nodes, dtype=np.float64)
+    seed_list = list(seed_internals)
+    s[seed_list] = 1.0 / len(seed_list)
+
+    pi = s.copy()
+    for it in range(max_iter):
+        pi_next = alpha * (P.T @ pi) + (1.0 - alpha) * s
+        # Re-add mass lost from dangling rows so the vector stays a distribution.
+        leaked = pi.sum() - pi_next.sum()
+        if leaked > 0:
+            pi_next += leaked * s
+        diff = float(np.max(np.abs(pi_next - pi)))
+        pi = pi_next
+        if diff < tol:
+            logger.debug(f"PPR converged after {it + 1} iterations (Δ={diff:.2e})")
+            break
+    else:
+        logger.warning(
+            f"PPR did not converge within {max_iter} iterations (final Δ={diff:.2e})"
+        )
+
+    # Apply thresholds. If both top_n and min_ppr are set, both must hold.
+    candidates = np.arange(n_nodes)
+    mask = np.ones(n_nodes, dtype=bool)
+    if min_ppr is not None:
+        mask &= pi >= min_ppr
+    selected = candidates[mask]
+
+    if top_n is not None and selected.size > top_n:
+        order = np.argpartition(-pi[selected], top_n - 1)[:top_n]
+        selected = selected[order]
+
+    return set(int(i) for i in selected.tolist())
+
+
+def _lte_select(
+    graph: nk.Graph,
+    seed_internals: Set[int],
+    lte_alpha: float,
+) -> Set[int]:
+    """Expand the seed set via NetworkIt's Local Tightness Expansion.
+
+    LTE operates on undirected graphs. For directed input we expand on an
+    undirected view but apply the resulting node set back to the original
+    graph (preserving its direction).
+    """
+    target = graph
+    if graph.isDirected():
+        target = nk.graphtools.toUndirected(graph)
+
+    lte = nk.scd.LocalTightnessExpansion(target, alpha=lte_alpha)
+    expanded = lte.expandOneCommunity(list(seed_internals))
+    return set(int(v) for v in expanded)
+
+
+# Subgraph rebuild ----------------------------------------------------------
+
+
+def _rebuild_subgraph(
+    graph: nk.Graph,
+    id_mapper: IDMapper,
+    keep_internal: Set[int],
+) -> Tuple[nk.Graph, IDMapper]:
+    """Build a new graph with contiguous internal IDs ``0..K-1``.
+
+    Unlike ``_apply_masks_to_graph``, which uses ``removeNode`` and leaves
+    holes in the internal ID space, this rebuilds the graph from scratch so
+    downstream matrix operations can rely on ``range(numberOfNodes())``.
+    """
+    sorted_kept = sorted(keep_internal)
+    old_to_new = {old: new for new, old in enumerate(sorted_kept)}
+
+    new_graph = nk.Graph(
+        n=len(sorted_kept),
+        weighted=graph.isWeighted(),
+        directed=graph.isDirected(),
+    )
+
+    new_mapper = IDMapper()
+    for old_id in sorted_kept:
+        try:
+            original = id_mapper.get_original(old_id)
+        except KeyError:
+            continue
+        new_mapper.add_mapping(original, old_to_new[old_id])
+
+    is_weighted = graph.isWeighted()
+    for u, v in graph.iterEdges():
+        if u in keep_internal and v in keep_internal:
+            new_u = old_to_new[u]
+            new_v = old_to_new[v]
+            if is_weighted:
+                new_graph.addEdge(new_u, new_v, graph.weight(u, v))
+            else:
+                new_graph.addEdge(new_u, new_v)
+
+    return new_graph, new_mapper
