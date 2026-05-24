@@ -27,6 +27,7 @@ from guidedLP.common.exceptions import (
     ValidationError,
 )
 from guidedLP.common.logging_config import get_logger, log_function_entry, LoggingTimer
+from guidedLP.network.construction import _extract_edge_arrays
 
 logger = get_logger(__name__)
 
@@ -41,45 +42,61 @@ SUPPORTED_PROXIMITY_METHODS = ["khop", "ppr", "lte"]
 SUPPORTED_DIRECTIONS = ["out", "in", "both"]
 
 
-def filter_graph(
-    graph: nk.Graph,
-    id_mapper: IDMapper,
-    filters: Dict[str, Any],
-    combine: str = "and"
-) -> Tuple[nk.Graph, IDMapper]:
-    """
-    Apply various filters to a graph based on specified criteria.
+# Filter types that operate purely on the edge frame (no graph traversal).
+FRAME_FRIENDLY_FILTERS = {"min_degree", "max_degree", "min_weight", "nodes", "exclude_nodes"}
+TRAVERSAL_REQUIRED_FILTERS = {"giant_component_only", "centrality"}
 
-    This function provides a flexible framework for filtering networks using
-    multiple criteria such as degree bounds, component selection, and centrality
-    thresholds. Filters can be combined using AND or OR logic.
+
+def filter_graph(
+    edges: Union[nk.Graph, pl.DataFrame],
+    id_mapper: Optional[IDMapper] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    combine: str = "and",
+    *,
+    output_format: Optional[str] = None,
+) -> Union[Tuple[nk.Graph, IDMapper], pl.DataFrame]:
+    """
+    Apply various filters to a network based on specified criteria.
+
+    Accepts either a NetworkIt graph (with an ``id_mapper``) or a Polars edge
+    frame (with columns ``source_id``, ``target_id``, ``weight``). The output
+    format defaults to matching the input but can be forced via
+    ``output_format``. ``frame → graph`` is intentionally not supported — call
+    :func:`build_graph_from_edgelist` on the returned frame if you need a
+    graph.
 
     Parameters
     ----------
-    graph : nk.Graph
-        NetworkIt graph object to filter
-    id_mapper : IDMapper
-        Bidirectional mapping between original and internal node IDs
+    edges : nk.Graph or pl.DataFrame
+        Either a NetworkIt graph or a Polars edge frame with columns
+        ``source_id``, ``target_id``, ``weight``.
+    id_mapper : IDMapper, optional
+        Required when ``edges`` is a Graph; ignored when it's a frame
+        (frames already use original IDs).
     filters : Dict[str, Any]
         Dictionary specifying filter criteria. Supported filters:
         - "min_degree": int - Minimum degree threshold
         - "max_degree": int - Maximum degree threshold
         - "min_weight": float - Minimum edge weight threshold
         - "giant_component_only": bool - Keep only largest connected component
+          (**graph input only** — requires traversal)
         - "nodes": List[str] - Keep only these nodes (original IDs)
         - "exclude_nodes": List[str] - Remove these nodes (original IDs)
         - "centrality": Dict - Filter by centrality metrics
-          {"metric": str, "min_value": float}
+          {"metric": str, "min_value": float} (**graph input only**)
     combine : str, default "and"
-        How to combine multiple filters: "and" or "or"
+        How to combine multiple filters within each category (node vs. edge):
+        "and" or "or". Between categories the result is always AND-combined.
+    output_format : str, optional
+        ``"graph"``, ``"dataframe"``, or ``None`` (default — match input).
+        ``output_format="graph"`` with a frame input is not supported.
 
     Returns
     -------
     Tuple[nk.Graph, IDMapper]
-        filtered_graph : nk.Graph
-            Filtered NetworkIt graph
-        updated_mapper : IDMapper
-            Updated ID mapper containing only remaining nodes
+        Graph-output path; the filtered graph and the updated ID mapper.
+    pl.DataFrame
+        DataFrame-output path; the filtered edge frame.
 
     Examples
     --------
@@ -127,6 +144,33 @@ def filter_graph(
     them according to the specified logic. For efficiency, component detection
     is only performed when necessary.
     """
+    if filters is None:
+        filters = {}
+    _validate_filter_parameters(filters, combine)
+
+    # Dispatch on input type.
+    if isinstance(edges, pl.DataFrame):
+        if output_format == "graph":
+            raise ValidationError(
+                "output_format='graph' with a DataFrame input is not supported. "
+                "Call build_graph_from_edgelist() on the returned frame instead."
+            )
+        return _filter_edges_frame(edges, filters, combine)
+
+    if not isinstance(edges, nk.Graph):
+        raise ValidationError(
+            f"`edges` must be a NetworkIt graph or a Polars DataFrame, got {type(edges).__name__}"
+        )
+    if id_mapper is None:
+        raise ValidationError("`id_mapper` is required when `edges` is a NetworkIt graph")
+
+    if output_format not in (None, "graph", "dataframe"):
+        raise ValidationError(
+            f"output_format must be 'graph', 'dataframe', or None; got {output_format!r}"
+        )
+
+    graph = edges  # readability
+
     log_function_entry(
         "filter_graph",
         graph_nodes=graph.numberOfNodes(),
@@ -135,12 +179,12 @@ def filter_graph(
         combine=combine
     )
 
-    # Validate parameters
-    _validate_filter_parameters(filters, combine)
-
     # Handle empty graph
     if graph.numberOfNodes() == 0:
         logger.warning("Empty graph provided. Returning empty graph.")
+        if output_format == "dataframe":
+            from guidedLP.network.construction import graph_to_edges
+            return graph_to_edges(graph, id_mapper)
         return graph, id_mapper
 
     with LoggingTimer("filter_graph", {"filters": list(filters.keys()), "nodes": graph.numberOfNodes()}):
@@ -195,6 +239,10 @@ def filter_graph(
                 f"{graph.numberOfEdges()} → {filtered_graph.numberOfEdges()} edges"
             )
 
+            if output_format == "dataframe":
+                from guidedLP.network.construction import graph_to_edges
+                return graph_to_edges(filtered_graph, updated_mapper)
+
             return filtered_graph, updated_mapper
 
         except Exception as e:
@@ -206,6 +254,110 @@ def filter_graph(
                     "error_type": "computation"
                 }
             ) from e
+
+
+def _filter_edges_frame(
+    df: pl.DataFrame,
+    filters: Dict[str, Any],
+    combine: str,
+) -> pl.DataFrame:
+    """Frame-input branch of :func:`filter_graph`.
+
+    Applies the frame-friendly filter types (``min_degree``, ``max_degree``,
+    ``min_weight``, ``nodes``, ``exclude_nodes``). Raises
+    :class:`ValidationError` for filters that require graph traversal
+    (``giant_component_only``, ``centrality``) — pointing users to
+    :func:`build_graph_from_edgelist` for the explicit conversion.
+
+    Within each category (node-derived vs. edge-derived predicates) the
+    user's ``combine`` choice applies. Between categories the predicates are
+    always AND-combined — matching the graph-input path.
+    """
+    required = {"source_id", "target_id", "weight"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValidationError(
+            f"Edge frame is missing required columns: {sorted(missing)}. "
+            f"Expected {sorted(required)}."
+        )
+
+    # Reject traversal-required filters early with a clear message.
+    needs_graph = TRAVERSAL_REQUIRED_FILTERS & set(filters.keys())
+    if needs_graph:
+        raise ValidationError(
+            f"Filter type(s) {sorted(needs_graph)} require a graph object "
+            "(connected-component or centrality computations are not expressible "
+            "as a pure edge-frame operation). Build a graph first via "
+            "build_graph_from_edgelist() and pass it to filter_graph()."
+        )
+
+    # Per-node degree (unweighted in+out count). Edge frames are agnostic to
+    # direction here — we mirror the original graph-side semantic which simply
+    # uses graph.degree(u).
+    src = df.select(pl.col("source_id").alias("node"))
+    tgt = df.select(pl.col("target_id").alias("node"))
+    degrees = (
+        pl.concat([src, tgt])
+        .group_by("node")
+        .agg(pl.len().alias("degree"))
+    )
+
+    surviving_node_sets: List[Set[Any]] = []
+    edge_predicates: List["pl.Expr"] = []
+
+    for filter_type, filter_value in filters.items():
+        if filter_type == "min_degree":
+            kept = set(degrees.filter(pl.col("degree") >= filter_value)["node"].to_list())
+            surviving_node_sets.append(kept)
+        elif filter_type == "max_degree":
+            kept = set(degrees.filter(pl.col("degree") <= filter_value)["node"].to_list())
+            surviving_node_sets.append(kept)
+        elif filter_type == "min_weight":
+            edge_predicates.append(pl.col("weight") >= filter_value)
+        elif filter_type == "nodes":
+            surviving_node_sets.append(set(filter_value))
+        elif filter_type == "exclude_nodes":
+            all_nodes = set(degrees["node"].to_list())
+            surviving_node_sets.append(all_nodes - set(filter_value))
+
+    # Combine node-derived sets per user choice, then convert to an edge
+    # predicate (both endpoints must survive).
+    node_edge_pred: Optional["pl.Expr"] = None
+    if surviving_node_sets:
+        if combine == "and":
+            surviving = set.intersection(*surviving_node_sets) if len(surviving_node_sets) > 1 else surviving_node_sets[0]
+        else:
+            surviving = set.union(*surviving_node_sets)
+        surviving_list = list(surviving)
+        node_edge_pred = (
+            pl.col("source_id").is_in(surviving_list)
+            & pl.col("target_id").is_in(surviving_list)
+        )
+
+    # Combine edge-derived predicates per user choice.
+    edge_pred: Optional["pl.Expr"] = None
+    if edge_predicates:
+        edge_pred = edge_predicates[0]
+        for p in edge_predicates[1:]:
+            edge_pred = (edge_pred & p) if combine == "and" else (edge_pred | p)
+
+    # Cross-category combine is always AND.
+    if node_edge_pred is not None and edge_pred is not None:
+        final = node_edge_pred & edge_pred
+    elif node_edge_pred is not None:
+        final = node_edge_pred
+    elif edge_pred is not None:
+        final = edge_pred
+    else:
+        return df
+
+    out = df.filter(final)
+    if out.height == 0:
+        raise ComputationError(
+            "All edges were filtered out. Consider relaxing filter criteria.",
+            context={"operation": "filter_graph", "filters": filters},
+        )
+    return out
 
 
 # Helper functions for validation
@@ -260,11 +412,8 @@ def _apply_weight_filter(graph: nk.Graph, min_weight: float) -> np.ndarray:
         logger.warning("Weight filter applied to unweighted graph. All edges have weight 1.0")
         return np.ones(graph.numberOfEdges(), dtype=bool)
 
-    weights = []
-    for u, v in graph.iterEdges():
-        weights.append(graph.weight(u, v))
-
-    return np.array(weights) >= min_weight
+    _, _, weights = _extract_edge_arrays(graph)
+    return weights >= min_weight
 
 
 def _apply_component_filter(graph: nk.Graph) -> np.ndarray:
@@ -558,7 +707,21 @@ def filter_by_seed_proximity(
 
     The returned graph is rebuilt with contiguous internal IDs (0..K-1) so
     downstream matrix operations (e.g. GLP) work directly.
+
+    Notes
+    -----
+    Frame input is intentionally not supported here — all three methods
+    (``khop``, ``ppr``, ``lte``) are graph-traversal algorithms. Pass a
+    NetworkIt graph; if you only have a frame, build one with
+    :func:`build_graph_from_edgelist` first.
     """
+    if not isinstance(graph, nk.Graph):
+        raise ValidationError(
+            "filter_by_seed_proximity requires a NetworkIt graph (its three "
+            "methods are graph traversals). Convert your edge frame with "
+            f"build_graph_from_edgelist() first. Got {type(graph).__name__}."
+        )
+
     log_function_entry(
         "filter_by_seed_proximity",
         graph_nodes=graph.numberOfNodes(),

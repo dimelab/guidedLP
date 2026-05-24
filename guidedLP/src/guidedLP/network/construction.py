@@ -1023,6 +1023,74 @@ def _add_edges_chunk(
             add_edge(int(u), int(v))
 
 
+def _extract_edge_arrays(
+    graph: nk.Graph,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Walk ``graph.iterEdges()`` once, returning (sources, targets, weights).
+
+    All three arrays are sized ``E`` and indexed by internal node IDs. Weights
+    are 1.0 for unweighted graphs. Used as the single low-level edge-extraction
+    primitive across the package — every other helper that needs to leave the
+    graph object for numpy/Polars math should route through here.
+    """
+    weighted = graph.isWeighted()
+    sources_l: List[int] = []
+    targets_l: List[int] = []
+    weights_l: List[float] = []
+    for u, v in graph.iterEdges():
+        sources_l.append(u)
+        targets_l.append(v)
+        weights_l.append(graph.weight(u, v) if weighted else 1.0)
+
+    sources = np.asarray(sources_l, dtype=np.int64)
+    targets = np.asarray(targets_l, dtype=np.int64)
+    weights = np.asarray(weights_l, dtype=np.float64)
+    return sources, targets, weights
+
+
+def graph_to_edges(graph: nk.Graph, id_mapper: IDMapper) -> pl.DataFrame:
+    """Extract a NetworkIt graph's edges into a Polars frame keyed by original IDs.
+
+    Parameters
+    ----------
+    graph : nk.Graph
+        NetworkIt graph to extract from.
+    id_mapper : IDMapper
+        Bidirectional mapping between original and internal node IDs. Used to
+        translate internal IDs back to the user-facing originals.
+
+    Returns
+    -------
+    pl.DataFrame
+        Columns: ``source_id``, ``target_id``, ``weight`` (Float64). ``weight``
+        is always present and equals 1.0 for unweighted graphs. For undirected
+        graphs each edge appears once, with the orientation NetworkIt returns
+        from ``iterEdges()``.
+
+    Notes
+    -----
+    Time complexity: O(E). The Python-level loop dominates; on large graphs
+    this is the single biggest non-vectorised cost of the dataframe pipeline.
+    """
+    sources, targets, weights = _extract_edge_arrays(graph)
+    if sources.size == 0:
+        return pl.DataFrame(
+            schema={
+                "source_id": pl.Object,
+                "target_id": pl.Object,
+                "weight": pl.Float64,
+            }
+        )
+
+    return pl.DataFrame(
+        {
+            "source_id": id_mapper.get_original_batch(sources.tolist()),
+            "target_id": id_mapper.get_original_batch(targets.tolist()),
+            "weight": weights,
+        }
+    )
+
+
 def get_graph_info(graph: nk.Graph, id_mapper: IDMapper) -> Dict[str, Any]:
     """
     Get comprehensive information about a constructed graph.
@@ -1108,25 +1176,34 @@ def validate_graph_construction(
 
 
 def project_bipartite(
-    graph: nk.Graph,
-    id_mapper: IDMapper,
+    edges: Union[nk.Graph, pl.DataFrame],
+    id_mapper: Optional[IDMapper] = None,
     projection_mode: str = "source",
     weight_method: str = "count",
     verbose: bool = True,
-) -> Tuple[nk.Graph, IDMapper]:
+    *,
+    output_format: Optional[str] = None,
+) -> Union[Tuple[nk.Graph, IDMapper], pl.DataFrame]:
     """
-    Project bipartite graph to unipartite by connecting nodes with shared neighbors.
-    
-    This function projects a bipartite graph onto one of its partitions, creating
-    a unipartite graph where nodes are connected if they share neighbors in the
-    other partition. Edge weights are calculated using various similarity measures.
-    
+    Project a bipartite network to unipartite by connecting nodes with shared neighbors.
+
+    Accepts either a NetworkIt graph (with an ``id_mapper``) or a Polars edge
+    frame (with columns ``source_id``, ``target_id``). The output format
+    defaults to matching the input but can be forced via ``output_format``.
+    ``frame → graph`` is intentionally not supported — call
+    :func:`build_graph_from_edgelist` on the returned frame if you need a
+    graph.
+
     Parameters
     ----------
-    graph : nk.Graph
-        Bipartite NetworkIt graph to project
-    id_mapper : IDMapper
-        Original ID mapper containing all bipartite graph nodes
+    edges : nk.Graph or pl.DataFrame
+        Either a bipartite NetworkIt graph or a Polars edge frame with columns
+        ``source_id``, ``target_id`` (and optionally ``weight``, ignored — the
+        projection always produces its own computed weights).
+    id_mapper : IDMapper, optional
+        Required when ``edges`` is a Graph; ignored when it's a frame
+        (frames already use original IDs, and the source/target partitions
+        are implicit in the column names).
     projection_mode : str, default "source"
         Which partition to project onto:
         - "source": Project onto the source partition (nodes that appear as sources)
@@ -1136,24 +1213,32 @@ def project_bipartite(
         - "count": Number of shared neighbors
         - "jaccard": Jaccard similarity of neighbor sets
         - "overlap": Overlap coefficient (min of neighbor set sizes)
-        
+    verbose : bool, default True
+        Print a one-line summary at the end.
+    output_format : str, optional
+        ``"graph"``, ``"dataframe"``, or ``None`` (default — match input).
+        ``output_format="graph"`` with a frame input is not supported.
+
     Returns
     -------
-    projected_graph : nk.Graph
-        Unipartite NetworkIt graph containing only projected nodes
-    new_id_mapper : IDMapper
-        Updated ID mapper containing only nodes in the projected graph
-        
+    Tuple[nk.Graph, IDMapper]
+        Graph-output path; the projected unipartite graph and a new ID mapper.
+    pl.DataFrame
+        DataFrame-output path; the projected edges with columns
+        ``source_id``, ``target_id``, ``weight``.
+
     Raises
     ------
     GraphConstructionError
-        If the input graph is not bipartite or projection fails
-    ConfigurationError
-        If invalid projection_mode or weight_method is specified
-        
+        If the input graph is not bipartite or projection fails.
+    ValidationError
+        If invalid ``projection_mode``, ``weight_method``, or ``output_format``
+        is specified, or if a frame input lacks required columns.
+
     Examples
     --------
-    >>> # Create bipartite graph (users -> items)
+    Graph input (legacy form):
+
     >>> edges = pl.DataFrame({
     ...     "user": ["u1", "u1", "u2", "u2", "u3"],
     ...     "item": ["i1", "i2", "i1", "i3", "i2"]
@@ -1161,44 +1246,76 @@ def project_bipartite(
     >>> graph, mapper = build_graph_from_edgelist(
     ...     edges, source_col="user", target_col="item", bipartite=True
     ... )
-    >>> 
-    >>> # Project onto users (connect users who like same items)
     >>> user_graph, user_mapper = project_bipartite(graph, mapper, "source", "count")
-    >>> 
-    >>> # Project onto items (connect items liked by same users)  
-    >>> item_graph, item_mapper = project_bipartite(graph, mapper, "target", "jaccard")
-    
+
+    Frame input — partitions implicit in the columns:
+
+    >>> bipartite_edges = pl.DataFrame({
+    ...     "source_id": ["u1", "u1", "u2", "u2", "u3"],
+    ...     "target_id": ["i1", "i2", "i1", "i3", "i2"],
+    ...     "weight": [1.0] * 5,
+    ... })
+    >>> projected_df = project_bipartite(bipartite_edges, projection_mode="source")
+
     Notes
     -----
     Time Complexity: O(N² × D) worst case, where N is the size of the projection
     partition and D is the average degree in the other partition.
-    
+
     Space Complexity: O(N²) in the worst case for a fully connected projection.
-    
-    The function identifies bipartite partitions by analyzing edge patterns rather
-    than requiring explicit partition information. This makes it robust to various
-    bipartite graph construction approaches.
-    
+
+    The graph-input path identifies bipartite partitions either from the
+    IDMapper's recorded partitions (when the graph was built with
+    ``bipartite=True``) or via BFS 2-coloring. The frame-input path treats
+    the ``source_id`` column as the source partition and ``target_id`` as
+    the target partition — partitions are implicit in the convention, so no
+    detection step is needed.
+
     Weight Methods:
     - **Count**: Simple count of shared neighbors. Fast and intuitive.
     - **Jaccard**: |A ∩ B| / |A ∪ B|. Normalized similarity measure.
     - **Overlap**: |A ∩ B| / min(|A|, |B|). Asymmetric similarity measure.
     """
-    log_function_entry("project_bipartite",
-                      projection_mode=projection_mode, weight_method=weight_method)
-
-    # Validate parameters
+    # Validate parameters (do this before any dispatch so messages are consistent).
     validate_parameter(projection_mode, ["source", "target"], "projection_mode", "project_bipartite")
     validate_parameter(weight_method, ["count", "jaccard", "overlap"], "weight_method", "project_bipartite")
 
     import time as _time
     _t_start = _time.perf_counter()
 
+    # Frame-input branch.
+    if isinstance(edges, pl.DataFrame):
+        if output_format == "graph":
+            raise ValidationError(
+                "output_format='graph' with a DataFrame input is not supported. "
+                "Call build_graph_from_edgelist() on the returned frame instead."
+            )
+        return _project_bipartite_frame_path(
+            edges, projection_mode, weight_method, verbose, _t_start
+        )
+
+    if not isinstance(edges, nk.Graph):
+        raise ValidationError(
+            f"`edges` must be a NetworkIt graph or a Polars DataFrame, got {type(edges).__name__}"
+        )
+    if id_mapper is None:
+        raise ValidationError("`id_mapper` is required when `edges` is a NetworkIt graph")
+    if output_format not in (None, "graph", "dataframe"):
+        raise ValidationError(
+            f"output_format must be 'graph', 'dataframe', or None; got {output_format!r}"
+        )
+
+    graph = edges  # readability
+    want_df_only = output_format == "dataframe"
+
+    log_function_entry("project_bipartite",
+                      projection_mode=projection_mode, weight_method=weight_method)
+
     with LoggingTimer("project_bipartite"):
         try:
             # Step 1: Identify bipartite partitions
             source_partition, target_partition = _identify_bipartite_partitions(graph, id_mapper)
-            
+
             # Step 2: Select projection partition and other partition
             if projection_mode == "source":
                 projection_partition = source_partition
@@ -1206,18 +1323,35 @@ def project_bipartite(
             else:  # projection_mode == "target"
                 projection_partition = target_partition
                 other_partition = source_partition
-            
+
             logger.info("Projecting bipartite graph: %d nodes in projection partition, %d in other partition",
                        len(projection_partition), len(other_partition))
-            
+
             # Step 3: Build neighbor mapping for projection partition nodes
             neighbor_map = _build_neighbor_mapping(graph, id_mapper, projection_partition, other_partition)
-            
-            # Step 4: Create projected graph and new ID mapper
+
+            # Step 4: Short-circuit when the caller wants a frame back — skip
+            # the NetworkIt graph build (and its O(E) addEdge loop) entirely.
+            if want_df_only:
+                edge_df = _compute_projection_edges(
+                    projection_partition, neighbor_map, weight_method
+                )
+                if verbose:
+                    dt = _time.perf_counter() - _t_start
+                    print(
+                        f"[project_bipartite] {dt:.2f}s | mode={projection_mode}, "
+                        f"weight={weight_method} | "
+                        f"bipartite: {graph.numberOfNodes():,} nodes, "
+                        f"{graph.numberOfEdges():,} edges → "
+                        f"projected frame: {edge_df.height:,} edges"
+                    )
+                return edge_df
+
+            # Step 5: Create projected graph and new ID mapper
             projected_graph, new_id_mapper = _create_projected_graph(
                 projection_partition, neighbor_map, weight_method, graph.isWeighted()
             )
-            
+
             logger.info("Bipartite projection completed: %d nodes, %d edges",
                        projected_graph.numberOfNodes(), projected_graph.numberOfEdges())
 
@@ -1226,7 +1360,7 @@ def project_bipartite(
                 projection_mode, weight_method,
             )
             return projected_graph, new_id_mapper
-            
+
         except Exception as e:
             if isinstance(e, (GraphConstructionError, ValidationError)):
                 raise
@@ -1414,80 +1548,136 @@ def _build_neighbor_mapping(
                 neighbors.add(neighbor_orig)
         
         neighbor_map[proj_node_orig] = neighbors
-    
+
     return neighbor_map
 
 
-def _create_projected_graph(
-    projection_partition: List[Any],
-    neighbor_map: Dict[Any, Set[Any]],
-    weight_method: str,
-    preserve_weights: bool
-) -> Tuple[nk.Graph, IDMapper]:
-    """
-    Create the projected unipartite graph using a sparse-matrix co-occurrence.
+def _neighbor_map_from_edges(
+    df: pl.DataFrame,
+    projection_mode: str,
+) -> Tuple[List[Any], Dict[Any, Set[Any]]]:
+    """Frame analog of :func:`_build_neighbor_mapping`.
 
-    Equivalent to the naive ``for i,j: |N(i) ∩ N(j)|`` double loop but uses
-    ``scipy.sparse`` so the heavy lifting runs in C/BLAS:
-
-      A   = bipartite incidence matrix (projection × intermediate, 0/1)
-      AAT = A @ A.T  →  AAT[i,j] = |N(i) ∩ N(j)|       (the "count" weight)
-      deg = A.sum(axis=1)                              (per-node bipartite degree)
-      jaccard = count / (deg_i + deg_j − count)
-      overlap = count / min(deg_i, deg_j)
-
-    Output is bit-identical to the legacy set-intersection loop for ``count``
-    (integer arithmetic both sides) and matches to within float-precision
-    tolerance for ``jaccard`` and ``overlap``.
+    Treats the ``source_id`` column as the source partition and the
+    ``target_id`` column as the target partition (the natural convention for
+    frames produced by :func:`graph_to_edges` and friends — no BFS partition
+    detection needed since partitions are implicit in the columns).
 
     Parameters
     ----------
-    projection_partition : List[Any]
-        Nodes in projection partition (original IDs)
-    neighbor_map : Dict[Any, Set[Any]]
-        Mapping from projection nodes to their bipartite-neighbor sets
-    weight_method : str
-        One of "count", "jaccard", "overlap"
-    preserve_weights : bool
-        Unused under this implementation; the projection is always weighted.
-        Kept for API compatibility with the legacy signature.
+    df : pl.DataFrame
+        Bipartite edge frame with columns ``source_id``, ``target_id``.
+    projection_mode : str
+        Either ``"source"`` (project onto unique ``source_id`` values) or
+        ``"target"`` (project onto unique ``target_id`` values).
 
     Returns
     -------
-    projected_graph : nk.Graph
-        Projected unipartite graph (undirected, weighted).
-    new_id_mapper : IDMapper
-        ID mapper for projected graph. Internal IDs assigned in sorted-by-str
-        order of the original IDs — matches the legacy implementation exactly.
+    Tuple[List[Any], Dict[Any, Set[Any]]]
+        ``(projection_partition, neighbor_map)`` — the unique projection-side
+        node IDs and a mapping from each to its bipartite-neighbor set.
     """
-    logger.debug(
-        "Creating projected graph with %d nodes using %s weights (sparse path)",
-        len(projection_partition), weight_method,
+    if projection_mode == "source":
+        proj_col, other_col = "source_id", "target_id"
+    else:
+        proj_col, other_col = "target_id", "source_id"
+
+    # Dedupe (proj, other) pairs to mirror the set() semantics of the graph path.
+    pairs = df.select(pl.col(proj_col), pl.col(other_col)).unique()
+    grouped = pairs.group_by(proj_col).agg(pl.col(other_col).alias("neighbors"))
+
+    projection_partition = grouped[proj_col].to_list()
+    neighbor_map: Dict[Any, Set[Any]] = {
+        row[proj_col]: set(row["neighbors"])
+        for row in grouped.iter_rows(named=True)
+    }
+    return projection_partition, neighbor_map
+
+
+def _project_bipartite_frame_path(
+    df: pl.DataFrame,
+    projection_mode: str,
+    weight_method: str,
+    verbose: bool,
+    t_start: float,
+) -> pl.DataFrame:
+    """Frame-input branch of :func:`project_bipartite`.
+
+    Builds the neighbor map via Polars ``group_by`` (no BFS, no
+    NetworkIt walk) and dispatches to the shared sparse-matrix kernel.
+    Returns the projected edges as a frame keyed by original IDs.
+    """
+    required = {"source_id", "target_id"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValidationError(
+            f"Edge frame is missing required columns: {sorted(missing)}. "
+            f"Expected {sorted(required)}."
+        )
+
+    projection_partition, neighbor_map = _neighbor_map_from_edges(df, projection_mode)
+
+    logger.info(
+        "Projecting bipartite frame: %d nodes in projection partition "
+        "(mode=%s, weight=%s)",
+        len(projection_partition), projection_mode, weight_method,
     )
 
-    # Step 1: Build the new ID mapper with the same deterministic ordering
-    # the legacy code used (sorted by str). This keeps the returned graph's
-    # internal IDs bit-identical between implementations.
+    edge_df = _compute_projection_edges(
+        projection_partition, neighbor_map, weight_method
+    )
+
+    if verbose:
+        import time as _time
+        dt = _time.perf_counter() - t_start
+        print(
+            f"[project_bipartite] {dt:.2f}s | mode={projection_mode}, "
+            f"weight={weight_method} | frame: {df.height:,} bipartite edges → "
+            f"{edge_df.height:,} projected edges"
+        )
+
+    return edge_df
+
+
+def _compute_projection_arrays(
+    projection_partition: List[Any],
+    neighbor_map: Dict[Any, Set[Any]],
+    weight_method: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Any]]:
+    """Sparse-matrix kernel shared by the graph-output and frame-output paths.
+
+    Computes the bipartite co-occurrence projection
+    ``AAT[i,j] = |N(i) ∩ N(j)|`` and applies the requested weight method,
+    returning the projection edges as integer-index numpy arrays plus the
+    deterministic projection-node ordering.
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray, np.ndarray, List[Any]]
+        - ``i_arr``, ``j_arr``: integer indices into ``sorted_projection``,
+          strict upper triangle (no self-loops, no duplicates).
+        - ``weights``: float64 edge weights, all > 0.
+        - ``sorted_projection``: the projection partition sorted by ``str``
+          (deterministic; matches the legacy IDMapper internal-ID ordering).
+    """
     sorted_projection = sorted(projection_partition, key=str)
-    new_id_mapper = IDMapper()
-    for internal_id, original_id in enumerate(sorted_projection):
-        new_id_mapper.add_mapping(original_id, internal_id)
-
     n = len(sorted_projection)
-    projected_graph = nk.Graph(n, weighted=True, directed=False)
 
+    empty_arrays = (
+        np.zeros(0, dtype=np.int64),
+        np.zeros(0, dtype=np.int64),
+        np.zeros(0, dtype=np.float64),
+        sorted_projection,
+    )
     if n == 0:
-        return projected_graph, new_id_mapper
+        return empty_arrays
 
-    # Step 2: Build the bipartite incidence matrix A (n × n_intermediate).
-    # Collect every intermediate-node original ID seen in neighbor_map,
-    # then map them to dense column indices.
+    # Build the bipartite incidence matrix A (n × n_intermediate).
     intermediate_to_col: Dict[Any, int] = {}
     rows: List[int] = []
     cols: List[int] = []
     for i, original_id in enumerate(sorted_projection):
-        neighbors = neighbor_map.get(original_id, ())
-        for inter_orig in neighbors:
+        for inter_orig in neighbor_map.get(original_id, ()):
             col = intermediate_to_col.get(inter_orig)
             if col is None:
                 col = len(intermediate_to_col)
@@ -1496,29 +1686,25 @@ def _create_projected_graph(
             cols.append(col)
 
     n_intermediates = len(intermediate_to_col)
-
-    # No edges in the bipartite layer ⇒ no projection edges either.
     if not rows or n_intermediates == 0:
-        return projected_graph, new_id_mapper
+        return empty_arrays
 
     A = sp.csr_matrix(
         (np.ones(len(rows), dtype=np.int64), (np.asarray(rows), np.asarray(cols))),
         shape=(n, n_intermediates),
     )
 
-    # Step 3: Shared-neighbor counts via A @ A.T. Only keep the strict upper
-    # triangle — the graph is undirected and we skip self-loops (diagonal).
+    # Shared-neighbor counts; keep strict upper triangle only (undirected, no self-loops).
     AAT = (A @ A.T).tocsr()
     AAT_upper = sp.triu(AAT, k=1).tocoo()
 
     if AAT_upper.nnz == 0:
-        return projected_graph, new_id_mapper
+        return empty_arrays
 
     i_arr = AAT_upper.row.astype(np.int64, copy=False)
     j_arr = AAT_upper.col.astype(np.int64, copy=False)
     shared = AAT_upper.data.astype(np.int64, copy=False)
 
-    # Step 4: Compute the requested weight, then add edges with weight > 0.
     if weight_method == "count":
         # Integer counts cast to float so they round-trip through NetworkIt
         # the same way the legacy ``float(len(...))`` did.
@@ -1538,10 +1724,96 @@ def _create_projected_graph(
     else:
         raise ValueError(f"Unknown weight method: {weight_method}")
 
-    # Step 5: Emit edges. Match the legacy behaviour of skipping weight==0
-    # entries (which can occur for jaccard/overlap on degenerate inputs).
+    # Drop weight==0 entries (can occur for jaccard/overlap on degenerate inputs).
     nonzero = weights > 0
-    for u, v, w in zip(i_arr[nonzero], j_arr[nonzero], weights[nonzero]):
+    return (
+        i_arr[nonzero],
+        j_arr[nonzero],
+        weights[nonzero],
+        sorted_projection,
+    )
+
+
+def _compute_projection_edges(
+    projection_partition: List[Any],
+    neighbor_map: Dict[Any, Set[Any]],
+    weight_method: str,
+) -> pl.DataFrame:
+    """Project to an edge frame keyed by original IDs.
+
+    Thin wrapper around :func:`_compute_projection_arrays` that translates
+    internal indices back to the projection-partition's original IDs. Used
+    by both the frame-input path of :func:`project_bipartite` and the
+    ``output_format="dataframe"`` short-circuit on the graph-input path.
+
+    Returns
+    -------
+    pl.DataFrame
+        Columns: ``source_id``, ``target_id``, ``weight``.
+    """
+    i_arr, j_arr, weights, sorted_projection = _compute_projection_arrays(
+        projection_partition, neighbor_map, weight_method
+    )
+    if i_arr.size == 0:
+        return pl.DataFrame(
+            schema={
+                "source_id": pl.Object,
+                "target_id": pl.Object,
+                "weight": pl.Float64,
+            }
+        )
+    src_originals = [sorted_projection[i] for i in i_arr.tolist()]
+    tgt_originals = [sorted_projection[j] for j in j_arr.tolist()]
+    return pl.DataFrame({
+        "source_id": src_originals,
+        "target_id": tgt_originals,
+        "weight": weights,
+    })
+
+
+def _create_projected_graph(
+    projection_partition: List[Any],
+    neighbor_map: Dict[Any, Set[Any]],
+    weight_method: str,
+    preserve_weights: bool,
+) -> Tuple[nk.Graph, IDMapper]:
+    """Build the projected unipartite NetworkIt graph + IDMapper.
+
+    Calls :func:`_compute_projection_arrays` for the sparse-matrix kernel and
+    wraps the result into a NetworkIt graph keyed by the deterministic
+    sorted-by-``str`` ordering of the projection partition.
+
+    Parameters
+    ----------
+    preserve_weights : bool
+        Unused under this implementation; the projection is always weighted.
+        Kept for API compatibility with the legacy signature.
+
+    Returns
+    -------
+    projected_graph : nk.Graph
+        Projected unipartite graph (undirected, weighted).
+    new_id_mapper : IDMapper
+        ID mapper for the projected graph. Internal IDs assigned in
+        sorted-by-``str`` order of the original IDs.
+    """
+    logger.debug(
+        "Creating projected graph with %d nodes using %s weights (sparse path)",
+        len(projection_partition), weight_method,
+    )
+
+    i_arr, j_arr, weights, sorted_projection = _compute_projection_arrays(
+        projection_partition, neighbor_map, weight_method
+    )
+
+    n = len(sorted_projection)
+    new_id_mapper = IDMapper()
+    for internal_id, original_id in enumerate(sorted_projection):
+        new_id_mapper.add_mapping(original_id, internal_id)
+
+    projected_graph = nk.Graph(n, weighted=True, directed=False)
+
+    for u, v, w in zip(i_arr, j_arr, weights):
         projected_graph.addEdge(int(u), int(v), float(w))
 
     return projected_graph, new_id_mapper

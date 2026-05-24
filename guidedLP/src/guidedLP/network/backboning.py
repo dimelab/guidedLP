@@ -17,7 +17,7 @@ to one of:
 - ``"degree"`` — keep highest-degree nodes (median fallback or ``target_nodes``).
 """
 
-from typing import Tuple, Optional, Dict, Any, Union, List
+from typing import Tuple, Optional, Dict, Any, Union, List, Set
 import time as _time
 import warnings
 
@@ -33,6 +33,7 @@ from guidedLP.common.exceptions import (
     ValidationError,
 )
 from guidedLP.common.logging_config import get_logger, log_function_entry, LoggingTimer
+from guidedLP.network.construction import _extract_edge_arrays
 
 logger = get_logger(__name__)
 
@@ -49,8 +50,8 @@ AVAILABLE_METHODS = AVAILABLE_BACKBONE_METHODS
 
 
 def apply_backbone(
-    graph: nk.Graph,
-    id_mapper: IDMapper,
+    edges: Union[nk.Graph, pl.DataFrame],
+    id_mapper: Optional[IDMapper] = None,
     method: str = "disparity",
     *,
     alpha: float = 0.05,
@@ -63,17 +64,31 @@ def apply_backbone(
     min_node_retention: Optional[float] = None,
     return_filtered_edges: bool = False,
     verbose: bool = True,
-) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
+    directed: bool = False,
+    output_format: Optional[str] = None,
+) -> Union[
+    Tuple[nk.Graph, IDMapper],
+    Tuple[nk.Graph, IDMapper, pl.DataFrame],
+    pl.DataFrame,
+]:
     """
     Extract a network backbone by filtering edges with one of several methods.
 
+    Accepts either a NetworkIt graph (with an ``id_mapper``) or a Polars edge
+    frame (with columns ``source_id``, ``target_id``, ``weight``). The output
+    format defaults to matching the input but can be forced via
+    ``output_format``. ``frame → graph`` is intentionally not supported — call
+    :func:`build_graph_from_edgelist` on the returned frame if you need a
+    graph.
+
     Parameters
     ----------
-    graph : nk.Graph
-        NetworkIt graph to filter. Weighted graphs are required for
-        ``method="disparity"`` and ``method="noise_corrected"``.
-    id_mapper : IDMapper
-        Bidirectional mapping between original and internal node IDs.
+    edges : nk.Graph or pl.DataFrame
+        Either a NetworkIt graph (weighted is required for
+        ``method="disparity"`` and ``method="noise_corrected"``) or a Polars
+        edge frame with columns ``source_id``, ``target_id``, ``weight``.
+    id_mapper : IDMapper, optional
+        Required when ``edges`` is a Graph; ignored when it's a frame.
     method : str, default "disparity"
         Backbone extraction method. One of
         ``{"disparity", "noise_corrected", "bipartite_svn", "weight", "degree"}``.
@@ -132,24 +147,39 @@ def apply_backbone(
         Use this to eliminate generic high-degree nodes whose edges are
         mostly noise.
     return_filtered_edges : bool, default False
-        If True, return a third element: a Polars DataFrame with per-edge
-        filtering details. Schema depends on ``method``:
+        Only meaningful when the effective output format is ``"graph"``: if
+        True, returns an additional per-edge DataFrame. Schema depends on
+        ``method``:
 
         - all methods: ``source_id``, ``target_id``, ``weight``, ``kept``
         - ``disparity``: also ``p_value``, ``alpha_score``
         - ``noise_corrected``: also ``score``, ``sdev_cij``
         - ``bipartite_svn``: also ``p_value``
         - ``weight`` / ``degree``: ``p_value`` and ``alpha_score`` are NaN
+
+        Redundant when ``output_format="dataframe"`` (the primary return is
+        already that frame).
     verbose : bool, default True
         Print a one-line summary at the end (timing + node/edge retention).
+    directed : bool, default False
+        Whether the underlying graph is directed. Only used when ``edges`` is
+        a DataFrame (a graph carries this intrinsically).
+    output_format : str, optional
+        ``"graph"`` (returns ``(graph, mapper)`` or
+        ``(graph, mapper, df)``), ``"dataframe"`` (returns the per-edge
+        results frame), or ``None`` (default — matches input type).
+        ``output_format="graph"`` with a frame input is not supported.
 
     Returns
     -------
     Tuple[nk.Graph, IDMapper]
-        The backbone graph and the updated ID mapper.
+        Graph-output path; the backbone graph and the updated ID mapper.
     Tuple[nk.Graph, IDMapper, pl.DataFrame]
         If ``return_filtered_edges=True``, additionally a per-edge results
         DataFrame.
+    pl.DataFrame
+        DataFrame-output path; one row per (oriented) edge with method-
+        specific score columns and a ``kept`` boolean.
 
     Raises
     ------
@@ -192,6 +222,49 @@ def apply_backbone(
     (2011). Statistically validated networks in bipartite complex systems.
     PLoS ONE, 6(3), e17994.
     """
+    _t_start = _time.perf_counter()
+
+    # Dispatch on input type.
+    if isinstance(edges, pl.DataFrame):
+        if output_format == "graph":
+            raise ValidationError(
+                "output_format='graph' with a DataFrame input is not supported. "
+                "Call build_graph_from_edgelist() on the returned frame instead."
+            )
+        return _apply_backbone_frame_path(
+            edges_df=edges,
+            method=method,
+            directed=directed,
+            alpha=alpha,
+            threshold=threshold,
+            target_edges=target_edges,
+            target_nodes=target_nodes,
+            weight_threshold=weight_threshold,
+            correction=correction,
+            min_node_retention=min_node_retention,
+            verbose=verbose,
+            t_start=_t_start,
+        )
+
+    if not isinstance(edges, nk.Graph):
+        raise ValidationError(
+            f"`edges` must be a NetworkIt graph or a Polars DataFrame, got {type(edges).__name__}"
+        )
+    if id_mapper is None:
+        raise ValidationError("`id_mapper` is required when `edges` is a NetworkIt graph")
+
+    if output_format not in (None, "graph", "dataframe"):
+        raise ValidationError(
+            f"output_format must be 'graph', 'dataframe', or None; got {output_format!r}"
+        )
+
+    # Graph-input path. If the caller asked for a dataframe back, force the
+    # per-edge df to be built and unwrap it from the result tuple at the end.
+    want_df_only = output_format == "dataframe"
+    return_edges_for_path = return_filtered_edges or want_df_only
+
+    graph = edges  # readability for the rest of this function
+
     log_function_entry(
         "apply_backbone",
         graph_nodes=graph.numberOfNodes(),
@@ -201,8 +274,6 @@ def apply_backbone(
         target_nodes=target_nodes,
         target_edges=target_edges,
     )
-
-    _t_start = _time.perf_counter()
 
     _validate_backbone_parameters(
         method=method,
@@ -226,6 +297,8 @@ def apply_backbone(
         )
         empty_mapper = id_mapper if graph.numberOfNodes() > 0 else IDMapper()
         _print_backbone_summary(verbose, _t_start, graph, empty_graph, method)
+        if want_df_only:
+            return _empty_edges_df(method)
         if return_filtered_edges:
             return empty_graph, empty_mapper, _empty_edges_df(method)
         return empty_graph, empty_mapper
@@ -239,35 +312,35 @@ def apply_backbone(
             if method == "disparity":
                 result = _apply_disparity_filter(
                     graph, id_mapper, alpha, target_edges,
-                    keep_disconnected, return_filtered_edges,
+                    keep_disconnected, return_edges_for_path,
                 )
             elif method == "noise_corrected":
                 result = _apply_noise_corrected_filter(
                     graph, id_mapper, threshold,
-                    keep_disconnected, return_filtered_edges,
+                    keep_disconnected, return_edges_for_path,
                 )
             elif method == "bipartite_svn":
                 result = _apply_bipartite_svn_filter(
                     graph, id_mapper, alpha, correction,
                     keep_disconnected, min_node_retention,
-                    return_filtered_edges,
+                    return_edges_for_path,
                 )
             elif method == "weight":
                 result = _apply_weight_threshold(
                     graph, id_mapper, target_edges, weight_threshold,
-                    keep_disconnected, return_filtered_edges,
+                    keep_disconnected, return_edges_for_path,
                 )
             elif method == "degree":
                 result = _apply_degree_threshold(
                     graph, id_mapper, target_nodes,
-                    keep_disconnected, return_filtered_edges,
+                    keep_disconnected, return_edges_for_path,
                 )
             else:
                 # Defensive: _validate_backbone_parameters already guards this.
                 raise ValidationError(f"Unsupported backbone method: {method}")
 
-            if return_filtered_edges:
-                backbone_graph, _, _ = result
+            if return_edges_for_path:
+                backbone_graph, _, edge_results_df = result
             else:
                 backbone_graph, _ = result
 
@@ -278,6 +351,9 @@ def apply_backbone(
             )
 
             _print_backbone_summary(verbose, _t_start, graph, backbone_graph, method)
+
+            if want_df_only:
+                return edge_results_df
             return result
 
         except (ConfigurationError, ComputationError, ValidationError):
@@ -291,6 +367,114 @@ def apply_backbone(
                     "error_type": "computation",
                 },
             ) from e
+
+
+def _apply_backbone_frame_path(
+    edges_df: pl.DataFrame,
+    method: str,
+    *,
+    directed: bool,
+    alpha: float,
+    threshold: float,
+    target_edges: Optional[int],
+    target_nodes: Optional[int],
+    weight_threshold: Optional[float],
+    correction: str,
+    min_node_retention: Optional[float],
+    verbose: bool,
+    t_start: float,
+) -> pl.DataFrame:
+    """Frame-input branch of :func:`apply_backbone`.
+
+    Dispatches to the appropriate ``_*_on_edges`` helper. Returns the per-edge
+    results frame (including the ``kept`` column) — the caller does any
+    further filtering or graph construction.
+    """
+    # Validate parameters that don't depend on a graph object.
+    _validate_frame_input(edges_df, method)
+    _validate_backbone_parameters(
+        method=method,
+        alpha=alpha,
+        threshold=threshold,
+        target_nodes=target_nodes,
+        target_edges=target_edges,
+        weight_threshold=weight_threshold,
+        correction=correction,
+        min_node_retention=min_node_retention,
+        graph=None,  # frame path: no graph-side checks
+    )
+
+    n_in = edges_df.height
+    if n_in == 0:
+        warnings.warn("Empty edge frame provided. Returning empty result.")
+        result_df = _empty_edges_df(method)
+        _print_backbone_frame_summary(verbose, t_start, n_in, 0, method)
+        return result_df
+
+    with LoggingTimer("apply_backbone", {"method": method, "edges": n_in, "input": "frame"}):
+        try:
+            if method == "disparity":
+                result_df = _disparity_on_edges(edges_df, directed, alpha, target_edges)
+            elif method == "noise_corrected":
+                result_df = _noise_corrected_on_edges(edges_df, directed, threshold)
+            elif method == "bipartite_svn":
+                # Treat as weighted if the column actually carries variation.
+                w = edges_df["weight"].to_numpy()
+                is_weighted_effective = w.size > 0 and not np.allclose(w, 1.0)
+                result_df, _ = _bipartite_svn_on_edges(
+                    edges_df, alpha, correction, min_node_retention, is_weighted_effective
+                )
+            elif method == "weight":
+                result_df = _weight_threshold_on_edges(edges_df, target_edges, weight_threshold)
+            elif method == "degree":
+                result_df, _ = _degree_threshold_on_edges(edges_df, target_nodes)
+            else:
+                raise ValidationError(f"Unsupported backbone method: {method}")
+
+            n_kept = int(result_df.filter(pl.col("kept")).height)
+            logger.info(
+                "Backbone extraction completed (frame): %d → %d edges kept",
+                n_in, n_kept,
+            )
+            _print_backbone_frame_summary(verbose, t_start, n_in, n_kept, method)
+            return result_df
+
+        except (ConfigurationError, ComputationError, ValidationError):
+            raise
+        except Exception as e:
+            raise ComputationError(
+                f"Backbone extraction failed: {e}",
+                context={
+                    "operation": "apply_backbone",
+                    "method": method,
+                    "error_type": "computation",
+                },
+            ) from e
+
+
+def _validate_frame_input(df: pl.DataFrame, method: str) -> None:
+    """Schema check for the DataFrame-input path of :func:`apply_backbone`."""
+    required = {"source_id", "target_id", "weight"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValidationError(
+            f"Edge frame is missing required columns: {sorted(missing)}. "
+            f"Expected {sorted(required)}."
+        )
+
+
+def _print_backbone_frame_summary(
+    verbose: bool, t_start: float, n_in: int, n_kept: int, method: str
+) -> None:
+    """Frame-input variant of :func:`_print_backbone_summary`."""
+    if not verbose:
+        return
+    dt = _time.perf_counter() - t_start
+    pct = (100 * n_kept / n_in) if n_in else 0.0
+    print(
+        f"[apply_backbone] {dt:.2f}s | method={method} | frame: "
+        f"{n_in:,} → {n_kept:,} edges kept ({pct:.1f}%)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -307,9 +491,13 @@ def _validate_backbone_parameters(
     weight_threshold: Optional[float],
     correction: str,
     min_node_retention: Optional[float],
-    graph: nk.Graph,
+    graph: Optional[nk.Graph],
 ) -> None:
-    """Validate the cross-method parameter surface of :func:`apply_backbone`."""
+    """Validate the cross-method parameter surface of :func:`apply_backbone`.
+
+    ``graph`` is optional: when ``None`` (DataFrame-input path) any
+    graph-side checks are skipped.
+    """
     if method not in AVAILABLE_BACKBONE_METHODS:
         raise ValidationError(
             f"Invalid backbone method: {method}. "
@@ -340,7 +528,7 @@ def _validate_backbone_parameters(
                 f"threshold must be > 0 for noise_corrected, got {threshold}"
             )
 
-    if method == "disparity" and not graph.isWeighted():
+    if method == "disparity" and graph is not None and not graph.isWeighted():
         raise ValidationError("Disparity filter requires a weighted graph")
 
     if method == "bipartite_svn":
@@ -363,6 +551,187 @@ def _validate_backbone_parameters(
 # Disparity filter (Serrano et al. 2009)
 # ---------------------------------------------------------------------------
 
+def _disparity_on_edges(
+    df: pl.DataFrame,
+    directed: bool,
+    alpha: float,
+    target_edges: Optional[int] = None,
+) -> pl.DataFrame:
+    """Serrano et al. (2009) disparity filter on an edge frame.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        Edge frame with columns ``source_id``, ``target_id``, ``weight``.
+    directed : bool
+        Directed graphs use only the source-side disparity score; undirected
+        graphs combine source- and target-side scores via element-wise min.
+    alpha : float
+        Significance level. An edge is kept iff its disparity score is below
+        ``alpha`` (or exactly 1.0, the leaf-node sentinel).
+    target_edges : int, optional
+        Cap the kept-edge count to this many lowest-α edges.
+
+    Returns
+    -------
+    pl.DataFrame
+        Columns: ``source_id``, ``target_id``, ``weight``, ``p_value``,
+        ``alpha_score``, ``kept``.
+    """
+    # Per-node aggregates.
+    # Directed: strength = out-strength only (source-side group_by). Degree
+    # for the disparity formula is the total in+out count — historically what
+    # the numpy version did.
+    # Undirected: strength and degree both summed across source and target sides
+    # (each edge contributes to both endpoints).
+    src_strength = df.group_by("source_id").agg(
+        pl.col("weight").sum().alias("ws"),
+        pl.len().alias("ks"),
+    )
+    tgt_strength = df.group_by("target_id").agg(
+        pl.col("weight").sum().alias("wt"),
+        pl.len().alias("kt"),
+    )
+
+    if directed:
+        # Per-node "strength" used in the formula is out-strength.
+        # Per-node "degree" is in+out, so we have to combine both sides.
+        node_strength = src_strength.rename({"source_id": "node", "ws": "strength"}).drop("ks")
+        node_degree = (
+            pl.concat([
+                src_strength.select(pl.col("source_id").alias("node"), pl.col("ks").alias("k")),
+                tgt_strength.select(pl.col("target_id").alias("node"), pl.col("kt").alias("k")),
+            ])
+            .group_by("node")
+            .agg(pl.col("k").sum().alias("degree"))
+        )
+    else:
+        combined = (
+            pl.concat([
+                src_strength.select(
+                    pl.col("source_id").alias("node"),
+                    pl.col("ws").alias("strength"),
+                    pl.col("ks").alias("degree"),
+                ),
+                tgt_strength.select(
+                    pl.col("target_id").alias("node"),
+                    pl.col("wt").alias("strength"),
+                    pl.col("kt").alias("degree"),
+                ),
+            ])
+            .group_by("node")
+            .agg(
+                pl.col("strength").sum().alias("strength"),
+                pl.col("degree").sum().alias("degree"),
+            )
+        )
+        node_strength = combined.select("node", "strength")
+        node_degree = combined.select("node", "degree")
+
+    node_stats = node_strength.join(node_degree, on="node", how="inner")
+
+    work = (
+        df.join(
+            node_stats.rename({"node": "source_id", "strength": "s_u", "degree": "k_u"}),
+            on="source_id", how="left",
+        )
+        .join(
+            node_stats.rename({"node": "target_id", "strength": "s_v", "degree": "k_v"}),
+            on="target_id", how="left",
+        )
+    )
+
+    # Compute the source-side disparity α_uv. Guard s_u==0 by treating it as 1
+    # downstream — those edges get marked invalid and dropped.
+    work = work.with_columns([
+        pl.when(pl.col("s_u") > 0)
+            .then(pl.col("weight") / pl.col("s_u"))
+            .otherwise(0.0)
+            .alias("p_uv"),
+    ])
+    work = work.with_columns(
+        _disparity_alpha_expr(
+            1.0 - pl.col("p_uv"),
+            pl.col("k_u").cast(pl.Float64) - 1.0,
+        ).alias("alpha_uv")
+    )
+
+    if directed:
+        work = work.with_columns([
+            pl.col("alpha_uv").alias("alpha_score"),
+            pl.col("p_uv").alias("p_value"),
+        ])
+    else:
+        work = work.with_columns([
+            pl.when(pl.col("s_v") > 0)
+                .then(pl.col("weight") / pl.col("s_v"))
+                .otherwise(0.0)
+                .alias("p_vu"),
+        ])
+        work = work.with_columns(
+            _disparity_alpha_expr(
+                1.0 - pl.col("p_vu"),
+                pl.col("k_v").cast(pl.Float64) - 1.0,
+            ).alias("alpha_vu")
+        )
+        work = work.with_columns([
+            pl.min_horizontal("alpha_uv", "alpha_vu").alias("alpha_score"),
+            pl.min_horizontal("p_uv", "p_vu").alias("p_value"),
+        ])
+
+    # Invalid edges: zero strength on either endpoint. We clamp their score
+    # to 1.0 and exclude them from the kept set.
+    work = work.with_columns(
+        ((pl.col("s_u") == 0) | (pl.col("s_v") == 0)).alias("_invalid")
+    )
+    work = work.with_columns([
+        pl.when(pl.col("_invalid")).then(1.0).otherwise(pl.col("alpha_score")).alias("alpha_score"),
+        pl.when(pl.col("_invalid")).then(1.0).otherwise(pl.col("p_value")).alias("p_value"),
+    ])
+    work = work.with_columns(
+        (
+            ((pl.col("alpha_score") < alpha) | (pl.col("alpha_score") >= 1.0))
+            & ~pl.col("_invalid")
+        ).alias("kept")
+    )
+
+    if target_edges is not None:
+        n_kept = int(work.filter(pl.col("kept")).height)
+        if n_kept > target_edges:
+            # Rank by ascending alpha_score among valid edges; only the
+            # target_edges lowest survive. row_index gives a stable ordering
+            # that matches numpy's argsort behavior for ties.
+            work = work.with_row_index(name="_idx")
+            sorted_valid = (
+                work.filter(~pl.col("_invalid"))
+                .sort(["alpha_score", "_idx"])
+                .head(target_edges)
+                .select("_idx")
+            )
+            kept_idx = set(sorted_valid["_idx"].to_list())
+            work = work.with_columns(
+                pl.col("_idx").is_in(list(kept_idx)).alias("kept")
+            ).drop("_idx")
+
+    return work.select([
+        "source_id", "target_id", "weight",
+        "p_value", "alpha_score", "kept",
+    ])
+
+
+def _disparity_alpha_expr(base: "pl.Expr", exponent: "pl.Expr") -> "pl.Expr":
+    """Polars expression form of :func:`_disparity_alpha`. Same edge-case order:
+    exponent ≤ 0 → 1.0; base ≤ 0 → 0.0; base ≥ 1 → 1.0; else exp(k·log(base))."""
+    log_base = base.log()
+    raw = (exponent * log_base).clip(lower_bound=-700.0).exp()
+    return (
+        pl.when(exponent <= 0).then(1.0)
+        .when(base <= 0).then(0.0)
+        .when(base >= 1).then(1.0)
+        .otherwise(raw)
+    )
+
+
 def _apply_disparity_filter(
     graph: nk.Graph,
     id_mapper: IDMapper,
@@ -371,103 +740,40 @@ def _apply_disparity_filter(
     keep_disconnected: bool,
     return_filtered_edges: bool,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
-    """Apply Serrano et al.'s disparity filter, fully vectorized over edges."""
+    """Graph-shim around :func:`_disparity_on_edges`."""
     logger.debug("Applying disparity filter with alpha=%.3f", alpha)
 
     n_nodes = graph.numberOfNodes()
     directed = graph.isDirected()
 
-    sources_l: list = []
-    targets_l: list = []
-    weights_l: list = []
-    for u, v in graph.iterEdges():
-        sources_l.append(u)
-        targets_l.append(v)
-        weights_l.append(graph.weight(u, v))
+    sources, targets, weights = _extract_edge_arrays(graph)
 
-    if not sources_l:
+    if sources.size == 0:
         empty = nk.Graph(n_nodes, weighted=True, directed=directed)
         if return_filtered_edges:
             return empty, id_mapper, _empty_edges_df("disparity")
         return empty, id_mapper
 
-    sources = np.asarray(sources_l, dtype=np.int64)
-    targets = np.asarray(targets_l, dtype=np.int64)
-    weights = np.asarray(weights_l, dtype=np.float64)
+    edge_df = pl.DataFrame({
+        "source_id": sources,
+        "target_id": targets,
+        "weight": weights,
+    })
+    scored = _disparity_on_edges(edge_df, directed, alpha, target_edges)
 
-    # Strengths and degree counts in O(E) each.
-    if directed:
-        strength = np.bincount(sources, weights=weights, minlength=n_nodes)
-        degree_counts = (
-            np.bincount(sources, minlength=n_nodes)
-            + np.bincount(targets, minlength=n_nodes)
-        )
-    else:
-        strength = (
-            np.bincount(sources, weights=weights, minlength=n_nodes)
-            + np.bincount(targets, weights=weights, minlength=n_nodes)
-        )
-        degree_counts = (
-            np.bincount(sources, minlength=n_nodes)
-            + np.bincount(targets, minlength=n_nodes)
-        )
-
-    s_u = strength[sources]
-    s_v = strength[targets]
-    k_u = degree_counts[sources].astype(np.float64)
-    k_v = degree_counts[targets].astype(np.float64)
-
-    s_u_safe = np.where(s_u > 0, s_u, 1.0)
-    p_uv = weights / s_u_safe
-    alpha_uv = _disparity_alpha(1.0 - p_uv, k_u - 1.0)
-
-    if directed:
-        final_alpha = alpha_uv
-        p_value_col = p_uv
-    else:
-        s_v_safe = np.where(s_v > 0, s_v, 1.0)
-        p_vu = weights / s_v_safe
-        alpha_vu = _disparity_alpha(1.0 - p_vu, k_v - 1.0)
-        final_alpha = np.minimum(alpha_uv, alpha_vu)
-        p_value_col = np.minimum(p_uv, p_vu)
-
-    keep_mask = (final_alpha < alpha) | (final_alpha >= 1.0)
-
-    invalid_mask = (s_u == 0) | (s_v == 0)
-    if np.any(invalid_mask):
-        final_alpha = np.where(invalid_mask, 1.0, final_alpha)
-        p_value_col = np.where(invalid_mask, 1.0, p_value_col)
-        keep_mask = keep_mask & ~invalid_mask
-
-    # Optional target_edges cap: keep the lowest-α edges (Serrano et al.'s
-    # natural ordering of statistical significance).
-    if target_edges is not None and int(keep_mask.sum()) > target_edges:
-        sorted_idx = np.argsort(final_alpha)
-        new_mask = np.zeros_like(keep_mask)
-        new_mask[sorted_idx[:target_edges]] = True
-        keep_mask = new_mask & ~invalid_mask
-
-    kept_sources = sources[keep_mask]
-    kept_targets = targets[keep_mask]
-    kept_weights = weights[keep_mask]
-
+    kept_df = scored.filter(pl.col("kept"))
     backbone_graph, updated_mapper = _assemble_backbone(
         n_nodes, directed, weighted=True,
-        kept_sources=kept_sources, kept_targets=kept_targets,
-        kept_weights=kept_weights,
+        kept_sources=kept_df["source_id"].to_numpy(),
+        kept_targets=kept_df["target_id"].to_numpy(),
+        kept_weights=kept_df["weight"].to_numpy(),
         keep_disconnected=keep_disconnected, id_mapper=id_mapper,
     )
 
     if return_filtered_edges:
-        edge_df = pl.DataFrame({
-            "source_id": id_mapper.get_original_batch(sources.tolist()),
-            "target_id": id_mapper.get_original_batch(targets.tolist()),
-            "weight": weights,
-            "p_value": p_value_col,
-            "alpha_score": final_alpha,
-            "kept": keep_mask,
-        })
-        return backbone_graph, updated_mapper, edge_df
+        return backbone_graph, updated_mapper, _translate_edges_to_originals(
+            scored, id_mapper
+        )
 
     return backbone_graph, updated_mapper
 
@@ -517,75 +823,86 @@ def _safe_power(base: float, exponent: float) -> float:
 # Noise-corrected backbone (Coscia & Neffke 2017)
 # ---------------------------------------------------------------------------
 
-def _apply_noise_corrected_filter(
-    graph: nk.Graph,
-    id_mapper: IDMapper,
+def _noise_corrected_on_edges(
+    df: pl.DataFrame,
+    directed: bool,
     threshold: float,
-    keep_disconnected: bool,
-    return_filtered_edges: bool,
-) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
-    """Apply the Coscia & Neffke (2017) noise-corrected backbone in Polars."""
-    logger.debug("Applying noise-corrected backbone with threshold=%.3f", threshold)
+) -> pl.DataFrame:
+    """Coscia & Neffke (2017) noise-corrected backbone on an edge frame.
 
-    n_nodes = graph.numberOfNodes()
-    directed = graph.isDirected()
+    Parameters
+    ----------
+    df : pl.DataFrame
+        Edge frame with columns ``source_id``, ``target_id``, ``weight``.
+        Node-ID column types may be anything Polars can group_by on.
+    directed : bool
+        Whether the underlying graph is directed. For undirected graphs the
+        frame is symmetrized internally before computing node strengths, and
+        only the canonical ``source_id <= target_id`` orientation is returned.
+    threshold : float
+        Posterior-standard-deviation multiplier. Edges are kept iff
+        ``score − threshold · sdev_cij > 0``.
 
-    sources_l: list = []
-    targets_l: list = []
-    weights_l: list = []
-    for u, v in graph.iterEdges():
-        sources_l.append(u)
-        targets_l.append(v)
-        weights_l.append(graph.weight(u, v))
+    Returns
+    -------
+    pl.DataFrame
+        Columns: ``source_id``, ``target_id``, ``weight``, ``score``,
+        ``sdev_cij``, ``kept`` — one row per (oriented) edge.
 
-    if not sources_l:
-        empty = nk.Graph(n_nodes, weighted=True, directed=directed)
-        if return_filtered_edges:
-            return empty, id_mapper, _empty_edges_df("noise_corrected")
-        return empty, id_mapper
-
-    sources = np.asarray(sources_l, dtype=np.int64)
-    targets = np.asarray(targets_l, dtype=np.int64)
-    weights = np.asarray(weights_l, dtype=np.float64)
-
-    # Symmetrize for undirected graphs so group_by sums give full node strengths.
+    Raises
+    ------
+    ComputationError
+        If the total edge weight is non-positive.
+    """
     if directed:
-        df = pl.DataFrame({"o": sources, "e": targets, "w": weights})
+        work = df.select(
+            pl.col("source_id").alias("o"),
+            pl.col("target_id").alias("e"),
+            pl.col("weight").alias("w"),
+        )
     else:
-        df = pl.DataFrame({
-            "o": np.concatenate([sources, targets]),
-            "e": np.concatenate([targets, sources]),
-            "w": np.concatenate([weights, weights]),
-        })
+        # Symmetrize so per-node group_by sums give full incident strengths.
+        work = pl.concat([
+            df.select(
+                pl.col("source_id").alias("o"),
+                pl.col("target_id").alias("e"),
+                pl.col("weight").alias("w"),
+            ),
+            df.select(
+                pl.col("target_id").alias("o"),
+                pl.col("source_id").alias("e"),
+                pl.col("weight").alias("w"),
+            ),
+        ])
 
-    n_total = float(df["w"].sum())
+    n_total = float(work["w"].sum())
     if n_total <= 0:
         raise ComputationError(
             "Noise-corrected backbone requires positive total edge weight",
             context={"operation": "noise_corrected"},
         )
 
-    src_sum = df.group_by("o").agg(pl.col("w").sum().alias("o_sum"))
-    trg_sum = df.group_by("e").agg(pl.col("w").sum().alias("e_sum"))
-    df = df.join(src_sum, on="o", how="left").join(trg_sum, on="e", how="left")
+    src_sum = work.group_by("o").agg(pl.col("w").sum().alias("o_sum"))
+    trg_sum = work.group_by("e").agg(pl.col("w").sum().alias("e_sum"))
+    work = work.join(src_sum, on="o", how="left").join(trg_sum, on="e", how="left")
 
-    df = df.with_columns([
+    work = work.with_columns([
         ((pl.col("o_sum") * pl.col("e_sum")) / (n_total * n_total))
             .alias("mean_prior_probability"),
         (n_total / (pl.col("o_sum") * pl.col("e_sum"))).alias("kappa"),
     ])
-    df = df.with_columns(
+    work = work.with_columns(
         ((pl.col("kappa") * pl.col("w") - 1) / (pl.col("kappa") * pl.col("w") + 1))
             .alias("score")
     )
-    df = df.with_columns(
+    work = work.with_columns(
         (
             (pl.col("o_sum") * pl.col("e_sum")
              * (n_total - pl.col("o_sum")) * (n_total - pl.col("e_sum")))
             / ((n_total ** 4) * (n_total - 1))
         ).alias("var_prior_probability")
     )
-    df = df.with_columns([
+    work = work.with_columns([
         (
             (pl.col("mean_prior_probability") ** 2 / pl.col("var_prior_probability"))
             * (1 - pl.col("mean_prior_probability"))
@@ -597,67 +914,98 @@ def _apply_noise_corrected_filter(
             - (1 - pl.col("mean_prior_probability"))
         ).alias("beta_prior"),
     ])
-    df = df.with_columns([
+    work = work.with_columns([
         (pl.col("alpha_prior") + pl.col("w")).alias("alpha_post"),
         (n_total - pl.col("w") + pl.col("beta_prior")).alias("beta_post"),
     ])
-    df = df.with_columns(
+    work = work.with_columns(
         (pl.col("alpha_post") / (pl.col("alpha_post") + pl.col("beta_post")))
             .alias("expected_pij")
     )
-    df = df.with_columns(
+    work = work.with_columns(
         (pl.col("expected_pij") * (1 - pl.col("expected_pij")) * n_total)
             .alias("variance_nij")
     )
-    df = df.with_columns(
+    work = work.with_columns(
         (
             (1.0 / (pl.col("o_sum") * pl.col("e_sum")))
             - (n_total * (pl.col("o_sum") + pl.col("e_sum"))
                / ((pl.col("o_sum") * pl.col("e_sum")) ** 2))
         ).alias("d")
     )
-    df = df.with_columns(
+    work = work.with_columns(
         (
             pl.col("variance_nij")
             * ((2 * (pl.col("kappa") + pl.col("w") * pl.col("d")))
                / ((pl.col("kappa") * pl.col("w") + 1) ** 2)) ** 2
         ).alias("variance_cij")
     )
-    df = df.with_columns(
+    work = work.with_columns(
         pl.col("variance_cij").clip(lower_bound=0.0).sqrt().alias("sdev_cij")
     )
 
     if not directed:
-        df = df.filter(pl.col("o") <= pl.col("e"))
+        # Collapse the symmetrized frame back to the canonical orientation.
+        # Comparing IDs only makes sense when they're orderable; for non-orderable
+        # types (e.g. arbitrary strings) Polars still does lexicographic order,
+        # which is a stable canonical choice even if not semantically meaningful.
+        work = work.filter(pl.col("o") <= pl.col("e"))
 
-    df = df.with_columns(
+    work = work.with_columns(
         ((pl.col("score") - threshold * pl.col("sdev_cij")) > 0).alias("kept")
     )
 
-    kept_df = df.filter(pl.col("kept"))
-    kept_sources = kept_df["o"].to_numpy()
-    kept_targets = kept_df["e"].to_numpy()
-    kept_weights = kept_df["w"].to_numpy()
+    return work.select([
+        pl.col("o").alias("source_id"),
+        pl.col("e").alias("target_id"),
+        pl.col("w").alias("weight"),
+        pl.col("score"),
+        pl.col("sdev_cij"),
+        pl.col("kept"),
+    ])
 
+
+def _apply_noise_corrected_filter(
+    graph: nk.Graph,
+    id_mapper: IDMapper,
+    threshold: float,
+    keep_disconnected: bool,
+    return_filtered_edges: bool,
+) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
+    """Graph-shim around :func:`_noise_corrected_on_edges`."""
+    logger.debug("Applying noise-corrected backbone with threshold=%.3f", threshold)
+
+    n_nodes = graph.numberOfNodes()
+    directed = graph.isDirected()
+
+    sources, targets, weights = _extract_edge_arrays(graph)
+
+    if sources.size == 0:
+        empty = nk.Graph(n_nodes, weighted=True, directed=directed)
+        if return_filtered_edges:
+            return empty, id_mapper, _empty_edges_df("noise_corrected")
+        return empty, id_mapper
+
+    edge_df = pl.DataFrame({
+        "source_id": sources,
+        "target_id": targets,
+        "weight": weights,
+    })
+    scored = _noise_corrected_on_edges(edge_df, directed, threshold)
+
+    kept_df = scored.filter(pl.col("kept"))
     backbone_graph, updated_mapper = _assemble_backbone(
         n_nodes, directed, weighted=True,
-        kept_sources=kept_sources, kept_targets=kept_targets,
-        kept_weights=kept_weights,
+        kept_sources=kept_df["source_id"].to_numpy(),
+        kept_targets=kept_df["target_id"].to_numpy(),
+        kept_weights=kept_df["weight"].to_numpy(),
         keep_disconnected=keep_disconnected, id_mapper=id_mapper,
     )
 
     if return_filtered_edges:
-        internal_sources = df["o"].to_list()
-        internal_targets = df["e"].to_list()
-        edge_df = pl.DataFrame({
-            "source_id": id_mapper.get_original_batch(internal_sources),
-            "target_id": id_mapper.get_original_batch(internal_targets),
-            "weight": df["w"],
-            "score": df["score"],
-            "sdev_cij": df["sdev_cij"],
-            "kept": df["kept"],
-        })
-        return backbone_graph, updated_mapper, edge_df
+        return backbone_graph, updated_mapper, _translate_edges_to_originals(
+            scored, id_mapper
+        )
 
     return backbone_graph, updated_mapper
 
@@ -666,59 +1014,76 @@ def _apply_noise_corrected_filter(
 # Bipartite SVN filter (Tumminello et al. 2011)
 # ---------------------------------------------------------------------------
 
-def _apply_bipartite_svn_filter(
-    graph: nk.Graph,
-    id_mapper: IDMapper,
+def _bipartite_svn_on_edges(
+    df: pl.DataFrame,
     alpha: float,
     correction: str,
-    keep_disconnected: bool,
-    min_node_retention: Optional[float],
-    return_filtered_edges: bool,
-) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
-    """Tumminello et al. (2011) Statistically Validated Network filter.
+    min_node_retention: Optional[float] = None,
+    is_weighted_effective: bool = True,
+) -> Tuple[pl.DataFrame, Set[Any]]:
+    """Tumminello et al. (2011) SVN filter on a bipartite edge frame.
 
-    Per-edge p-value under a Poisson configuration null with optional
-    multiple-testing correction and node-retention post-filter.
+    Parameters
+    ----------
+    df : pl.DataFrame
+        Edge frame with columns ``source_id``, ``target_id``, ``weight``.
+    alpha : float
+        Per-edge significance level (subject to ``correction``).
+    correction : str
+        One of ``"fdr_bh"``, ``"bonferroni"``, ``"none"``.
+    min_node_retention : float, optional
+        Post-filter node-retention threshold in ``(0, 1]``. Nodes whose
+        retention ratio falls below this are dropped; the corresponding
+        ``kept`` entries are cleared, and the dropped-node IDs are returned
+        as the second tuple element so the graph shim can remove them.
+    is_weighted_effective : bool, default True
+        If False, treat all weights as 1 (unweighted Poisson tail).
+
+    Returns
+    -------
+    Tuple[pl.DataFrame, Set[Any]]
+        - DataFrame with columns ``source_id``, ``target_id``, ``weight``,
+          ``p_value``, ``kept``.
+        - Set of node IDs flagged by ``min_node_retention`` (empty when the
+          retention filter is not used). The graph shim uses this to drop
+          those specific nodes even when ``keep_disconnected=True``.
     """
-    n_nodes = graph.numberOfNodes()
-    if graph.numberOfEdges() == 0:
-        if return_filtered_edges:
-            return graph, id_mapper, _empty_edges_df("bipartite_svn")
-        return graph, id_mapper
+    # Strengths: each edge contributes to both endpoints (bipartite ⇒ undirected).
+    incident = pl.concat([
+        df.select(pl.col("source_id").alias("node"), pl.col("weight")),
+        df.select(pl.col("target_id").alias("node"), pl.col("weight")),
+    ])
+    strengths = incident.group_by("node").agg(pl.col("weight").sum().alias("strength"))
 
-    edges_list = list(graph.iterEdges())
-    n_edges = len(edges_list)
-    u_arr = np.empty(n_edges, dtype=np.int64)
-    v_arr = np.empty(n_edges, dtype=np.int64)
-    w_arr = np.empty(n_edges, dtype=np.float64)
-    for i, (u, v) in enumerate(edges_list):
-        u_arr[i] = u
-        v_arr[i] = v
-        w_arr[i] = graph.weight(u, v) if graph.isWeighted() else 1.0
-
-    is_weighted_effective = graph.isWeighted() and not np.allclose(w_arr, 1.0)
-
-    strengths = np.zeros(n_nodes, dtype=np.float64)
-    np.add.at(strengths, u_arr, w_arr)
-    np.add.at(strengths, v_arr, w_arr)
-
-    W_total = w_arr.sum()
+    n_edges = df.height
+    W_total = float(df["weight"].sum())
     if W_total <= 0:
-        logger.warning("Bipartite SVN filter received zero total weight; returning empty graph.")
-        empty = _build_empty_like(graph)
-        if return_filtered_edges:
-            return empty, IDMapper(), _empty_edges_df("bipartite_svn")
-        return empty, IDMapper()
+        logger.warning("Bipartite SVN filter received zero total weight; nothing kept.")
+        empty = df.with_columns([
+            pl.lit(1.0, dtype=pl.Float64).alias("p_value"),
+            pl.lit(False).alias("kept"),
+        ]).select(["source_id", "target_id", "weight", "p_value", "kept"])
+        return empty, set()
 
-    # Bipartite configuration-model null: μ = s_u · s_v / W_total (the
-    # partition-wise strength sums are both W_total for a bipartite graph,
-    # so the standard "2·W_total" unipartite normalisation does not apply).
-    mu = strengths[u_arr] * strengths[v_arr] / W_total
+    work = (
+        df.join(
+            strengths.rename({"node": "source_id", "strength": "s_u"}),
+            on="source_id", how="left",
+        )
+        .join(
+            strengths.rename({"node": "target_id", "strength": "s_v"}),
+            on="target_id", how="left",
+        )
+        .with_columns(((pl.col("s_u") * pl.col("s_v")) / W_total).alias("mu"))
+    )
 
+    # Poisson tail: scipy has no Polars equivalent; drop to numpy here only.
+    mu_arr = work["mu"].to_numpy()
+    w_arr = work["weight"].to_numpy()
     if is_weighted_effective:
-        p_values = poisson.sf(np.ceil(w_arr) - 1, mu)
+        p_values = poisson.sf(np.ceil(w_arr) - 1, mu_arr)
     else:
-        p_values = -np.expm1(-mu)
+        p_values = -np.expm1(-mu_arr)
 
     if correction == "bonferroni":
         keep_mask = p_values <= (alpha / n_edges)
@@ -733,63 +1098,126 @@ def _apply_bipartite_svn_filter(
             f"Expected 'fdr_bh', 'bonferroni', or 'none'."
         )
 
-    # Optional node-level retention filter.
-    node_dropped_mask: Optional[np.ndarray] = None
+    work = work.with_columns([
+        pl.Series("p_value", p_values),
+        pl.Series("kept", keep_mask),
+    ])
+
+    dropped_nodes: Set[Any] = set()
     if min_node_retention is not None:
-        original_degree = np.zeros(n_nodes, dtype=np.int64)
-        np.add.at(original_degree, u_arr, 1)
-        np.add.at(original_degree, v_arr, 1)
-
-        kept_u = u_arr[keep_mask]
-        kept_v = v_arr[keep_mask]
-        surviving_degree = np.zeros(n_nodes, dtype=np.int64)
-        np.add.at(surviving_degree, kept_u, 1)
-        np.add.at(surviving_degree, kept_v, 1)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            retention = np.where(
-                original_degree > 0,
-                surviving_degree / original_degree,
-                1.0,
+        original_degree = incident.group_by("node").agg(
+            pl.len().alias("original_degree")
+        )
+        surviving_incident = pl.concat([
+            work.filter(pl.col("kept")).select(pl.col("source_id").alias("node")),
+            work.filter(pl.col("kept")).select(pl.col("target_id").alias("node")),
+        ])
+        surviving_degree = surviving_incident.group_by("node").agg(
+            pl.len().alias("surviving_degree")
+        )
+        retention = (
+            original_degree
+            .join(surviving_degree, on="node", how="left")
+            .with_columns(pl.col("surviving_degree").fill_null(0))
+            .with_columns(
+                (pl.col("surviving_degree") / pl.col("original_degree")).alias("ratio")
             )
-        node_dropped_mask = retention < min_node_retention
+        )
+        dropped_frame = retention.filter(pl.col("ratio") < min_node_retention)
+        dropped_nodes = set(dropped_frame["node"].to_list())
 
-        kept_node_mask = ~node_dropped_mask
-        keep_mask = keep_mask & kept_node_mask[u_arr] & kept_node_mask[v_arr]
+        if dropped_nodes:
+            work = work.with_columns(
+                (
+                    pl.col("kept")
+                    & ~pl.col("source_id").is_in(list(dropped_nodes))
+                    & ~pl.col("target_id").is_in(list(dropped_nodes))
+                ).alias("kept")
+            )
 
         logger.info(
             "Bipartite SVN filter: weighted=%s, alpha=%.3g, correction=%s, "
             "min_node_retention=%.2f — dropped %d nodes by retention; "
             "kept %d/%d edges (%.1f%%)",
             is_weighted_effective, alpha, correction, min_node_retention,
-            int(node_dropped_mask.sum()),
-            int(keep_mask.sum()), n_edges,
-            100.0 * int(keep_mask.sum()) / n_edges if n_edges else 0.0,
+            len(dropped_nodes),
+            int(work["kept"].sum()), n_edges,
+            100.0 * int(work["kept"].sum()) / n_edges if n_edges else 0.0,
         )
     else:
         logger.info(
             "Bipartite SVN filter: weighted=%s, alpha=%.3g, correction=%s — "
             "kept %d/%d edges (%.1f%%)",
             is_weighted_effective, alpha, correction,
-            int(keep_mask.sum()), n_edges,
-            100.0 * int(keep_mask.sum()) / n_edges if n_edges else 0.0,
+            int(work["kept"].sum()), n_edges,
+            100.0 * int(work["kept"].sum()) / n_edges if n_edges else 0.0,
         )
 
-    # Build the backbone graph; bipartite_svn historically uses the
-    # removeNode approach (preserves internal IDs and bipartite partition info).
+    return (
+        work.select(["source_id", "target_id", "weight", "p_value", "kept"]),
+        dropped_nodes,
+    )
+
+
+def _apply_bipartite_svn_filter(
+    graph: nk.Graph,
+    id_mapper: IDMapper,
+    alpha: float,
+    correction: str,
+    keep_disconnected: bool,
+    min_node_retention: Optional[float],
+    return_filtered_edges: bool,
+) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
+    """Graph-shim around :func:`_bipartite_svn_on_edges`.
+
+    Builds the backbone with NetworkIt's ``removeNode`` (preserves internal
+    IDs so bipartite partition info on the IDMapper stays consistent).
+    """
+    n_nodes = graph.numberOfNodes()
+    if graph.numberOfEdges() == 0:
+        if return_filtered_edges:
+            return graph, id_mapper, _empty_edges_df("bipartite_svn")
+        return graph, id_mapper
+
+    u_arr, v_arr, w_arr = _extract_edge_arrays(graph)
+    is_weighted_effective = graph.isWeighted() and not np.allclose(w_arr, 1.0)
+
+    if w_arr.sum() <= 0:
+        empty = _build_empty_like(graph)
+        if return_filtered_edges:
+            return empty, IDMapper(), _empty_edges_df("bipartite_svn")
+        return empty, IDMapper()
+
+    edge_df = pl.DataFrame({
+        "source_id": u_arr,
+        "target_id": v_arr,
+        "weight": w_arr,
+    })
+    scored, dropped_internal_nodes = _bipartite_svn_on_edges(
+        edge_df, alpha, correction, min_node_retention, is_weighted_effective
+    )
+
+    kept_df = scored.filter(pl.col("kept"))
+    kept_u = kept_df["source_id"].to_numpy()
+    kept_v = kept_df["target_id"].to_numpy()
+    kept_w = kept_df["weight"].to_numpy()
+
+    # bipartite_svn historically uses the removeNode approach (preserves
+    # internal IDs and bipartite partition info).
     backbone_graph = nk.Graph(
         n_nodes, directed=graph.isDirected(), weighted=graph.isWeighted()
     )
-    for u, v, w in zip(u_arr[keep_mask], v_arr[keep_mask], w_arr[keep_mask]):
+    for u, v, w in zip(kept_u, kept_v, kept_w):
         if graph.isWeighted():
             backbone_graph.addEdge(int(u), int(v), float(w))
         else:
             backbone_graph.addEdge(int(u), int(v))
 
-    if node_dropped_mask is not None:
-        for node in np.where(node_dropped_mask)[0]:
-            if backbone_graph.hasNode(int(node)):
-                backbone_graph.removeNode(int(node))
+    # Drop retention-flagged nodes explicitly (these may differ from
+    # "no surviving edges" only when keep_disconnected=True).
+    for node in dropped_internal_nodes:
+        if backbone_graph.hasNode(int(node)):
+            backbone_graph.removeNode(int(node))
 
     if not keep_disconnected:
         nodes_to_remove = [
@@ -821,14 +1249,9 @@ def _apply_bipartite_svn_filter(
             updated_mapper.target_partition_originals = new_tgt
 
     if return_filtered_edges:
-        edge_df = pl.DataFrame({
-            "source_id": id_mapper.get_original_batch(u_arr.tolist()),
-            "target_id": id_mapper.get_original_batch(v_arr.tolist()),
-            "weight": w_arr,
-            "p_value": p_values,
-            "kept": keep_mask,
-        })
-        return backbone_graph, updated_mapper, edge_df
+        return backbone_graph, updated_mapper, _translate_edges_to_originals(
+            scored, id_mapper
+        )
 
     return backbone_graph, updated_mapper
 
@@ -857,6 +1280,59 @@ def _benjamini_hochberg_mask(p_values: np.ndarray, alpha: float) -> np.ndarray:
 # Weight threshold
 # ---------------------------------------------------------------------------
 
+def _weight_threshold_on_edges(
+    df: pl.DataFrame,
+    target_edges: Optional[int] = None,
+    weight_threshold: Optional[float] = None,
+) -> pl.DataFrame:
+    """Weight-threshold filter on an edge frame.
+
+    Threshold selection (priority order):
+      1. explicit ``weight_threshold`` if given,
+      2. value at rank ``target_edges`` if given,
+      3. median of all weights (fallback).
+
+    Returns
+    -------
+    pl.DataFrame
+        Columns: ``source_id``, ``target_id``, ``weight``, ``p_value`` (NaN),
+        ``alpha_score`` (NaN), ``kept``.
+    """
+    weights = df["weight"].to_numpy()
+    n_edges = weights.size
+
+    if n_edges == 0:
+        return df.with_columns([
+            pl.lit(float("nan"), dtype=pl.Float64).alias("p_value"),
+            pl.lit(float("nan"), dtype=pl.Float64).alias("alpha_score"),
+            pl.lit(False).alias("kept"),
+        ]).select(["source_id", "target_id", "weight", "p_value", "alpha_score", "kept"])
+
+    if weight_threshold is not None:
+        threshold = float(weight_threshold)
+        keep_mask = weights >= threshold
+        logger.debug("Weight threshold: %s (explicit)", threshold)
+    elif target_edges is not None:
+        # Exactly target_edges highest-weight edges; stable on ties.
+        if target_edges >= n_edges:
+            keep_mask = np.ones(n_edges, dtype=bool)
+        else:
+            sorted_idx = np.argsort(-weights, kind="stable")
+            keep_mask = np.zeros(n_edges, dtype=bool)
+            keep_mask[sorted_idx[:target_edges]] = True
+        logger.debug("Weight threshold: top %d edges", target_edges)
+    else:
+        threshold = float(np.median(weights))
+        keep_mask = weights >= threshold
+        logger.debug("Weight threshold: %s (median fallback)", threshold)
+
+    return df.with_columns([
+        pl.lit(float("nan"), dtype=pl.Float64).alias("p_value"),
+        pl.lit(float("nan"), dtype=pl.Float64).alias("alpha_score"),
+        pl.Series("kept", keep_mask),
+    ]).select(["source_id", "target_id", "weight", "p_value", "alpha_score", "kept"])
+
+
 def _apply_weight_threshold(
     graph: nk.Graph,
     id_mapper: IDMapper,
@@ -865,77 +1341,41 @@ def _apply_weight_threshold(
     keep_disconnected: bool,
     return_filtered_edges: bool,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
-    """Keep edges with weight above a threshold.
-
-    Threshold selection (priority order):
-      1. explicit ``weight_threshold`` if given,
-      2. value at rank ``target_edges`` if given,
-      3. median of all weights (fallback).
-    """
+    """Graph-shim around :func:`_weight_threshold_on_edges`."""
     if not graph.isWeighted():
         logger.warning("Weight threshold applied to unweighted graph (all weights = 1.0)")
 
     n_nodes = graph.numberOfNodes()
     directed = graph.isDirected()
 
-    sources_l: list = []
-    targets_l: list = []
-    weights_l: list = []
-    for u, v in graph.iterEdges():
-        sources_l.append(u)
-        targets_l.append(v)
-        weights_l.append(graph.weight(u, v) if graph.isWeighted() else 1.0)
+    sources, targets, weights = _extract_edge_arrays(graph)
 
-    if not sources_l:
+    if sources.size == 0:
         empty = nk.Graph(n_nodes, weighted=True, directed=directed)
         if return_filtered_edges:
             return empty, id_mapper, _empty_edges_df("weight")
         return empty, id_mapper
 
-    sources = np.asarray(sources_l, dtype=np.int64)
-    targets = np.asarray(targets_l, dtype=np.int64)
-    weights = np.asarray(weights_l, dtype=np.float64)
+    edge_df = pl.DataFrame({
+        "source_id": sources,
+        "target_id": targets,
+        "weight": weights,
+    })
+    scored = _weight_threshold_on_edges(edge_df, target_edges, weight_threshold)
 
-    if weight_threshold is not None:
-        threshold = float(weight_threshold)
-        keep_mask = weights >= threshold
-        logger.debug("Weight threshold: %s (explicit)", threshold)
-    elif target_edges is not None:
-        # Take exactly target_edges highest-weight edges (ties broken by
-        # original order). Avoids the threshold-with-ties overshoot.
-        if target_edges >= len(weights):
-            keep_mask = np.ones(len(weights), dtype=bool)
-        else:
-            sorted_idx = np.argsort(-weights, kind="stable")
-            keep_mask = np.zeros(len(weights), dtype=bool)
-            keep_mask[sorted_idx[:target_edges]] = True
-        logger.debug("Weight threshold: top %d edges", target_edges)
-    else:
-        threshold = float(np.median(weights))
-        keep_mask = weights >= threshold
-        logger.debug("Weight threshold: %s (median fallback)", threshold)
-
-    kept_sources = sources[keep_mask]
-    kept_targets = targets[keep_mask]
-    kept_weights = weights[keep_mask]
-
+    kept_df = scored.filter(pl.col("kept"))
     backbone_graph, updated_mapper = _assemble_backbone(
         n_nodes, directed, weighted=True,
-        kept_sources=kept_sources, kept_targets=kept_targets,
-        kept_weights=kept_weights,
+        kept_sources=kept_df["source_id"].to_numpy(),
+        kept_targets=kept_df["target_id"].to_numpy(),
+        kept_weights=kept_df["weight"].to_numpy(),
         keep_disconnected=keep_disconnected, id_mapper=id_mapper,
     )
 
     if return_filtered_edges:
-        edge_df = pl.DataFrame({
-            "source_id": id_mapper.get_original_batch(sources.tolist()),
-            "target_id": id_mapper.get_original_batch(targets.tolist()),
-            "weight": weights,
-            "p_value": np.full(len(weights), np.nan),
-            "alpha_score": np.full(len(weights), np.nan),
-            "kept": keep_mask,
-        })
-        return backbone_graph, updated_mapper, edge_df
+        return backbone_graph, updated_mapper, _translate_edges_to_originals(
+            scored, id_mapper
+        )
 
     return backbone_graph, updated_mapper
 
@@ -944,6 +1384,68 @@ def _apply_weight_threshold(
 # Degree threshold
 # ---------------------------------------------------------------------------
 
+def _degree_threshold_on_edges(
+    df: pl.DataFrame,
+    target_nodes: Optional[int] = None,
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    """Degree-threshold filter on an edge frame.
+
+    Treats degree as the unweighted in+out count (each edge contributes 1
+    to both endpoints), matching the original graph-side semantics for both
+    directed and undirected inputs.
+
+    Threshold selection (priority order):
+      1. value at rank ``target_nodes`` if given,
+      2. median degree (fallback).
+
+    Returns
+    -------
+    Tuple[pl.DataFrame, pl.DataFrame]
+        - Edge frame with columns ``source_id``, ``target_id``, ``weight``,
+          ``p_value`` (NaN), ``alpha_score`` (NaN), ``kept``.
+        - Per-node frame with columns ``node``, ``degree``, ``kept_node``.
+          The graph shim uses ``kept_node`` to preserve high-degree nodes
+          that lost all their edges (``keep_disconnected=True`` semantics).
+    """
+    src = df.select(pl.col("source_id").alias("node"))
+    tgt = df.select(pl.col("target_id").alias("node"))
+    degrees = (
+        pl.concat([src, tgt])
+        .group_by("node")
+        .agg(pl.len().alias("degree"))
+    )
+
+    deg_arr = degrees["degree"].to_numpy()
+    n_nodes_in_edges = deg_arr.size
+
+    if target_nodes is not None:
+        if target_nodes >= n_nodes_in_edges:
+            node_keep_mask = np.ones(n_nodes_in_edges, dtype=bool)
+        else:
+            sorted_idx = np.argsort(-deg_arr, kind="stable")
+            node_keep_mask = np.zeros(n_nodes_in_edges, dtype=bool)
+            node_keep_mask[sorted_idx[:target_nodes]] = True
+        logger.debug("Degree threshold: top %d nodes", target_nodes)
+    else:
+        threshold = int(np.median(deg_arr)) if n_nodes_in_edges else 0
+        node_keep_mask = deg_arr >= threshold
+        logger.debug("Degree threshold: %d (median fallback)", threshold)
+
+    node_df = degrees.with_columns(pl.Series("kept_node", node_keep_mask))
+    kept_node_ids = node_df.filter(pl.col("kept_node"))["node"].to_list()
+
+    edge_out = df.with_columns([
+        pl.lit(float("nan"), dtype=pl.Float64).alias("p_value"),
+        pl.lit(float("nan"), dtype=pl.Float64).alias("alpha_score"),
+        (
+            pl.col("source_id").is_in(kept_node_ids)
+            & pl.col("target_id").is_in(kept_node_ids)
+        ).alias("kept"),
+    ]).select(["source_id", "target_id", "weight", "p_value", "alpha_score", "kept"])
+
+    return edge_out, node_df
+
+
 def _apply_degree_threshold(
     graph: nk.Graph,
     id_mapper: IDMapper,
@@ -951,65 +1453,32 @@ def _apply_degree_threshold(
     keep_disconnected: bool,
     return_filtered_edges: bool,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
-    """Keep nodes with degree above a threshold.
-
-    Threshold selection (priority order):
-      1. value at rank ``target_nodes`` if given,
-      2. median degree (fallback).
-    """
+    """Graph-shim around :func:`_degree_threshold_on_edges`."""
     n_nodes = graph.numberOfNodes()
     directed = graph.isDirected()
     weighted = graph.isWeighted()
 
-    degrees = np.array(
-        [
-            graph.degree(u) if not directed else graph.degreeIn(u) + graph.degreeOut(u)
-            for u in range(n_nodes)
-        ],
-        dtype=np.int64,
-    )
+    sources, targets, weights = _extract_edge_arrays(graph)
+    edge_df = pl.DataFrame({
+        "source_id": sources,
+        "target_id": targets,
+        "weight": weights,
+    })
+    scored, node_df = _degree_threshold_on_edges(edge_df, target_nodes)
 
-    if target_nodes is not None:
-        # Take exactly target_nodes highest-degree nodes (ties broken by node id).
-        if target_nodes >= n_nodes:
-            keep_node_mask = np.ones(n_nodes, dtype=bool)
-        else:
-            sorted_idx = np.argsort(-degrees, kind="stable")
-            keep_node_mask = np.zeros(n_nodes, dtype=bool)
-            keep_node_mask[sorted_idx[:target_nodes]] = True
-        logger.debug("Degree threshold: top %d nodes", target_nodes)
-    else:
-        threshold = int(np.median(degrees))
-        keep_node_mask = degrees >= threshold
-        logger.debug("Degree threshold: %d (median fallback)", threshold)
+    kept_df = scored.filter(pl.col("kept"))
+    kept_sources = kept_df["source_id"].to_numpy()
+    kept_targets = kept_df["target_id"].to_numpy()
+    kept_weights = kept_df["weight"].to_numpy()
 
-    sources_l: list = []
-    targets_l: list = []
-    weights_l: list = []
-    edge_kept_l: list = []
-    for u, v in graph.iterEdges():
-        sources_l.append(u)
-        targets_l.append(v)
-        weights_l.append(graph.weight(u, v) if weighted else 1.0)
-        edge_kept_l.append(bool(keep_node_mask[u] and keep_node_mask[v]))
-
-    sources = np.asarray(sources_l, dtype=np.int64)
-    targets = np.asarray(targets_l, dtype=np.int64)
-    weights = np.asarray(weights_l, dtype=np.float64)
-    edge_kept = np.asarray(edge_kept_l, dtype=bool)
-
-    kept_sources = sources[edge_kept]
-    kept_targets = targets[edge_kept]
-    kept_weights = weights[edge_kept]
-
-    # For "degree", we keep nodes regardless of whether they ended up
-    # disconnected after edge filtering (the node-level filter is the point).
-    # `keep_disconnected` here controls whether *all* kept nodes survive
-    # (True) or only those that still have at least one edge (False).
+    # `keep_disconnected` here controls whether high-degree nodes that
+    # lost all their edges are preserved (True) or dropped (False).
     if keep_disconnected:
-        node_survives = keep_node_mask.copy()
+        node_survives = np.zeros(n_nodes, dtype=bool)
+        if node_df.height > 0:
+            kept_nodes = node_df.filter(pl.col("kept_node"))["node"].to_numpy().astype(np.int64)
+            node_survives[kept_nodes] = True
     else:
-        # Recompute survival based on kept edges.
         node_survives = np.zeros(n_nodes, dtype=bool)
         if kept_sources.size > 0:
             node_survives[kept_sources] = True
@@ -1035,15 +1504,9 @@ def _apply_degree_threshold(
             pass
 
     if return_filtered_edges:
-        edge_df = pl.DataFrame({
-            "source_id": id_mapper.get_original_batch(sources.tolist()),
-            "target_id": id_mapper.get_original_batch(targets.tolist()),
-            "weight": weights,
-            "p_value": np.full(len(weights), np.nan),
-            "alpha_score": np.full(len(weights), np.nan),
-            "kept": edge_kept,
-        })
-        return backbone_graph, updated_mapper, edge_df
+        return backbone_graph, updated_mapper, _translate_edges_to_originals(
+            scored, id_mapper
+        )
 
     return backbone_graph, updated_mapper
 
@@ -1101,6 +1564,26 @@ def _assemble_backbone(
 def _build_empty_like(graph: nk.Graph) -> nk.Graph:
     """Create an empty graph with the same directed/weighted flags."""
     return nk.Graph(0, weighted=graph.isWeighted(), directed=graph.isDirected())
+
+
+def _translate_edges_to_originals(
+    df: pl.DataFrame, id_mapper: IDMapper
+) -> pl.DataFrame:
+    """Replace the ``source_id`` and ``target_id`` columns (assumed to hold
+    NetworkIt internal integer IDs) with their original-ID counterparts.
+
+    Used by the graph-input path of :func:`apply_backbone` when the caller
+    asks for a per-edge results frame: the math is done on internal IDs but
+    the surfaced frame must speak the user's ID space.
+    """
+    if df.height == 0:
+        return df
+    src_originals = id_mapper.get_original_batch(df["source_id"].to_list())
+    tgt_originals = id_mapper.get_original_batch(df["target_id"].to_list())
+    return df.with_columns([
+        pl.Series("source_id", src_originals),
+        pl.Series("target_id", tgt_originals),
+    ])
 
 
 def _empty_edges_df(method: str) -> pl.DataFrame:
