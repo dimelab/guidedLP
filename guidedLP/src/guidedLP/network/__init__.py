@@ -34,11 +34,13 @@ from .communities import (
     identify_stable_communities
 )
 
-# Network filtering and backboning functions
-from .filtering import (
-    filter_graph,
+# Network filtering
+from .filtering import filter_graph
+
+# Network backboning
+from .backboning import (
     apply_backbone,
-    get_backbone_statistics
+    get_backbone_statistics,
 )
 
 # Graph export functions

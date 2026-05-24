@@ -220,7 +220,7 @@ Filter generic items *before* projecting, so the user-user projection is cheaper
 ```python
 import polars as pl
 from guidedLP.network.construction import build_graph_from_edgelist, project_bipartite
-from guidedLP.network.filtering import apply_backbone
+from guidedLP.network.backboning import apply_backbone
 from guidedLP.glp.propagation import guided_label_propagation
 from guidedLP.glp.utils import check_seed_coverage
 

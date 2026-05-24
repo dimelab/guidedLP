@@ -15,12 +15,13 @@ from typing import Tuple
 from guidedLP.network.backboning import (
     apply_backbone,
     get_backbone_summary,
+    get_backbone_statistics,
     _safe_power,
-    AVAILABLE_METHODS
+    AVAILABLE_METHODS,
 )
 from guidedLP.network.construction import build_graph_from_edgelist
 from guidedLP.common.id_mapper import IDMapper
-from guidedLP.common.exceptions import ConfigurationError, ValidationError
+from guidedLP.common.exceptions import ValidationError, ComputationError
 
 
 class TestDisparityFilter:
@@ -262,7 +263,7 @@ class TestWeightThreshold:
         
         # Keep edges with weight >= 2.5
         backbone_graph, backbone_mapper = apply_backbone(
-            graph, mapper, method="weight_threshold", weight_threshold=2.5
+            graph, mapper, method="weight", weight_threshold=2.5
         )
         
         # Should keep 2 edges (weights 3.0 and 4.0)
@@ -270,7 +271,7 @@ class TestWeightThreshold:
         
         # Test with target edges
         backbone_graph, backbone_mapper = apply_backbone(
-            graph, mapper, method="weight_threshold", target_edges=2
+            graph, mapper, method="weight", target_edges=2
         )
         
         # Should keep top 2 edges by weight
@@ -287,7 +288,7 @@ class TestWeightThreshold:
         graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
         
         _, _, edge_details = apply_backbone(
-            graph, mapper, method="weight_threshold", weight_threshold=1.5,
+            graph, mapper, method="weight", weight_threshold=1.5,
             return_filtered_edges=True
         )
         
@@ -315,7 +316,7 @@ class TestDegreeThreshold:
         
         # Keep top 2 nodes by degree
         backbone_graph, backbone_mapper = apply_backbone(
-            graph, mapper, method="degree_threshold", target_nodes=2
+            graph, mapper, method="degree", target_nodes=2
         )
         
         # Should keep 'hub' (degree 3) and one other node with degree 2
@@ -474,13 +475,13 @@ class TestBackboneValidation:
         graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
         
         # Alpha must be in (0, 1)
-        with pytest.raises(ValidationError, match="Alpha must be in"):
+        with pytest.raises(ValidationError, match="alpha must be"):
             apply_backbone(graph, mapper, method="disparity", alpha=0.0)
         
-        with pytest.raises(ValidationError, match="Alpha must be in"):
+        with pytest.raises(ValidationError, match="alpha must be"):
             apply_backbone(graph, mapper, method="disparity", alpha=1.0)
         
-        with pytest.raises(ValidationError, match="Alpha must be in"):
+        with pytest.raises(ValidationError, match="alpha must be"):
             apply_backbone(graph, mapper, method="disparity", alpha=-0.5)
     
     def test_conflicting_parameters(self):
@@ -500,23 +501,24 @@ class TestBackboneValidation:
                 target_nodes=10, target_edges=20
             )
     
-    def test_missing_required_parameters(self):
-        """Test missing required parameters for specific methods."""
+    def test_weight_and_degree_fallback_to_median(self):
+        """Weight and degree methods fall back to median when no explicit
+        threshold or target is given (no error is raised)."""
         edges = pl.DataFrame({
-            'source': ['A'],
-            'target': ['B'],
-            'weight': [1.0]
+            'source': ['A', 'B', 'C'],
+            'target': ['B', 'C', 'A'],
+            'weight': [1.0, 2.0, 3.0],
         })
-        
+
         graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
-        
-        # Weight threshold needs either weight_threshold or target_edges
-        with pytest.raises(ConfigurationError, match="Must specify either"):
-            apply_backbone(graph, mapper, method="weight_threshold")
-        
-        # Degree threshold needs target_nodes
-        with pytest.raises(ConfigurationError, match="Must specify target_nodes"):
-            apply_backbone(graph, mapper, method="degree_threshold")
+
+        # method="weight" with no explicit threshold/target_edges → median.
+        bb_weight, _ = apply_backbone(graph, mapper, method="weight")
+        assert bb_weight.numberOfEdges() <= graph.numberOfEdges()
+
+        # method="degree" with no target_nodes → median degree.
+        bb_degree, _ = apply_backbone(graph, mapper, method="degree")
+        assert bb_degree.numberOfNodes() <= graph.numberOfNodes()
 
 
 class TestBackboneSummary:
@@ -533,7 +535,7 @@ class TestBackboneSummary:
         graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
         
         backbone_graph, backbone_mapper, edge_details = apply_backbone(
-            graph, mapper, method="weight_threshold", weight_threshold=2.5,
+            graph, mapper, method="weight", weight_threshold=2.5,
             return_filtered_edges=True
         )
         
@@ -692,7 +694,7 @@ class TestGraphMapperSynchronization:
 
         # Filter with threshold that removes some edges/nodes
         backbone_graph, backbone_mapper = apply_backbone(
-            graph, mapper, method="weight_threshold",
+            graph, mapper, method="weight",
             weight_threshold=4.0, keep_disconnected=False
         )
 
@@ -712,7 +714,7 @@ class TestGraphMapperSynchronization:
 
         # Filter by degree - target_nodes will filter to keep nodes with higher degree
         backbone_graph, backbone_mapper = apply_backbone(
-            graph, mapper, method="degree_threshold",
+            graph, mapper, method="degree",
             target_nodes=3, keep_disconnected=False
         )
 
@@ -732,7 +734,7 @@ class TestGraphMapperSynchronization:
 
         # With keep_disconnected=True, should preserve all nodes
         backbone_graph, backbone_mapper = apply_backbone(
-            graph, mapper, method="weight_threshold",
+            graph, mapper, method="weight",
             weight_threshold=6.0, keep_disconnected=True
         )
 
@@ -754,7 +756,7 @@ class TestGraphMapperSynchronization:
 
         # High threshold will disconnect some nodes
         backbone_graph, backbone_mapper = apply_backbone(
-            graph, mapper, method="weight_threshold",
+            graph, mapper, method="weight",
             weight_threshold=5.0, keep_disconnected=False
         )
 
@@ -800,7 +802,7 @@ class TestGraphMapperSynchronization:
         graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
 
         backbone_graph, backbone_mapper = apply_backbone(
-            graph, mapper, method="weight_threshold",
+            graph, mapper, method="weight",
             weight_threshold=5.0, keep_disconnected=False
         )
 
@@ -837,7 +839,7 @@ class TestGraphMapperSynchronization:
         graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
 
         # Apply multiple backboning methods
-        for method in ['disparity', 'noise_corrected', 'weight_threshold', 'degree_threshold']:
+        for method in ['disparity', 'noise_corrected', 'weight', 'degree']:
             if method == 'disparity':
                 backbone_graph, backbone_mapper = apply_backbone(
                     graph, mapper, method=method, alpha=0.05, keep_disconnected=False
@@ -846,11 +848,11 @@ class TestGraphMapperSynchronization:
                 backbone_graph, backbone_mapper = apply_backbone(
                     graph, mapper, method=method, threshold=1.0, keep_disconnected=False
                 )
-            elif method == 'weight_threshold':
+            elif method == 'weight':
                 backbone_graph, backbone_mapper = apply_backbone(
                     graph, mapper, method=method, weight_threshold=5.0, keep_disconnected=False
                 )
-            else:  # degree_threshold
+            else:  # degree
                 backbone_graph, backbone_mapper = apply_backbone(
                     graph, mapper, method=method, target_nodes=500, keep_disconnected=False
                 )
@@ -859,6 +861,203 @@ class TestGraphMapperSynchronization:
             assert backbone_graph.numberOfNodes() == backbone_mapper.size(), \
                 f"{method}: Large graph synchronization failed: " \
                 f"{backbone_graph.numberOfNodes()} != {backbone_mapper.size()}"
+
+
+# ---------------------------------------------------------------------------
+# Tests ported from the old test_filtering.py — coverage that's unique to the
+# consolidated apply_backbone (median-fallback, target_edges cap on disparity,
+# disparity validation messages, zero/extreme weights).
+# ---------------------------------------------------------------------------
+
+class TestApplyBackbonePorted:
+    """Backbone coverage ported from test_filtering.py."""
+
+    def setup_method(self):
+        self.weighted_graph = nk.Graph(5, weighted=True)
+        self.weighted_graph.addEdge(0, 1, 10.0)
+        self.weighted_graph.addEdge(0, 2, 5.0)
+        self.weighted_graph.addEdge(0, 3, 1.0)
+        self.weighted_graph.addEdge(0, 4, 0.5)
+        self.weighted_graph.addEdge(1, 2, 3.0)
+
+        self.weighted_mapper = IDMapper()
+        for i in range(5):
+            self.weighted_mapper.add_mapping(f"node_{i}", i)
+
+        self.unweighted_graph = nk.Graph(6)
+        for i in range(1, 6):
+            self.unweighted_graph.addEdge(0, i)
+        self.unweighted_graph.addEdge(1, 2)
+        self.unweighted_graph.addEdge(3, 4)
+
+        self.unweighted_mapper = IDMapper()
+        for i in range(6):
+            self.unweighted_mapper.add_mapping(f"unw_{i}", i)
+
+    def test_disparity_filter_target_edges(self):
+        """target_edges caps the disparity-filtered edge count."""
+        target = 3
+        backbone, _ = apply_backbone(
+            self.weighted_graph, self.weighted_mapper,
+            method="disparity", alpha=0.1, target_edges=target,
+        )
+        assert backbone.numberOfEdges() <= target
+
+    def test_weight_method_median_fallback(self):
+        """method='weight' with no target_edges/weight_threshold uses the median."""
+        backbone, _ = apply_backbone(
+            self.weighted_graph, self.weighted_mapper, method="weight",
+        )
+        assert backbone.numberOfEdges() <= self.weighted_graph.numberOfEdges()
+
+    def test_weight_method_unweighted_graph(self):
+        """method='weight' tolerates unweighted input (all weights = 1.0)."""
+        backbone, _ = apply_backbone(
+            self.unweighted_graph, self.unweighted_mapper, method="weight",
+        )
+        assert backbone.numberOfNodes() == self.unweighted_graph.numberOfNodes()
+
+    def test_degree_method_median_fallback(self):
+        """method='degree' with no target_nodes uses the median degree."""
+        backbone, _ = apply_backbone(
+            self.unweighted_graph, self.unweighted_mapper, method="degree",
+        )
+        assert backbone.numberOfNodes() <= self.unweighted_graph.numberOfNodes()
+
+    def test_get_backbone_statistics_full_keys(self):
+        """get_backbone_statistics exposes density and compression metrics."""
+        backbone, _ = apply_backbone(
+            self.weighted_graph, self.weighted_mapper,
+            method="disparity", alpha=0.1,
+        )
+        stats = get_backbone_statistics(self.weighted_graph, backbone)
+        for key in (
+            "original_nodes", "original_edges",
+            "backbone_nodes", "backbone_edges",
+            "node_retention", "edge_retention",
+            "compression_ratio",
+            "original_density", "backbone_density", "density_ratio",
+        ):
+            assert key in stats
+        assert 0 <= stats["node_retention"] <= 1
+        assert 0 <= stats["edge_retention"] <= 1
+        assert stats["compression_ratio"] >= 1
+
+    def test_all_edges_filtered_returns_empty(self):
+        """Extreme alpha that filters everything returns an empty backbone
+        (rather than raising) — the user can inspect numberOfEdges()."""
+        backbone, _ = apply_backbone(
+            self.weighted_graph, self.weighted_mapper,
+            method="disparity", alpha=0.000001,
+        )
+        assert backbone.numberOfEdges() == 0
+
+
+class TestBackboneParameterValidationPorted:
+    """Validation tests ported from test_filtering.py."""
+
+    def setup_method(self):
+        self.graph = nk.Graph(3, weighted=True)
+        self.graph.addEdge(0, 1, 1.0)
+        self.graph.addEdge(1, 2, 2.0)
+        self.mapper = IDMapper()
+        for i in range(3):
+            self.mapper.add_mapping(f"node_{i}", i)
+
+    def test_backbone_negative_targets(self):
+        with pytest.raises(ValidationError, match="target_nodes must be positive"):
+            apply_backbone(self.graph, self.mapper, target_nodes=-1)
+
+    def test_disparity_requires_weighted_graph(self):
+        unweighted = nk.Graph(3)
+        unweighted.addEdge(0, 1)
+        unweighted.addEdge(1, 2)
+        with pytest.raises(ValidationError, match="Disparity filter requires a weighted graph"):
+            apply_backbone(unweighted, self.mapper, method="disparity")
+
+
+class TestBackboneEdgeCasesPorted:
+    """Edge cases ported from test_filtering.py."""
+
+    def test_star_graph_disparity(self):
+        star_graph = nk.Graph(5, weighted=True)
+        star_graph.addEdge(0, 1, 10.0)
+        star_graph.addEdge(0, 2, 5.0)
+        star_graph.addEdge(0, 3, 1.0)
+        star_graph.addEdge(0, 4, 0.1)
+        mapper = IDMapper()
+        for i in range(5):
+            mapper.add_mapping(f"star_{i}", i)
+
+        backbone, _ = apply_backbone(
+            star_graph, mapper, method="disparity", alpha=0.1,
+        )
+        assert backbone.numberOfEdges() < star_graph.numberOfEdges()
+
+    def test_disparity_on_500_node_random_graph(self):
+        n_nodes = 500
+        large_graph = nk.Graph(n_nodes, weighted=True)
+        np.random.seed(42)
+        for _ in range(1000):
+            u, v = np.random.choice(n_nodes, 2, replace=False)
+            weight = np.random.exponential(2.0)
+            if not large_graph.hasEdge(u, v):
+                large_graph.addEdge(u, v, weight)
+        mapper = IDMapper()
+        for i in range(n_nodes):
+            mapper.add_mapping(f"large_{i}", i)
+
+        backbone, _ = apply_backbone(
+            large_graph, mapper, method="disparity", alpha=0.05,
+        )
+        assert backbone.numberOfNodes() <= n_nodes
+        assert backbone.numberOfEdges() <= large_graph.numberOfEdges()
+
+    def test_all_equal_weights_disparity(self):
+        equal_graph = nk.Graph(4, weighted=True)
+        for u, v in [(0, 1), (0, 2), (0, 3), (1, 2)]:
+            equal_graph.addEdge(u, v, 1.0)
+        mapper = IDMapper()
+        for i in range(4):
+            mapper.add_mapping(f"eq_{i}", i)
+
+        try:
+            backbone, _ = apply_backbone(
+                equal_graph, mapper, method="disparity", alpha=0.5,
+            )
+            assert backbone.numberOfNodes() <= 4
+            assert backbone.numberOfEdges() <= 4
+        except ComputationError:
+            # All edges filtered out is also valid for the equal-weight case.
+            pass
+
+    def test_zero_weight_edges(self):
+        zero_graph = nk.Graph(3, weighted=True)
+        zero_graph.addEdge(0, 1, 0.0)
+        zero_graph.addEdge(1, 2, 1.0)
+        mapper = IDMapper()
+        for i in range(3):
+            mapper.add_mapping(f"zero_{i}", i)
+
+        backbone, _ = apply_backbone(
+            zero_graph, mapper, method="weight", target_edges=1,
+        )
+        assert backbone.numberOfEdges() == 1
+
+    def test_numerical_stability_large_weights(self):
+        large_weight_graph = nk.Graph(3, weighted=True)
+        large_weight_graph.addEdge(0, 1, 1e6)
+        large_weight_graph.addEdge(0, 2, 1e-6)
+        large_weight_graph.addEdge(1, 2, 1.0)
+        mapper = IDMapper()
+        for i in range(3):
+            mapper.add_mapping(f"big_{i}", i)
+
+        backbone, _ = apply_backbone(
+            large_weight_graph, mapper, method="disparity", alpha=0.1,
+        )
+        assert backbone.numberOfNodes() >= 1
+        assert backbone.numberOfEdges() >= 0
 
 
 if __name__ == "__main__":
