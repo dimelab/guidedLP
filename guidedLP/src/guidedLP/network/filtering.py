@@ -213,7 +213,7 @@ def apply_backbone(
     target_edges: Optional[int] = None,
     alpha: float = 0.05,
     keep_disconnected: bool = False,
-    bonferroni: bool = True,
+    correction: str = "fdr_bh",
     verbose: bool = True,
 ) -> Tuple[nk.Graph, IDMapper]:
     """
@@ -253,11 +253,20 @@ def apply_backbone(
         cutoff (typical range: 0.01–0.05).
     keep_disconnected : bool, default False
         Whether to keep isolated nodes after edge filtering
-    bonferroni : bool, default True
-        Only used by ``method="bipartite_svn"``. When True, the effective
-        per-edge cutoff is ``alpha / |E|`` (Bonferroni correction for the
-        |E| simultaneous hypothesis tests). Set to False to use ``alpha``
-        directly (more permissive, more edges kept).
+    correction : str, default "fdr_bh"
+        Only used by ``method="bipartite_svn"``. Multiple-testing correction
+        applied to the per-edge p-values:
+
+        - ``"fdr_bh"`` (default, recommended): Benjamini-Hochberg false
+          discovery rate. Controls the expected proportion of false
+          discoveries among kept edges. Scales gracefully to millions of
+          tests — appropriate for large bipartite graphs.
+        - ``"bonferroni"``: per-edge cutoff = ``alpha / |E|``. Controls the
+          family-wise error rate (chance of *any* false positive). Extremely
+          conservative on large graphs — at |E| = 10⁶ even alpha=0.99 can
+          filter out everything.
+        - ``"none"``: use ``alpha`` directly as the per-edge p-value cutoff.
+          Most permissive; expect lots of false positives at scale.
     
     Returns
     -------
@@ -353,8 +362,13 @@ def apply_backbone(
                     graph, id_mapper, target_nodes, keep_disconnected
                 )
             elif method == "bipartite_svn":
+                if correction not in ("fdr_bh", "bonferroni", "none"):
+                    raise ValidationError(
+                        f"Invalid correction value: {correction!r}. "
+                        f"Expected 'fdr_bh', 'bonferroni', or 'none'."
+                    )
                 backbone_graph, updated_mapper = _apply_bipartite_svn_filter(
-                    graph, id_mapper, alpha, bonferroni, keep_disconnected
+                    graph, id_mapper, alpha, correction, keep_disconnected
                 )
             else:
                 raise ValidationError(f"Unsupported backbone method: {method}")
@@ -833,7 +847,7 @@ def _apply_bipartite_svn_filter(
     graph: nk.Graph,
     id_mapper: IDMapper,
     alpha: float,
-    bonferroni: bool,
+    correction: str,
     keep_disconnected: bool,
 ) -> Tuple[nk.Graph, IDMapper]:
     """
@@ -847,24 +861,19 @@ def _apply_bipartite_svn_filter(
                                                           configuration model)
       p_value  = P[ X ≥ w  |  X ~ Poisson(μ) ]
 
-    The edge is kept iff ``p_value ≤ alpha_eff``, where ``alpha_eff = alpha /
-    |E|`` (Bonferroni-corrected for the |E| simultaneous tests) when
-    ``bonferroni=True``, else ``alpha_eff = alpha``.
+    Then a multiple-testing correction is applied across all |E| p-values:
+
+      - ``correction="fdr_bh"``: Benjamini-Hochberg FDR. Scales gracefully
+        to |E| in the millions. The recommended default.
+      - ``correction="bonferroni"``: per-edge cutoff α/|E|. Conservative;
+        impractical when |E| is huge because the per-edge bar becomes
+        astronomically small.
+      - ``correction="none"``: use ``alpha`` directly. Most permissive.
 
     Auto-detects unweighted input: if ``graph.isWeighted()`` is False, or
     every edge weight equals 1.0, the observed weight is treated as 1 and
     the test reduces to ``p_value = 1 − exp(−μ)`` (the standard Bernoulli /
     "edge exists at all" test under a sparse Poisson approximation).
-
-    Notes
-    -----
-    The Poisson model is the standard sparse limit of the bipartite
-    configuration model and matches Tumminello et al.'s null. For weighted
-    integer-valued edges (e.g. share counts) this is exact in expectation;
-    for very dense graphs the approximation slightly under-states tail
-    probabilities. Bonferroni is the conservative default because |E| can
-    easily reach 10⁶+ and uncorrected α would let through millions of
-    spurious edges.
     """
     from scipy.stats import poisson
 
@@ -917,19 +926,26 @@ def _apply_bipartite_svn_filter(
         # Unweighted: observed weight is 1, so P(X ≥ 1) = 1 - exp(-μ).
         p_values = -np.expm1(-mu)  # numerically stable 1 - exp(-mu)
 
-    # Apply Bonferroni correction if requested.
-    if bonferroni:
-        alpha_effective = alpha / n_edges
+    # Apply multiple-testing correction.
+    if correction == "bonferroni":
+        keep_mask = p_values <= (alpha / n_edges)
+    elif correction == "fdr_bh":
+        keep_mask = _benjamini_hochberg_mask(p_values, alpha)
+    elif correction == "none":
+        keep_mask = p_values <= alpha
     else:
-        alpha_effective = alpha
+        # Defensive: apply_backbone validates this upstream, but be safe.
+        raise ValidationError(
+            f"Invalid correction: {correction!r}. "
+            f"Expected 'fdr_bh', 'bonferroni', or 'none'."
+        )
 
-    keep_mask = p_values <= alpha_effective
     n_kept = int(keep_mask.sum())
 
     logger.info(
-        "Bipartite SVN filter: weighted=%s, alpha=%.3g, bonferroni=%s, "
-        "alpha_eff=%.3e — kept %d/%d edges (%.1f%%)",
-        is_weighted_effective, alpha, bonferroni, alpha_effective,
+        "Bipartite SVN filter: weighted=%s, alpha=%.3g, correction=%s — "
+        "kept %d/%d edges (%.1f%%)",
+        is_weighted_effective, alpha, correction,
         n_kept, n_edges, 100.0 * n_kept / n_edges if n_edges else 0.0,
     )
 
@@ -986,6 +1002,37 @@ def _apply_bipartite_svn_filter(
 def _build_empty_like(graph: nk.Graph) -> nk.Graph:
     """Create an empty graph with the same directed/weighted flags."""
     return nk.Graph(0, weighted=graph.isWeighted(), directed=graph.isDirected())
+
+
+def _benjamini_hochberg_mask(p_values: np.ndarray, alpha: float) -> np.ndarray:
+    """Boolean mask: which p-values are rejected under Benjamini-Hochberg FDR.
+
+    Algorithm:
+      1. Sort p-values ascending: p_(1) ≤ p_(2) ≤ ... ≤ p_(N).
+      2. Find the largest rank k such that p_(k) ≤ (k / N) · alpha.
+      3. Reject the k smallest p-values.
+
+    Vectorized — no Python loop. Returns a mask aligned to the original
+    p_values order.
+    """
+    n = p_values.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+
+    sorted_idx = np.argsort(p_values)
+    sorted_p = p_values[sorted_idx]
+    thresholds = np.arange(1, n + 1, dtype=np.float64) / n * alpha
+    below = sorted_p <= thresholds
+
+    if not below.any():
+        return np.zeros(n, dtype=bool)
+
+    # Largest rank at which the threshold is met (BH step-up).
+    last_reject_in_sorted = int(np.where(below)[0].max())
+
+    reject_mask = np.zeros(n, dtype=bool)
+    reject_mask[sorted_idx[: last_reject_in_sorted + 1]] = True
+    return reject_mask
 
 
 def _apply_degree_threshold(

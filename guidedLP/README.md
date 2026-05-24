@@ -236,13 +236,18 @@ print(f"Bipartite:   {bipartite.numberOfNodes():>6} nodes, {bipartite.numberOfEd
 # Statistically Validated Network filter on the bipartite layer.
 # For each edge (u, item), test whether the observed weight is more than
 # expected under a configuration-model null preserving node strengths.
-# - alpha     = per-edge p-value cutoff (0.01–0.05 typical)
-# - bonferroni= True corrects for |E| simultaneous tests (recommended at scale)
+# - alpha       = per-edge p-value cutoff (0.01–0.05 typical)
+# - correction  = multiple-testing correction across all |E| edge tests:
+#                 "fdr_bh" (default): Benjamini-Hochberg FDR — scales to
+#                                     millions of edges; recommended.
+#                 "bonferroni":       very conservative — at |E| ≥ ~10⁵
+#                                     even α = 0.99 can filter everything.
+#                 "none":             use α directly; most permissive.
 backbone, backbone_mapper = apply_backbone(
     bipartite, full_mapper,
     method="bipartite_svn",
-    alpha=0.01,
-    bonferroni=True,          # set False for small graphs / exploratory work
+    alpha=0.05,
+    correction="fdr_bh",      # try "none" first on small/exploratory graphs
     keep_disconnected=False,
 )
 print(f"Backbone:    {backbone.numberOfNodes():>6} nodes, {backbone.numberOfEdges():>8} edges")
@@ -267,7 +272,7 @@ results = guided_label_propagation(
 )
 ```
 
-The `bipartite_svn` filter has only one knob (`alpha`) plus the optional Bonferroni toggle. Generic targets get filtered out automatically because high-degree nodes have high *expected* weight under the null — no degree threshold to tune.
+The `bipartite_svn` filter has only one knob (`alpha`) plus the `correction` choice. Generic targets get filtered out automatically because high-degree nodes have high *expected* weight under the null — no degree threshold to tune. The default `correction="fdr_bh"` (Benjamini-Hochberg) is the one you'll want for any real-size graph; `"bonferroni"` is only sensible for thousands (not millions) of edges, because Bonferroni divides α by |E| and that bar becomes impossibly strict at scale.
 
 #### Unipartite case — `disparity` (Serrano et al. 2009)
 
