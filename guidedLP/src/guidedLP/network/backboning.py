@@ -361,8 +361,12 @@ def _apply_disparity_filter(
         else:
             final_alpha = alpha_uv
         
-        # Edge is kept if disparity score is below threshold
-        keep_edge = final_alpha < alpha
+        # Edge is kept if disparity score is below threshold. final_alpha == 1.0
+        # is the sentinel used when an endpoint has degree 1 — the formula
+        # (1-p)^(k-1) breaks down for k=1, so we can't meaningfully filter
+        # those edges. Treat them as kept by default (standard practice for
+        # the disparity filter on leaf nodes).
+        keep_edge = final_alpha < alpha or final_alpha >= 1.0
         
         edge_results.append({
             'source_id': id_mapper.get_original(u),
@@ -370,7 +374,7 @@ def _apply_disparity_filter(
             'weight': w,
             'p_value': min(p_uv, p_vu) if not graph.isDirected() else p_uv,
             'alpha_score': final_alpha,
-            'kept': keep_edge
+            'kept': bool(keep_edge)
         })
         
         if keep_edge:
@@ -505,7 +509,7 @@ def _apply_weight_threshold(
             'weight': w,
             'p_value': np.nan,  # Not applicable for weight threshold
             'alpha_score': np.nan,  # Not applicable
-            'kept': keep_edge
+            'kept': bool(keep_edge)
         })
         
         if keep_edge:
@@ -593,7 +597,7 @@ def _apply_degree_threshold(
                 'weight': weight,
                 'p_value': np.nan,
                 'alpha_score': np.nan,
-                'kept': keep_edge
+                'kept': bool(keep_edge)
             })
             
             if keep_edge:
@@ -678,7 +682,7 @@ def get_backbone_summary(
             
             # Alpha score statistics (for disparity filter)
             alpha_scores = kept_edges['alpha_score'].drop_nulls()
-            if alpha_scores.height > 0:
+            if len(alpha_scores) > 0:
                 summary['alpha_statistics'] = {
                     'alpha_mean': float(alpha_scores.mean()),
                     'alpha_std': float(alpha_scores.std()),

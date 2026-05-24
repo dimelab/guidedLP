@@ -322,12 +322,17 @@ def setup_logging(
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
     
+    # Reset the performance logger's filters so repeated setup_logging calls
+    # don't accumulate filters (each prior call would leave its own
+    # PerformanceFilter installed forever otherwise).
+    perf_logger = logging.getLogger("glp.performance")
+    for existing in list(perf_logger.filters):
+        if isinstance(existing, PerformanceFilter):
+            perf_logger.removeFilter(existing)
+
     # Add performance filter if requested
     if config["performance_logging"]:
         perf_filter = PerformanceFilter()
-        
-        # Create separate performance logger
-        perf_logger = logging.getLogger("glp.performance")
         perf_logger.addFilter(perf_filter)
         
         # Optionally create separate performance log file
@@ -386,10 +391,15 @@ def _resolve_logging_config(**kwargs) -> Dict[str, Any]:
     # Resolve each configuration option
     level = kwargs.get("level") or os.getenv(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL)
     
-    log_dir = kwargs.get("log_dir") or os.getenv(ENV_LOG_DIR, DEFAULT_LOG_DIR)
+    # File logging is opt-in. Only auto-derive a log path when the caller
+    # explicitly asked for one (via parameter or env var) — otherwise
+    # setup_logging() would silently create ./logs/glp.log on every import
+    # in any project that uses the library. DEFAULT_LOG_DIR ("logs") is now
+    # only used as the *parent* directory when a log_file is requested
+    # without specifying log_dir.
+    log_dir = kwargs.get("log_dir") or os.getenv(ENV_LOG_DIR)
     log_file = kwargs.get("log_file") or os.getenv(ENV_LOG_FILE)
-    
-    # If no specific log file but log_dir is specified, use default name
+
     if not log_file and log_dir:
         log_file = os.path.join(log_dir, "glp.log")
     

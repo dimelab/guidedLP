@@ -169,7 +169,7 @@ def train_test_split_validation(
         # Step 1: Determine the train and test sets.
         if test_seeds is None:
             _validate_split_inputs(seed_labels, labels, test_size, stratify)
-            train_seeds, test_seeds, train_labels_list, test_labels_list = _split_seed_data(
+            train_seeds, test_seeds, _, _ = _split_seed_data(
                 seed_labels, labels, test_size, stratify, random_seed
             )
         else:
@@ -177,7 +177,6 @@ def train_test_split_validation(
             train_seeds, test_seeds = _resolve_custom_test_set(
                 seed_labels, test_seeds, labels
             )
-            test_labels_list = None  # Will be aligned with test_predictions below.
 
         logger.info(f"Split: {len(train_seeds)} training seeds, {len(test_seeds)} test seeds")
 
@@ -197,12 +196,15 @@ def train_test_split_validation(
         # Step 3: Extract predictions for test nodes
         test_predictions = _extract_test_predictions(predictions, test_seeds)
 
-        # When the user provided a custom test set, build the true-label list in
-        # the same order as test_predictions so metrics are correctly aligned.
-        if test_labels_list is None:
-            test_labels_list = [
-                test_seeds[nid] for nid in test_predictions["node_id"].to_list()
-            ]
+        # Always rebuild the true-label list from test_predictions' row order
+        # so the parallel arrays passed to sklearn's metric functions are
+        # guaranteed to align. (The earlier code used sklearn's split-time
+        # ordering, which doesn't match the order polars' filter() returns —
+        # a latent bug that caused accuracy to silently miscompute when the
+        # two orders disagreed.)
+        test_labels_list = [
+            test_seeds[nid] for nid in test_predictions["node_id"].to_list()
+        ]
 
         # Step 4: Calculate comprehensive metrics
         metrics = _calculate_validation_metrics(
@@ -391,11 +393,20 @@ def _split_seed_data(
             )
             
     except ValueError as e:
-        # Handle stratification errors
-        if "least populated class" in str(e):
-            raise ValidationError(
-                f"Cannot perform stratified split: {e}. "
-                f"Try setting stratify=False or providing more seeds per label."
+        # Handle stratification errors. When stratify=True but a class has
+        # fewer than 2 samples, sklearn refuses. _validate_split_inputs has
+        # already emitted a UserWarning warning the caller that "Stratified
+        # split may fail"; fall back gracefully to an unstratified split
+        # rather than raising, so callers get a usable result.
+        if stratify and "least populated class" in str(e):
+            warnings.warn(
+                f"Stratified split failed ({e}); falling back to non-stratified split."
+            )
+            train_ids, test_ids, train_labels_list, test_labels_list = train_test_split(
+                seed_ids,
+                seed_labels_list,
+                test_size=test_size,
+                random_state=random_seed,
             )
         else:
             raise ValidationError(f"Train/test split failed: {e}")
@@ -831,21 +842,44 @@ def _generate_cv_folds(
         else:
             raise ValidationError(f"K-fold split failed: {e}")
     
-    # Convert splits to train/test dictionaries
+    # Convert splits to train/test dictionaries. The sklearn split generator
+    # may raise during iteration (not at .split() call time) when a class
+    # has fewer members than k_folds; catch that and fall back to a
+    # non-stratified KFold (matches the UserWarning emitted earlier).
     fold_splits = []
-    for fold_idx, (train_indices, test_indices) in enumerate(splits):
-        train_ids = [seed_ids[i] for i in train_indices]
-        test_ids = [seed_ids[i] for i in test_indices]
-        train_labels_list = [seed_labels_list[i] for i in train_indices]
-        test_labels_list = [seed_labels_list[i] for i in test_indices]
-        
-        train_seeds = dict(zip(train_ids, train_labels_list))
-        test_seeds = dict(zip(test_ids, test_labels_list))
-        
-        fold_splits.append((train_seeds, test_seeds))
-        
-        logger.debug(f"Fold {fold_idx}: {len(train_seeds)} train, {len(test_seeds)} test")
-    
+    try:
+        for fold_idx, (train_indices, test_indices) in enumerate(splits):
+            train_ids = [seed_ids[i] for i in train_indices]
+            test_ids = [seed_ids[i] for i in test_indices]
+            train_labels_list = [seed_labels_list[i] for i in train_indices]
+            test_labels_list = [seed_labels_list[i] for i in test_indices]
+
+            train_seeds = dict(zip(train_ids, train_labels_list))
+            test_seeds = dict(zip(test_ids, test_labels_list))
+
+            fold_splits.append((train_seeds, test_seeds))
+
+            logger.debug(f"Fold {fold_idx}: {len(train_seeds)} train, {len(test_seeds)} test")
+    except ValueError as e:
+        if stratify and "number of members in each class" in str(e):
+            warnings.warn(
+                f"Stratified {k_folds}-fold CV failed ({e}); "
+                "falling back to non-stratified KFold."
+            )
+            kfold = KFold(n_splits=k_folds, shuffle=True, random_state=random_seed)
+            fold_splits = []
+            for fold_idx, (train_indices, test_indices) in enumerate(kfold.split(seed_ids)):
+                train_ids = [seed_ids[i] for i in train_indices]
+                test_ids = [seed_ids[i] for i in test_indices]
+                train_labels_list = [seed_labels_list[i] for i in train_indices]
+                test_labels_list = [seed_labels_list[i] for i in test_indices]
+                fold_splits.append((
+                    dict(zip(train_ids, train_labels_list)),
+                    dict(zip(test_ids, test_labels_list)),
+                ))
+        else:
+            raise ValidationError(f"K-fold split failed: {e}")
+
     return fold_splits
 
 

@@ -116,22 +116,33 @@ class TestBasicGraphConstruction:
         assert id_mapper.has_original("user1")
     
     def test_mixed_node_types(self):
-        """Test graph construction with mixed node ID types."""
-        edges = pl.DataFrame({
-            "source": ["A", 1, "C", 2],
-            "target": [1, "C", 2, "A"]
-        })
-        
+        """Test graph construction with mixed node ID types.
+
+        polars 1.x enforces a single dtype per Series. With ``strict=False``
+        it casts everything to a common type (typically String when both
+        strings and ints are present), so the IDMapper ends up holding the
+        string forms of the originally-numeric values. The library itself is
+        type-agnostic — this test confirms construction still succeeds and
+        the surviving (coerced) IDs round-trip through the mapper.
+        """
+        edges = pl.DataFrame(
+            {
+                "source": ["A", 1, "C", 2],
+                "target": [1, "C", 2, "A"],
+            },
+            strict=False,
+        )
+
         graph, id_mapper = build_graph_from_edgelist(edges)
-        
+
         assert graph.numberOfNodes() == 4
         assert graph.numberOfEdges() == 4
-        
-        # Test that both string and numeric IDs work
+
+        # After polars' uniform-typing, all IDs are strings.
         assert id_mapper.has_original("A")
-        assert id_mapper.has_original(1)
+        assert id_mapper.has_original("1")
         assert id_mapper.has_original("C")
-        assert id_mapper.has_original(2)
+        assert id_mapper.has_original("2")
 
 
 class TestAutoWeightCalculation:
@@ -1155,8 +1166,9 @@ class TestProjectionIntegrationScenarios:
         movie_graph, movie_mapper = project_bipartite(
             graph, id_mapper, "target", "overlap"
         )
-        
-        assert movie_graph.numberOfNodes() == 4
+
+        # 3 unique movies in the edgelist: titanic, avatar, inception
+        assert movie_graph.numberOfNodes() == 3
         
         # Check that movies watched by same users are connected
         titanic_id = movie_mapper.get_internal("titanic")

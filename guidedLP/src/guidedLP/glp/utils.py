@@ -7,11 +7,19 @@ creating balanced seed sets and suggesting optimal alpha values based on
 network properties.
 """
 
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import warnings
 import random
 import numpy as np
+import polars as pl
 import networkit as nk
+
+try:
+    import pandas as _pd  # type: ignore[import-not-found]
+    _HAS_PANDAS = True
+except ImportError:  # pragma: no cover
+    _pd = None  # type: ignore[assignment]
+    _HAS_PANDAS = False
 
 from guidedLP.common.id_mapper import IDMapper
 from guidedLP.common.exceptions import (
@@ -581,6 +589,18 @@ def check_seed_coverage(
         Cap on how many missing node IDs to include in each ``missing_sample``
         list. Set to 0 to disable sampling.
 
+    Notes
+    -----
+    Entries with **null labels** (``None`` in dict values, ``null`` in polars,
+    ``NaN`` / ``None`` in pandas) are silently dropped from the input before
+    counting. The number of dropped rows per side is reported in the
+    ``skipped_null_labels`` field. This makes the function safe to call on a
+    DataFrame produced by a left-join with a sparse labels table — unlabeled
+    rows just don't count toward train/test totals.
+
+    Null *node IDs*, by contrast, are still treated as a data error by
+    :func:`normalize_seed_input` (which raises).
+
     Returns
     -------
     Dict[str, Any]
@@ -590,10 +610,10 @@ def check_seed_coverage(
         ``train`` / ``test`` subdict::
 
             {
-                "total":          int,      # number of seeds passed in
-                "present":        int,      # how many are in the mapper
-                "missing":        int,      # how many are not
-                "coverage":       float,    # present / total, or 0.0 if total == 0
+                "total":               int,      # seeds remaining after null-label drop
+                "present":             int,      # how many are in the mapper
+                "missing":             int,      # how many are not
+                "coverage":            float,    # present / total, or 0.0 if total == 0
                 "by_label": {
                     label: {
                         "total":    int,
@@ -603,7 +623,8 @@ def check_seed_coverage(
                     },
                     ...
                 },
-                "missing_sample": List[Any],  # up to missing_sample_size IDs
+                "missing_sample":      List[Any],   # up to missing_sample_size IDs
+                "skipped_null_labels": int,         # rows dropped due to null labels
             }
 
         ``overlap`` subdict::
@@ -628,22 +649,33 @@ def check_seed_coverage(
     ...     print(f"Warning: {report['overlap']['conflicting']} nodes have "
     ...           f"different train/test labels")
     """
-    train_normalized = normalize_seed_input(seeds, seed_node_col, seed_label_col)
+    seeds_filtered, train_skipped = _drop_null_label_seeds(
+        seeds, seed_label_col
+    )
+    train_normalized = normalize_seed_input(
+        seeds_filtered, seed_node_col, seed_label_col
+    )
     train_report = _coverage_report(
         train_normalized, id_mapper, missing_sample_size
     )
+    train_report["skipped_null_labels"] = train_skipped
 
     result: Dict[str, Any] = {"train": train_report}
 
     if test_seeds is None:
         return result
 
-    test_normalized = normalize_seed_input(
-        test_seeds, seed_node_col, seed_label_col
+    test_filtered, test_skipped = _drop_null_label_seeds(
+        test_seeds, seed_label_col
     )
-    result["test"] = _coverage_report(
+    test_normalized = normalize_seed_input(
+        test_filtered, seed_node_col, seed_label_col
+    )
+    test_report = _coverage_report(
         test_normalized, id_mapper, missing_sample_size
     )
+    test_report["skipped_null_labels"] = test_skipped
+    result["test"] = test_report
 
     # Overlap analysis between train and test (independent of mapper membership).
     overlap_nodes = set(train_normalized) & set(test_normalized)
@@ -663,6 +695,61 @@ def check_seed_coverage(
     }
 
     return result
+
+
+def _drop_null_label_seeds(
+    seeds: Any, label_col: str
+) -> Tuple[Any, int]:
+    """Filter out seed entries with null labels.
+
+    Operates on any :data:`SeedInput` shape. For the inverse dict format
+    ``{label: [nodes]}`` a ``None`` *key* (i.e. a None label) drops the whole
+    list of nodes attached to it. For all other shapes a None / null / NaN
+    value in the label position drops the row.
+
+    Returns
+    -------
+    filtered : same type as the input (or the input unchanged for unknown types)
+    skipped : int
+        Number of entries dropped. Always 0 when the function can't infer the
+        structure — let :func:`normalize_seed_input` raise the real error
+        downstream.
+    """
+    # Dict shapes
+    if isinstance(seeds, dict):
+        if not seeds:
+            return seeds, 0
+        first_value = next(iter(seeds.values()))
+        if isinstance(first_value, (list, tuple, set)):
+            # Inverse format {label: [nodes]} — drop whole groups where the
+            # label key is None.
+            filtered_dict = {k: v for k, v in seeds.items() if k is not None}
+            skipped_keys = [k for k in seeds if k is None]
+            n_dropped = sum(len(seeds[k]) for k in skipped_keys)
+            return filtered_dict, n_dropped
+        # Canonical {node: label} — drop entries where label is None.
+        filtered_dict = {k: v for k, v in seeds.items() if v is not None}
+        return filtered_dict, len(seeds) - len(filtered_dict)
+
+    # Polars DataFrame
+    if isinstance(seeds, pl.DataFrame):
+        if label_col not in seeds.columns:
+            # Let normalize_seed_input raise the helpful "missing column" error.
+            return seeds, 0
+        before = len(seeds)
+        filtered = seeds.filter(pl.col(label_col).is_not_null())
+        return filtered, before - len(filtered)
+
+    # Pandas DataFrame (only if pandas is importable)
+    if _HAS_PANDAS and isinstance(seeds, _pd.DataFrame):
+        if label_col not in seeds.columns:
+            return seeds, 0
+        before = len(seeds)
+        filtered = seeds.dropna(subset=[label_col])
+        return filtered, before - len(filtered)
+
+    # Unknown type — pass through; normalize_seed_input will raise.
+    return seeds, 0
 
 
 def _coverage_report(

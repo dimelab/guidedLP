@@ -137,22 +137,38 @@ def build_graph_from_edgelist(
         try:
             # Step 1: Load edge list data
             df = _load_edge_list(edgelist)
-            
-            # Step 2: Validate edge list structure and data
-            _validate_edge_list(df, source_col, target_col, weight_col)
-            
-            # Step 3: Handle empty edge list
+
+            # Step 2: Handle empty edge list BEFORE running schema validation,
+            # which would otherwise raise on the empty DataFrame and prevent
+            # the warn-and-return path below from firing. An empty edgelist
+            # is a non-fatal case — the function returns an empty graph.
             if df.is_empty():
                 warnings.warn("Empty edge list provided. Creating empty graph.")
                 empty_graph = nk.Graph(0, weighted=(weight_col is not None), directed=directed)
                 empty_mapper = IDMapper()
                 return empty_graph, empty_mapper
+
+            # Step 3: Validate edge list structure and data
+            _validate_edge_list(df, source_col, target_col, weight_col)
             
-            # Step 4: Process edges (weights, duplicates, self-loops)
+            # Step 4: Process edges (weights, duplicates, self-loops).
+            # When auto_weight is on and the user didn't pass weight_col,
+            # _process_edges injects a 'weight' column from duplicate counts.
+            # Treat the graph as weighted only when those counts actually
+            # carry information (i.e. there was at least one duplicate); for
+            # a fully-unique edgelist all counts are 1, and producing a
+            # weighted graph would be a surprising default.
             processed_df = _process_edges(
-                df, source_col, target_col, weight_col, 
+                df, source_col, target_col, weight_col,
                 auto_weight, allow_self_loops, remove_duplicates
             )
+            if (
+                weight_col is None
+                and auto_weight
+                and "weight" in processed_df.columns
+                and processed_df["weight"].max() > 1
+            ):
+                weight_col = "weight"
             
             # Step 5: Create ID mapping
             id_mapper = _create_id_mapping(processed_df, source_col, target_col)
@@ -574,7 +590,7 @@ def get_graph_info(graph: nk.Graph, id_mapper: IDMapper) -> Dict[str, Any]:
         "weighted": graph.isWeighted(),
         "has_self_loops": graph.numberOfSelfLoops() > 0,
         "num_self_loops": graph.numberOfSelfLoops(),
-        "density": graph.density() if graph.numberOfNodes() > 1 else 0.0,
+        "density": nk.graphtools.density(graph) if graph.numberOfNodes() > 1 else 0.0,
         "node_id_mapping_size": id_mapper.size(),
         "is_connected": nk.components.ConnectedComponents(graph).run().numberOfComponents() == 1
     }

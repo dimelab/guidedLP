@@ -240,30 +240,38 @@ def validate_timestamps(
     if timestamps.is_empty():
         raise ValidationError("Timestamp series is empty", field=column_name)
     
-    # Check for null values
+    # Check for null values. Distinguish all-null (more specific, better
+    # error) from some-null so callers can tell the difference.
     null_count = timestamps.null_count()
     if null_count > 0 and not allow_nulls:
+        if null_count == len(timestamps):
+            raise ValidationError(
+                "All timestamps are null",
+                field=column_name,
+                details={"null_count": null_count, "allow_nulls": False},
+            )
         raise ValidationError(
             f"Column contains {null_count} null timestamps",
             field=column_name,
-            details={"null_count": null_count, "allow_nulls": False}
+            details={"null_count": null_count, "allow_nulls": False},
         )
     
     # Try to parse timestamps if they're not already datetime type
     if not timestamps.dtype.is_temporal():
         try:
-            # Attempt to parse as datetime
             parsed_timestamps = timestamps.str.to_datetime()
         except Exception as e:
-            # Try alternative parsing methods
-            try:
-                parsed_timestamps = pl.Series(timestamps.name).cast(pl.Datetime)
-            except Exception:
-                raise ValidationError(
-                    f"Failed to parse timestamps. Expected datetime format or parseable strings",
-                    field=column_name,
-                    details={"error": str(e), "sample_values": timestamps.head(5).to_list()}
-                )
+            # The previous fallback constructed an empty series and silently
+            # swallowed the parse failure, so callers got no error but also
+            # no validation. Re-raise as a ValidationError with diagnostics.
+            raise ValidationError(
+                "Failed to parse timestamps. Expected datetime format or parseable strings",
+                field=column_name,
+                details={
+                    "error": str(e),
+                    "sample_values": timestamps.head(5).to_list(),
+                },
+            )
     else:
         parsed_timestamps = timestamps
     
@@ -425,25 +433,11 @@ def validate_seed_labels(
     label_counts = {}
     for label in labels:
         label_counts[label] = seed_label_values.count(label)
-    
-    # Check minimum seeds per label
-    insufficient_labels = [
-        label for label, count in label_counts.items() 
-        if count < min_seeds_per_label
-    ]
-    
-    if insufficient_labels:
-        raise ValidationError(
-            f"Insufficient seeds for labels: {insufficient_labels}",
-            field="seed_labels",
-            details={
-                "insufficient_labels": insufficient_labels,
-                "label_counts": label_counts,
-                "min_required": min_seeds_per_label
-            }
-        )
-    
-    # Check for missing labels (labels with no seeds)
+
+    # Check missing labels (zero seeds) FIRST — this is a strictly more
+    # specific failure mode than "insufficient", with a clearer error
+    # message. Without this ordering the "no seeds found" branch is
+    # unreachable whenever min_seeds_per_label >= 1.
     missing_labels = [label for label, count in label_counts.items() if count == 0]
     if missing_labels:
         raise ValidationError(
@@ -452,6 +446,23 @@ def validate_seed_labels(
             details={
                 "missing_labels": missing_labels,
                 "label_counts": label_counts
+            }
+        )
+
+    # Then check for under-represented labels (have some seeds but fewer than the minimum)
+    insufficient_labels = [
+        label for label, count in label_counts.items()
+        if count < min_seeds_per_label
+    ]
+
+    if insufficient_labels:
+        raise ValidationError(
+            f"Insufficient seeds for labels: {insufficient_labels}",
+            field="seed_labels",
+            details={
+                "insufficient_labels": insufficient_labels,
+                "label_counts": label_counts,
+                "min_required": min_seeds_per_label
             }
         )
     

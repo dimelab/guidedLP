@@ -596,10 +596,13 @@ class IDMapper:
         >>> "unknown" in mapper
         False
         """
+        # Originals can be of any hashable type — including int — so check
+        # against originals first, then against internals (always ints).
+        if self.has_original(item):
+            return True
         if isinstance(item, int):
             return self.has_internal(item)
-        else:
-            return self.has_original(item)
+        return False
     
     def __repr__(self) -> str:
         """String representation of the mapper."""

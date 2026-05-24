@@ -371,8 +371,15 @@ class ConvergenceError(NetworkAnalysisError):
         """
         if self.final_change is None or self.threshold is None:
             return False
-        
-        return self.final_change <= (10 * self.threshold)
+
+        # Use division rather than multiplying threshold by 10: in floating
+        # point, 10 * 1e-6 == 9.999...e-6, so `1e-5 <= 10 * 1e-6` is False
+        # and barely-non-converged results were incorrectly marked unusable.
+        # Add a small relative epsilon to absorb the 1-ulp drift in the
+        # ratio direction too (e.g. 1e-5 / 1e-6 == 10.000000000000002).
+        if self.threshold <= 0:
+            return False
+        return (self.final_change / self.threshold) <= 10 * (1 + 1e-9)
 
 
 class ConfigurationError(NetworkAnalysisError):

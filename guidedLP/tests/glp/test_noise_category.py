@@ -121,14 +121,17 @@ class TestNoiseCategoryFeatures:
         single_seed_labels = {"A1": "important"}
         single_labels = ["important"]
         
-        # With noise category (should work well)
-        with pytest.warns(None) as warning_list:
+        # With noise category (should work well). pytest.warns(None) was removed
+        # in pytest 8.x — use warnings.catch_warnings to record any warnings.
+        import warnings as _warnings
+        with _warnings.catch_warnings(record=True) as warning_list:
+            _warnings.simplefilter("always")
             results_with_noise = guided_label_propagation(
                 graph=graph,
                 id_mapper=mapper,
                 seed_labels=single_seed_labels,
                 labels=single_labels,
-                enable_noise_category=True
+                enable_noise_category=True,
             )
         
         # Should have noise category

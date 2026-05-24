@@ -423,7 +423,7 @@ class TestCheckSeedCoverage:
         report = check_seed_coverage(mapper, {})
         assert report["train"] == {
             "total": 0, "present": 0, "missing": 0, "coverage": 0.0,
-            "by_label": {}, "missing_sample": [],
+            "by_label": {}, "missing_sample": [], "skipped_null_labels": 0,
         }
 
     def test_test_set_separately_reported(self):
@@ -482,6 +482,54 @@ class TestCheckSeedCoverage:
         seeds = {f"missing_{i}": "A" for i in range(5)}
         report = check_seed_coverage(mapper, seeds, missing_sample_size=0)
         assert report["train"]["missing_sample"] == []
+
+    def test_null_labels_in_dict_are_skipped(self):
+        mapper = self._make_mapper(["u1", "u2", "u3"])
+        # u3 has no known label yet → None should be silently dropped.
+        seeds = {"u1": "A", "u2": "B", "u3": None}
+        report = check_seed_coverage(mapper, seeds)
+        assert report["train"]["total"] == 2
+        assert report["train"]["present"] == 2
+        assert report["train"]["skipped_null_labels"] == 1
+        assert set(report["train"]["by_label"]) == {"A", "B"}
+
+    def test_null_labels_in_polars(self):
+        mapper = self._make_mapper(["u1", "u2", "u3", "u4"])
+        df = pl.DataFrame({
+            "node_id": ["u1", "u2", "u3", "u4"],
+            "label":   ["A",  None, "B", None],
+        })
+        report = check_seed_coverage(mapper, df)
+        assert report["train"]["total"] == 2
+        assert report["train"]["skipped_null_labels"] == 2
+        assert report["train"]["coverage"] == 1.0
+
+    def test_null_labels_in_pandas(self):
+        pd = pytest.importorskip("pandas")
+        mapper = self._make_mapper(["u1", "u2", "u3"])
+        df = pd.DataFrame({
+            "node_id": ["u1", "u2", "u3"],
+            "label":   ["A", None, "B"],
+        })
+        report = check_seed_coverage(mapper, df)
+        assert report["train"]["total"] == 2
+        assert report["train"]["skipped_null_labels"] == 1
+
+    def test_null_labels_counted_per_side(self):
+        mapper = self._make_mapper(["u1", "u2", "u3", "u4"])
+        train = {"u1": "A", "u2": None, "u3": "B"}                    # 1 null
+        test  = {"u4": "A", "u5": None, "u6": None, "u7": "B"}        # 2 nulls
+        report = check_seed_coverage(mapper, train, test_seeds=test)
+        assert report["train"]["skipped_null_labels"] == 1
+        assert report["test"]["skipped_null_labels"] == 2
+
+    def test_null_label_in_inverse_dict_drops_whole_group(self):
+        """An inverse-dict entry with key=None should drop its whole node list."""
+        mapper = self._make_mapper(["u1", "u2", "u3"])
+        seeds = {"A": ["u1"], None: ["u2", "u3"]}  # the None-keyed group → all dropped
+        report = check_seed_coverage(mapper, seeds)
+        assert report["train"]["total"] == 1
+        assert report["train"]["skipped_null_labels"] == 2
 
 
 class TestInputValidation:

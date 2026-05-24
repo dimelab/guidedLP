@@ -452,38 +452,43 @@ def _create_statistic_expression(metric: str, statistic: str) -> Optional[pl.Exp
 
 
 def _create_trend_expression(metric: str) -> pl.Expr:
-    """Create expression for linear trend calculation."""
-    
-    # For trend calculation, we need to use a custom function
-    # that calculates linear regression slope
-    return pl.col(metric).map_elements(
-        lambda series: _calculate_trend_slope(series),
-        return_dtype=pl.Float64
+    """Create expression for linear trend calculation.
+
+    polars 1.x's ``map_elements`` inside ``.agg()`` invokes the callback once
+    per row (producing a list-typed result), which is wrong for a trend
+    calculation — we need the slope across *all* values in the group. Use
+    ``map_batches`` instead so the callback receives the whole batch.
+    """
+    return pl.col(metric).map_batches(
+        lambda batch: pl.Series([_calculate_trend_slope(batch)]),
+        return_dtype=pl.Float64,
+        returns_scalar=True,
     ).alias(f"{metric}_trend")
 
 
-def _calculate_trend_slope(values: pl.Series) -> float:
-    """Calculate linear trend slope for a series of values."""
-    
+def _calculate_trend_slope(values) -> float:
+    """Calculate linear trend slope for a series of values.
+
+    ``values`` may be a polars Series, a numpy array, or a Python list — be
+    defensive about the conversion so we work under both old and new polars
+    APIs.
+    """
     try:
-        # Convert to numpy for calculations
-        y = values.to_numpy()
-        
-        # Filter out NaN values
+        if hasattr(values, "to_numpy"):
+            y = values.to_numpy()
+        else:
+            y = np.asarray(values, dtype=float)
+
         valid_mask = ~np.isnan(y)
         if valid_mask.sum() < 2:
             return 0.0  # Need at least 2 points for trend
-        
+
         y_valid = y[valid_mask]
         x_valid = np.arange(len(y_valid))
-        
-        # Calculate linear regression slope
-        if len(x_valid) < 2:
-            return 0.0
-        
+
         slope, _, _, _, _ = stats.linregress(x_valid, y_valid)
         return float(slope) if not np.isnan(slope) else 0.0
-        
+
     except Exception as e:
         logger.warning(f"Failed to calculate trend slope: {e}")
         return 0.0
