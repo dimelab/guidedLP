@@ -37,7 +37,8 @@ def build_graph_from_edgelist(
     bipartite: bool = False,
     auto_weight: bool = True,
     allow_self_loops: bool = True,
-    remove_duplicates: bool = False
+    remove_duplicates: bool = False,
+    bipartite_overlap: str = "raise",
 ) -> Tuple[nk.Graph, IDMapper]:
     """
     Construct a NetworkIt graph from an edge list with ID preservation.
@@ -69,7 +70,19 @@ def build_graph_from_edgelist(
         If True, allow edges from a node to itself; otherwise remove them
     remove_duplicates : bool, default False
         If True, remove duplicate edges before processing (keeps first occurrence)
-        
+    bipartite_overlap : str, default "raise"
+        How to handle nodes that appear in both source and target columns when
+        ``bipartite=True``. Only consulted when ``bipartite`` is True.
+
+        - ``"raise"``: default. Raise ``GraphConstructionError`` if any node is
+          in both columns (strictly bipartite input required).
+        - ``"drop"``: remove all edges where source or target is an overlap
+          node, emit a ``UserWarning`` with the count. The resulting graph is
+          strictly bipartite — safe for ``project_bipartite`` etc.
+        - ``"warn"``: keep all edges, emit a ``UserWarning``. Both partitions
+          on the returned :class:`IDMapper` will contain the overlap nodes.
+          Downstream projection results may be ambiguous on those nodes.
+
     Returns
     -------
     graph : nk.Graph
@@ -216,22 +229,36 @@ def build_graph_from_edgelist(
             ):
                 weight_col = "weight"
             
-            # Step 5: Create ID mapping
-            id_mapper = _create_id_mapping(processed_df, source_col, target_col)
-            
-            # Step 6: Validate bipartite structure if requested, and record
-            # which original IDs came from the source vs. target column. This
-            # lets downstream projection functions recover the user's column
-            # semantics without resorting to BFS coloring (whose 0/1 labelling
-            # is arbitrary with respect to the original columns).
+            # Step 5: Handle bipartite source/target overlap BEFORE building
+            # the id mapper, so the "drop" policy can remove offending edges
+            # cleanly. The "raise" path delegates to the existing strict
+            # validator; "warn" keeps everything and "drop" filters the
+            # processed DataFrame.
+            bipartite_overlap_used = False
             if bipartite:
-                _validate_bipartite_structure(processed_df, source_col, target_col, id_mapper)
-                id_mapper.set_bipartite_partitions(
-                    processed_df[source_col].unique().to_list(),
-                    processed_df[target_col].unique().to_list(),
+                processed_df, bipartite_overlap_used = _apply_bipartite_overlap_policy(
+                    processed_df, source_col, target_col, bipartite_overlap
                 )
 
-            # Step 7: Construct NetworkIt graph
+            # Step 6: Create ID mapping (over the possibly-filtered df).
+            id_mapper = _create_id_mapping(processed_df, source_col, target_col)
+
+            # Step 7: Record partition info on the id mapper so
+            # project_bipartite and similar functions don't have to fall back
+            # to BFS coloring (which produces arbitrary labels).
+            if bipartite:
+                source_set = set(processed_df[source_col].unique().to_list())
+                target_set = set(processed_df[target_col].unique().to_list())
+                if bipartite_overlap_used:
+                    # "warn" mode: partitions intentionally overlap. Set the
+                    # attributes directly because set_bipartite_partitions()
+                    # rejects overlap by design.
+                    id_mapper.source_partition_originals = source_set
+                    id_mapper.target_partition_originals = target_set
+                else:
+                    id_mapper.set_bipartite_partitions(source_set, target_set)
+
+            # Step 8: Construct NetworkIt graph
             graph = _construct_graph(processed_df, id_mapper, source_col, target_col,
                                    weight_col, directed, bipartite)
             
@@ -242,7 +269,7 @@ def build_graph_from_edgelist(
             return graph, id_mapper
             
         except Exception as e:
-            if isinstance(e, (ValidationError, GraphConstructionError, DataFormatError)):
+            if isinstance(e, (ValidationError, GraphConstructionError, DataFormatError, ConfigurationError)):
                 raise
             else:
                 raise GraphConstructionError(
@@ -477,6 +504,90 @@ def _create_id_mapping(
             operation="create_id_mapping",
             cause=e
         )
+
+
+def _apply_bipartite_overlap_policy(
+    df: pl.DataFrame,
+    source_col: str,
+    target_col: str,
+    policy: str,
+) -> Tuple[pl.DataFrame, bool]:
+    """
+    Apply the configured bipartite-overlap policy.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        Edge list (after _process_edges).
+    source_col, target_col : str
+        Column names.
+    policy : {"raise", "drop", "warn"}
+        - "raise": fail with GraphConstructionError on any overlap.
+        - "drop": filter out edges where source or target is in the overlap
+          set; emit a UserWarning with counts.
+        - "warn": emit a UserWarning, leave the DataFrame untouched.
+
+    Returns
+    -------
+    df : pl.DataFrame
+        Possibly filtered edge list.
+    overlap_kept : bool
+        True iff overlap was kept (i.e. policy was "warn" and overlap was
+        non-empty). Used by the caller to know whether the IDMapper
+        partitions will intentionally overlap.
+    """
+    valid_policies = ("raise", "drop", "warn")
+    if policy not in valid_policies:
+        raise ConfigurationError(
+            f"Invalid bipartite_overlap value: {policy!r}. "
+            f"Expected one of {valid_policies}."
+        )
+
+    source_set = set(df[source_col].unique().to_list())
+    target_set = set(df[target_col].unique().to_list())
+    overlap = source_set & target_set
+
+    if not overlap:
+        return df, False
+
+    sample = list(overlap)[:10]
+
+    if policy == "raise":
+        raise GraphConstructionError(
+            f"Graph is not bipartite: {len(overlap)} nodes appear in both "
+            f"source and target",
+            graph_type="bipartite",
+            details={
+                "overlapping_nodes": sample,
+                "total_overlap": len(overlap),
+                "source_partition_size": len(source_set),
+                "target_partition_size": len(target_set),
+            },
+        )
+
+    if policy == "drop":
+        rows_before = len(df)
+        overlap_list = list(overlap)
+        df = df.filter(
+            ~pl.col(source_col).is_in(overlap_list)
+            & ~pl.col(target_col).is_in(overlap_list)
+        )
+        n_dropped = rows_before - len(df)
+        warnings.warn(
+            f"bipartite_overlap='drop': removed {len(overlap)} overlap node(s) "
+            f"and {n_dropped} edge(s) (sample: {sample}). Graph is now "
+            f"strictly bipartite."
+        )
+        return df, False
+
+    # policy == "warn"
+    warnings.warn(
+        f"bipartite_overlap='warn': {len(overlap)} node(s) appear in both "
+        f"source and target columns (sample: {sample}). Graph is not "
+        f"strictly bipartite — downstream projection results on these "
+        f"nodes may be ambiguous."
+    )
+    return df, True
 
 
 def _validate_bipartite_structure(

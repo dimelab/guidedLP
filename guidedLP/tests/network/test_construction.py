@@ -689,6 +689,86 @@ class TestIntegrationScenarios:
         assert graph.weight(smith_id, jones_id) == 2.0
 
 
+class TestBipartiteOverlapPolicy:
+    """Test the bipartite_overlap kwarg of build_graph_from_edgelist.
+
+    Real-world bipartite-ish edgelists routinely have a small number of
+    nodes that bleed into both columns (a hashtag named after a user, an
+    author ID that collides with a paper ID, etc.). The kwarg lets callers
+    choose how strict to be.
+    """
+
+    def _overlap_edges(self):
+        # 4 source-only nodes, 3 target-only nodes, plus "shared" in both.
+        return pl.DataFrame({
+            "user":    ["u1", "u2", "u3", "u4", "shared", "u1"],
+            "tag":     ["#a", "#b", "#a", "#c", "#a",      "shared"],
+        })
+
+    def test_default_raises_on_overlap(self):
+        edges = self._overlap_edges()
+        from guidedLP.common.exceptions import GraphConstructionError
+        with pytest.raises(GraphConstructionError, match="not bipartite"):
+            build_graph_from_edgelist(
+                edges, source_col="user", target_col="tag", bipartite=True,
+            )
+
+    def test_drop_removes_overlap_edges(self):
+        edges = self._overlap_edges()
+        with pytest.warns(UserWarning, match="removed 1 overlap node"):
+            graph, mapper = build_graph_from_edgelist(
+                edges,
+                source_col="user", target_col="tag",
+                bipartite=True, bipartite_overlap="drop",
+            )
+        # "shared" appears in both columns — every edge touching it (2 rows)
+        # is dropped. 4 valid edges remain (u1-#a, u2-#b, u3-#a, u4-#c).
+        assert graph.numberOfEdges() == 4
+        # mapper now has 4 users + 3 tags = 7 nodes; "shared" is gone.
+        assert not mapper.has_original("shared")
+        # Partitions are clean (no overlap recorded).
+        assert mapper.has_bipartite_partitions()
+        assert mapper.source_partition_originals.isdisjoint(
+            mapper.target_partition_originals
+        )
+
+    def test_warn_keeps_overlap(self):
+        edges = self._overlap_edges()
+        with pytest.warns(UserWarning, match="not strictly bipartite"):
+            graph, mapper = build_graph_from_edgelist(
+                edges,
+                source_col="user", target_col="tag",
+                bipartite=True, bipartite_overlap="warn",
+            )
+        # All 6 edges preserved.
+        assert graph.numberOfEdges() == 6
+        # "shared" appears in BOTH recorded partitions.
+        assert "shared" in mapper.source_partition_originals
+        assert "shared" in mapper.target_partition_originals
+
+    def test_invalid_policy_raises(self):
+        edges = self._overlap_edges()
+        from guidedLP.common.exceptions import ConfigurationError
+        with pytest.raises(ConfigurationError, match="Invalid bipartite_overlap"):
+            build_graph_from_edgelist(
+                edges,
+                source_col="user", target_col="tag",
+                bipartite=True, bipartite_overlap="nonsense",
+            )
+
+    def test_drop_no_overlap_is_noop(self):
+        """When there's no overlap, drop mode should behave identically to raise."""
+        edges = pl.DataFrame({
+            "user": ["u1", "u2", "u3"],
+            "tag":  ["#a", "#b", "#c"],
+        })
+        graph, mapper = build_graph_from_edgelist(
+            edges, source_col="user", target_col="tag",
+            bipartite=True, bipartite_overlap="drop",
+        )
+        assert graph.numberOfEdges() == 3
+
+
 class TestBipartiteSourceTargetSemantics:
     """Regression tests for the source/target partition labelling bug.
 
