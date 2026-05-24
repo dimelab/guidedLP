@@ -14,62 +14,31 @@ This project provides efficient network analysis capabilities with a focus on **
 - Python 3.9 or higher
 - Git (for development installation)
 
-### Installation
-
-Install the package directly with pip:
+### Install
 
 ```bash
 # Clone the repository
 git clone https://github.com/alterpublics/guided-label-propagation.git
 cd guided-label-propagation/guidedLP
 
-# Install the package in development mode
+# Install in development mode
 pip install -e .
 
-# Or install dependencies separately if needed
-pip install -r requirements.txt
-```
-
-### Development Setup
-
-For development work:
-
-```bash
-# Install development dependencies  
-pip install pytest pytest-cov ruff black mypy
+# Or install with optional extras (dev tooling, docs, visualization)
+pip install -e ".[dev]"
+pip install -e ".[docs]"
+pip install -e ".[viz]"
+pip install -e ".[dev,docs,viz]"   # all three
 ```
 
 ### Verify Installation
 
-After installation, you can verify everything works correctly:
-
 ```bash
+# Run the post-install smoke test from the repo root
 python test_installation.py
-```
 
-This will test all key functionality and confirm your installation is working properly.
-
-# Or install with all optional dependencies
-pip install -e ".[dev,docs,viz]"
-```
-
-### Optional Dependencies
-
-```bash
-# For visualization capabilities
-pip install "guided-label-propagation[viz]"
-
-# For development and testing
-pip install "guided-label-propagation[dev]"
-
-# For documentation building
-pip install "guided-label-propagation[docs]"
-```
-
-### Verify Installation
-
-```bash
-python -c "import guided_lp; print('Installation successful!')"
+# Or just check the package imports
+python -c "import guidedLP; print('Installation successful!')"
 ```
 
 ## Quick Start
@@ -86,44 +55,282 @@ edges = pl.read_csv("network_data.csv")
 
 # Build network
 graph, id_mapper = build_graph_from_edgelist(
-    edges, 
-    source_col="user_a", 
+    edges,
+    source_col="user_a",
     target_col="user_b",
-    weight_col="weight"  # optional
+    weight_col="weight",  # optional
 )
 
-# Define seed nodes for each community
-seed_nodes = {
-    "progressive": ["user123", "user456", "user789"],
-    "conservative": ["user321", "user654", "user987"]
-}
+# Seed nodes can be supplied in any of four shapes — pick whichever is
+# convenient. They all get normalized internally to {node_id: label}.
+
+# (1) node_id -> label  (canonical)
+seeds = {"user123": "progressive", "user321": "conservative"}
+
+# (2) label -> [node_ids]
+# seeds = {
+#     "progressive": ["user123", "user456", "user789"],
+#     "conservative": ["user321", "user654", "user987"],
+# }
+
+# (3) polars.DataFrame with `node_id` and `label` columns
+# seeds = pl.read_csv("seeds.csv")
+
+# (4) pandas.DataFrame with `node_id` and `label` columns
+# import pandas as pd
+# seeds = pd.read_csv("seeds.csv")
 
 # Run Guided Label Propagation
 results = guided_label_propagation(
     graph=graph,
-    seeds=seed_nodes,
     id_mapper=id_mapper,
+    seed_labels=seeds,
+    labels=["progressive", "conservative"],
+    alpha=0.85,
     max_iterations=100,
-    threshold=0.01
+    convergence_threshold=1e-6,
 )
 
-# Export results
-export_results(results, "political_affiliation_scores.csv")
 print(f"Classified {len(results)} nodes with community probabilities")
 ```
 
-# Build graph and run GLP
-graph, id_mapper = build_graph_from_edgelist(edges, "source", "target", "weight")
-results = guided_label_propagation(graph, seed_nodes, id_mapper)
+## Graph or DataFrame: pick your shape
 
-print(f"Sample analysis complete: {len(results)} nodes classified")
-```
+`apply_backbone`, `filter_graph`, and `project_bipartite` all accept **either** a NetworkIt graph **or** a Polars edge frame with columns `source_id`, `target_id`, `weight`. The output type defaults to matching the input but can be forced with `output_format="graph"` or `output_format="dataframe"`.
 
+Supported combos:
 
+| Input → Output | When to use |
+|---|---|
+| `graph → graph` (default for graph in) | Existing workflows — nothing changes. |
+| `graph → dataframe` | Inspect or chain a result in Polars without rebuilding. |
+| `frame → frame`  (default for frame in) | Stay in dataframe land — chain filtering, backboning, projection without ever building a graph. Faster when you don't need NetworkIt's traversals between steps. |
+| `frame → graph` | Not supported — call `build_graph_from_edgelist()` on the returned frame instead. |
+
+Two utilities bridge the two worlds:
+
+- `build_graph_from_edgelist(df, …)` — frame → graph
+- `graph_to_edges(graph, mapper)` — graph → frame (originals, ready for the dataframe path)
+
+Functions that genuinely *need* graph traversal (`filter_by_seed_proximity`, the `"giant_component_only"` / `"centrality"` filters in `filter_graph`, all GLP propagation and centrality algorithms) only accept graph input; they'll raise a clear error if handed a frame, naming the conversion utility to call.
 
 ## Examples
 
-### 1. Political Affiliation Analysis
+### 1. Backboning Before Propagation
+
+Both **bipartite** and **unipartite** graphs can be backboned, but the statistical test should match the graph type:
+
+- **Bipartite** (users ↔ items) — use `method="bipartite_svn"` (Tumminello et al. 2011). For each edge, tests whether the observed weight exceeds the expectation under a configuration-model null preserving node strengths. Filters out edges to generic high-degree items naturally, with no degree threshold to tune.
+- **Unipartite weighted** (user ↔ user, etc.) — use `method="disparity"` (Serrano et al. 2009). For each edge, tests whether its weight is statistically over-represented relative to its endpoints' other ties. Requires meaningful weight variance.
+
+Apply backboning when the graph has many incidental edges that dilute propagation, or when you need to cut compute time on a very large network. Skip it for already-sparse graphs and when weak edges *are* the signal.
+
+```python
+from guidedLP.network.construction import build_graph_from_edgelist, project_bipartite
+from guidedLP.network.backboning import apply_backbone
+from guidedLP.glp.propagation import guided_label_propagation
+from guidedLP.glp.utils import check_seed_coverage
+
+# ── BIPARTITE: user ↔ hashtag, then project onto users ────────────────────
+bipartite, full_mapper = build_graph_from_edgelist(
+    edges, source_col="user", target_col="hashtag", weight_col="count",
+    bipartite=True,
+)
+# Filter generic hashtags out of the bipartite layer BEFORE projecting,
+# so the projection step gets cheaper too.
+backbone, backbone_mapper = apply_backbone(
+    bipartite, full_mapper,
+    method="bipartite_svn",
+    alpha=0.05,
+    correction="fdr_bh",   # Benjamini-Hochberg FDR (default); scales to |E| in the millions.
+                           # "bonferroni" is too conservative at scale; "none" disables correction.
+)
+user_graph, user_mapper = project_bipartite(
+    backbone, backbone_mapper, projection_mode="source", weight_method="jaccard",
+)
+
+# ── UNIPARTITE: weighted retweet network ──────────────────────────────────
+# Disparity filter expects meaningful weight variance.
+graph, id_mapper = build_graph_from_edgelist(edges, "user_a", "user_b", "weight")
+backbone, backbone_mapper = apply_backbone(
+    graph, id_mapper, method="disparity", alpha=0.05,
+)
+
+# ── Common follow-up: check seed survival, then propagate ─────────────────
+seeds = {"@aoc": "left", "@realdonaldtrump": "right"}
+report = check_seed_coverage(backbone_mapper, seeds)
+print(f"Seeds surviving backbone: {report['train']['present']}/{report['train']['total']}")
+seeds = {k: v for k, v in seeds.items() if backbone_mapper.has_original(k)}
+
+results = guided_label_propagation(
+    graph=backbone, id_mapper=backbone_mapper,
+    seed_labels=seeds, labels=["left", "right"],
+)
+```
+
+Other methods: `method="weight"` (threshold + `target_edges=N`) or `method="degree"` (keep top-N by degree + `target_nodes=N`) — simpler but require manual tuning.
+
+### 2. Seed-Centered Filtering Before Propagation
+
+`filter_by_seed_proximity` prunes a graph to a neighborhood around your seed set — the local-relevance counterpart to backboning. Useful when seeds cover one part of a much larger graph and you want to run GLP on a manageable region without losing local structure.
+
+Three methods, all returning `(graph, id_mapper)` so they can be chained:
+
+| Method | What it does | Pick when |
+|---|---|---|
+| `"khop"` (default) | BFS up to `hops` levels from the seed set. | You want a predictable, bounded neighborhood. Watch hub explosion at hops≥2. |
+| `"ppr"` | Personalized PageRank from seeds; keep `top_n` and/or above `min_ppr`. | You're about to run GLP — same `αPF + (1−α)Y` kernel, so the filter is internally consistent with the propagation. |
+| `"lte"` | NetworkIt's `LocalTightnessExpansion` from the seed set. | Seeds sit inside a tight community and you want the filter to find its boundary. |
+
+```python
+from guidedLP.network.filtering import filter_by_seed_proximity
+
+seeds = ["@aoc", "@berniesanders", "@realdonaldtrump", "@tedcruz"]
+
+# k-hop
+g_sub, m_sub = filter_by_seed_proximity(graph, mapper, seeds, method="khop", hops=2)
+
+# PPR with a top-N cap
+g_sub, m_sub = filter_by_seed_proximity(graph, mapper, seeds, method="ppr", top_n=5000)
+
+# Chain: cap hub explosion with k-hop, then trim to the tight core with LTE
+g_hop, m_hop  = filter_by_seed_proximity(graph, mapper, seeds, method="khop", hops=3)
+g_core, m_core = filter_by_seed_proximity(g_hop, m_hop, seeds, method="lte")
+```
+
+Seeds accept a list/tuple/set or a polars DataFrame (column name via `seed_column`, default `"node_id"`). For directed graphs, `direction={"out", "in", "both"}` controls edge following for `"khop"` and `"ppr"`. The returned graph always has contiguous internal IDs, so it's ready to feed straight into GLP.
+
+### 3. Bipartite to Unipartite Projection
+
+Many computational social science datasets are naturally **bipartite** — users connected to hashtags, authors to papers, accounts to URLs. GLP runs on a unipartite graph, so the usual preprocessing is to project onto the partition where your seeds live: two users get connected if they share items in the other partition.
+
+```python
+from guidedLP.network.construction import build_graph_from_edgelist, project_bipartite
+
+# Bipartite edge list: user → hashtag uses
+bipartite, full_mapper = build_graph_from_edgelist(
+    edges, source_col="user", target_col="hashtag", weight_col="count",
+    bipartite=True,
+)
+
+# Project onto users. jaccard normalizes so a power user doesn't look
+# similar to everyone; use "count" for raw shared-neighbor count, or
+# "overlap" (|A∩B|/min(|A|,|B|)) when one set is contained in the other.
+user_graph, user_mapper = project_bipartite(
+    bipartite, full_mapper, projection_mode="source", weight_method="jaccard",
+)
+
+# Seeds must refer to nodes in the projected partition (here: users).
+# The new mapper contains only users — verify with check_seed_coverage(user_mapper, seeds).
+```
+
+For temporal bipartite data where edge order matters (A shared an item before B → B may attribute back to A), use `temporal_bipartite_to_unipartite` instead. It produces a *directed* unipartite graph using **citation convention**: edges point from later sharer → earlier sharer, so PageRank / HITS-Authority naturally surface the original sources. The function trusts your row order — pre-sort the edgelist by intermediate column ascending, then timestamp descending.
+
+### 4. Frame-Native Pipeline (No Graph Until the End)
+
+For real-world social-media style data — bipartite edges (users ↔ hashtags / URLs / domains) that you need to filter, backbone, project, and re-backbone before feeding to GLP — keep everything on a Polars frame and only materialise a NetworkIt graph at the very last step. Each frame-to-graph round trip costs an `iterEdges` walk in one direction and an `addEdge` loop in the other; on a million-edge network those loops dominate every per-stage runtime. Skipping them between stages is the whole point of the dual-input API.
+
+The pipeline below mirrors a common social-CSS preprocessing chain — **prune low-activity users → bipartite SVN → project to user-user → unipartite disparity → GLP**. Every stage operates on a frame; the only graph built is the final user-user graph that GLP consumes.
+
+```python
+import polars as pl
+from guidedLP.network.backboning import apply_backbone
+from guidedLP.network.construction import build_graph_from_edgelist, project_bipartite
+from guidedLP.glp.propagation import guided_label_propagation
+from guidedLP.glp.utils import check_seed_coverage
+
+# Load raw bipartite edges. Whatever column names you already have, just
+# normalise to source_id / target_id / weight (the schema all frame-mode
+# functions in this library expect).
+edges = pl.read_csv("user_hashtag_counts.csv").rename({
+    "user": "source_id",
+    "hashtag": "target_id",
+    "count": "weight",
+})
+
+# ── Step 1: min_source_degree filter ──────────────────────────────────────
+# Drop users with fewer than 5 distinct hashtags. There isn't a partition-
+# aware filter in `filter_graph` (its `min_degree` counts both sides), so we
+# just express it directly in Polars — this is the kind of glue step the
+# frame-native pipeline makes painless.
+src_deg = (
+    edges.group_by("source_id")
+        .agg(pl.col("target_id").n_unique().alias("deg"))
+)
+high_deg_users = src_deg.filter(pl.col("deg") >= 5)["source_id"].to_list()
+edges = edges.filter(pl.col("source_id").is_in(high_deg_users))
+
+# ── Step 2: bipartite backbone ────────────────────────────────────────────
+# Remove edges to generic high-frequency hashtags. SVN returns the per-edge
+# frame with a `kept` column; advance to the next step with only the kept
+# rows.
+edges = apply_backbone(
+    edges,
+    method="bipartite_svn", alpha=0.05, correction="fdr_bh",
+    directed=False,
+)
+edges = edges.filter(pl.col("kept"))
+
+# ── Step 3: project bipartite → unipartite ────────────────────────────────
+# Connect users who share hashtags. Jaccard normalises so a power user
+# doesn't end up artificially similar to everyone.
+user_edges = project_bipartite(
+    edges,
+    projection_mode="source", weight_method="jaccard",
+)
+
+# ── Step 4: unipartite backbone ───────────────────────────────────────────
+# A second backbone on the projection is good practice — the projection
+# step inflates edge counts (every shared hashtag becomes a user-user edge)
+# and disparity prunes the resulting noise.
+user_edges = apply_backbone(
+    user_edges,
+    method="disparity", alpha=0.05, directed=False,
+)
+user_edges = user_edges.filter(pl.col("kept"))
+
+# ── Step 5: build the graph (only now!) and run GLP ───────────────────────
+user_graph, user_mapper = build_graph_from_edgelist(
+    user_edges,
+    source_col="source_id", target_col="target_id", weight_col="weight",
+)
+
+seeds = {"@aoc": "left", "@berniesanders": "left",
+         "@realdonaldtrump": "right", "@tedcruz": "right"}
+
+# Some seeds may not survive the filtering chain; drop missing ones first.
+report = check_seed_coverage(user_mapper, seeds)
+print(f"Seeds surviving the pipeline: "
+      f"{report['train']['present']}/{report['train']['total']}")
+seeds = {k: v for k, v in seeds.items() if user_mapper.has_original(k)}
+
+results = guided_label_propagation(
+    graph=user_graph, id_mapper=user_mapper,
+    seed_labels=seeds, labels=["left", "right"],
+)
+```
+
+**Mixing shapes within a pipeline.** If you already have a graph but want to peek at an intermediate result as a frame, pass `output_format="dataframe"`:
+
+```python
+# Inspect a backbone without losing the original graph
+edges_df = apply_backbone(
+    graph, id_mapper, method="disparity", alpha=0.05,
+    output_format="dataframe",
+)
+strongest = edges_df.filter(pl.col("kept")).sort("alpha_score").head(20)
+```
+
+And to go the other way — from an existing graph into the dataframe pipeline — use `graph_to_edges`:
+
+```python
+from guidedLP.network.construction import graph_to_edges
+
+edges = graph_to_edges(graph, id_mapper)   # source_id, target_id, weight (originals)
+edges = apply_backbone(edges, method="noise_corrected", threshold=1.0, directed=False)
+```
+
+### 5. Political Affiliation Analysis
 
 ```python
 # Analyze political leaning in social networks
@@ -153,7 +360,7 @@ accuracy, metrics = train_test_split_validation(
 print(f"Political classification accuracy: {accuracy:.3f}")
 ```
 
-### 2. Temporal Network Analysis
+### 6. Temporal Network Analysis
 
 ```python
 # Track community evolution over time
@@ -163,21 +370,24 @@ from guidedLP.timeseries.temporal_metrics import extract_temporal_metrics
 # Load temporal network data
 temporal_data = pl.read_csv("tests/fixtures/sample_temporal.csv")
 
-# Create time slices
-time_slices = create_time_slices(
+# Create time slices (daily). slice_interval also accepts "weekly"/"monthly"/"yearly".
+time_slices = create_temporal_slices(
     temporal_data,
-    time_col="timestamp",
-    slice_duration="1d"  # daily slices
+    timestamp_col="timestamp",
+    slice_interval="daily",
 )
 
+seeds = {"@aoc": "left", "@realdonaldtrump": "right"}
+
 # Analyze each time slice
-for date, slice_edges in time_slices.items():
-    graph, id_mapper = build_graph_from_edgelist(
-        slice_edges, "source", "target", "weight"
+for slice_date, slice_graph, slice_mapper in time_slices:
+    results = guided_label_propagation(
+        graph=slice_graph,
+        id_mapper=slice_mapper,
+        seed_labels=seeds,
+        labels=["left", "right"],
     )
-    
-    results = guided_label_propagation(graph, seeds, id_mapper)
-    print(f"{date}: {len(results)} nodes classified")
+    print(f"{slice_date}: {len(results)} nodes classified")
 ```
 
 

@@ -49,15 +49,17 @@ def test_installation():
         print(f"❌ Basic functionality failed: {e}")
         return False
     
-    # Test 3: Temporal bipartite conversion
+    # Test 3: Temporal bipartite conversion (citation convention)
     print("\nTest 3: Temporal bipartite conversion...")
     try:
+        # The function trusts caller's row order — pre-sort by intermediate
+        # ascending, then timestamp DESCENDING (latest first per item).
         temporal_data = pl.DataFrame({
             "user": ["Alice", "Bob"],
             "item": ["X", "X"],
             "timestamp": ["2024-01-01 09:00", "2024-01-01 11:00"]
-        })
-        
+        }).sort(["item", "timestamp"], descending=[False, True])
+
         temporal_graph, temporal_mapper = temporal_bipartite_to_unipartite(
             temporal_data,
             source_col="user",
@@ -66,11 +68,23 @@ def test_installation():
             intermediate_col="item",
             projected_col="user"
         )
-        
-        if temporal_graph.numberOfNodes() == 2 and temporal_graph.numberOfEdges() == 1:
-            print("✅ Temporal bipartite conversion works")
+
+        # Expect Bob (later) → Alice (earlier) in citation convention.
+        bob_internal = temporal_mapper.get_internal("Bob")
+        alice_internal = temporal_mapper.get_internal("Alice")
+        has_bob_to_alice = temporal_graph.hasEdge(bob_internal, alice_internal)
+
+        if (temporal_graph.numberOfNodes() == 2
+            and temporal_graph.numberOfEdges() == 1
+            and has_bob_to_alice):
+            print("✅ Temporal bipartite conversion works (citation direction)")
         else:
-            print("❌ Temporal bipartite conversion failed")
+            print(
+                f"❌ Temporal bipartite conversion failed: "
+                f"nodes={temporal_graph.numberOfNodes()}, "
+                f"edges={temporal_graph.numberOfEdges()}, "
+                f"bob→alice={has_bob_to_alice}"
+            )
             return False
             
     except Exception as e:
