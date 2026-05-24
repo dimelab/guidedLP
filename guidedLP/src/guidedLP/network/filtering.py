@@ -214,6 +214,7 @@ def apply_backbone(
     alpha: float = 0.05,
     keep_disconnected: bool = False,
     correction: str = "fdr_bh",
+    node_level: bool = False,
     verbose: bool = True,
 ) -> Tuple[nk.Graph, IDMapper]:
     """
@@ -253,9 +254,24 @@ def apply_backbone(
         cutoff (typical range: 0.01–0.05).
     keep_disconnected : bool, default False
         Whether to keep isolated nodes after edge filtering
+    node_level : bool, default False
+        Only used by ``method="bipartite_svn"``. Controls whether the SVN
+        decision is made per-edge or per-node:
+
+        - ``False`` (default): each edge gets its own significance test;
+          edges with high p-values are dropped. Generic nodes typically
+          keep many of their edges and survive in the result.
+        - ``True``: edges' p-values are combined per node via Fisher's
+          method (``-2·Σ log p_i ~ χ²(2k)``), giving a single p-value per
+          node. The correction is then applied across nodes (not edges),
+          and entire nodes are kept or dropped. This is the right mode when
+          you want to eliminate generic high-degree nodes rather than just
+          trim their fringes. No extra threshold to tune — reuses ``alpha``
+          and ``correction``.
     correction : str, default "fdr_bh"
         Only used by ``method="bipartite_svn"``. Multiple-testing correction
-        applied to the per-edge p-values:
+        applied to the per-edge or per-node p-values (depending on
+        ``node_level``):
 
         - ``"fdr_bh"`` (default, recommended): Benjamini-Hochberg false
           discovery rate. Controls the expected proportion of false
@@ -368,7 +384,8 @@ def apply_backbone(
                         f"Expected 'fdr_bh', 'bonferroni', or 'none'."
                     )
                 backbone_graph, updated_mapper = _apply_bipartite_svn_filter(
-                    graph, id_mapper, alpha, correction, keep_disconnected
+                    graph, id_mapper, alpha, correction,
+                    keep_disconnected, node_level,
                 )
             else:
                 raise ValidationError(f"Unsupported backbone method: {method}")
@@ -849,6 +866,7 @@ def _apply_bipartite_svn_filter(
     alpha: float,
     correction: str,
     keep_disconnected: bool,
+    node_level: bool = False,
 ) -> Tuple[nk.Graph, IDMapper]:
     """
     Tumminello et al. (2011) Statistically Validated Network filter for
@@ -926,28 +944,42 @@ def _apply_bipartite_svn_filter(
         # Unweighted: observed weight is 1, so P(X ≥ 1) = 1 - exp(-μ).
         p_values = -np.expm1(-mu)  # numerically stable 1 - exp(-mu)
 
-    # Apply multiple-testing correction.
-    if correction == "bonferroni":
-        keep_mask = p_values <= (alpha / n_edges)
-    elif correction == "fdr_bh":
-        keep_mask = _benjamini_hochberg_mask(p_values, alpha)
-    elif correction == "none":
-        keep_mask = p_values <= alpha
-    else:
-        # Defensive: apply_backbone validates this upstream, but be safe.
-        raise ValidationError(
-            f"Invalid correction: {correction!r}. "
-            f"Expected 'fdr_bh', 'bonferroni', or 'none'."
+    # Choose between edge-level filtering (default) and node-level filtering
+    # (Fisher-combined p-values per node, correction applied across nodes).
+    # node_keep_mask is None for edge-level mode; non-None for node-level.
+    node_keep_mask: Optional[np.ndarray] = None
+    if node_level:
+        keep_mask, node_keep_mask, n_kept = _svn_node_level_mask(
+            p_values, u_arr, v_arr, n_nodes, alpha, correction,
         )
-
-    n_kept = int(keep_mask.sum())
-
-    logger.info(
-        "Bipartite SVN filter: weighted=%s, alpha=%.3g, correction=%s — "
-        "kept %d/%d edges (%.1f%%)",
-        is_weighted_effective, alpha, correction,
-        n_kept, n_edges, 100.0 * n_kept / n_edges if n_edges else 0.0,
-    )
+        logger.info(
+            "Bipartite SVN filter (node-level): weighted=%s, alpha=%.3g, "
+            "correction=%s — kept %d/%d nodes, %d/%d edges (%.1f%%)",
+            is_weighted_effective, alpha, correction,
+            int(node_keep_mask.sum()), n_nodes,
+            n_kept, n_edges,
+            100.0 * n_kept / n_edges if n_edges else 0.0,
+        )
+    else:
+        if correction == "bonferroni":
+            keep_mask = p_values <= (alpha / n_edges)
+        elif correction == "fdr_bh":
+            keep_mask = _benjamini_hochberg_mask(p_values, alpha)
+        elif correction == "none":
+            keep_mask = p_values <= alpha
+        else:
+            # Defensive: apply_backbone validates this upstream, but be safe.
+            raise ValidationError(
+                f"Invalid correction: {correction!r}. "
+                f"Expected 'fdr_bh', 'bonferroni', or 'none'."
+            )
+        n_kept = int(keep_mask.sum())
+        logger.info(
+            "Bipartite SVN filter (edge-level): weighted=%s, alpha=%.3g, "
+            "correction=%s — kept %d/%d edges (%.1f%%)",
+            is_weighted_effective, alpha, correction,
+            n_kept, n_edges, 100.0 * n_kept / n_edges if n_edges else 0.0,
+        )
 
     # Build the backbone graph.
     backbone_graph = nk.Graph(
@@ -961,11 +993,22 @@ def _apply_bipartite_svn_filter(
         else:
             backbone_graph.addEdge(int(u), int(v))
 
-    # Drop isolated nodes unless asked to keep them.
+    # Under node-level mode, nodes that the SVN test rejected must be removed
+    # regardless of keep_disconnected (the user explicitly asked to drop them).
+    # keep_disconnected then only controls whether *SVN-kept* nodes that became
+    # isolated as a side-effect (their neighbours were rejected) stay in or out.
+    if node_keep_mask is not None:
+        rejected = [
+            node for node in range(backbone_graph.numberOfNodes())
+            if not node_keep_mask[node]
+        ]
+        for node in rejected:
+            backbone_graph.removeNode(node)
+
     if not keep_disconnected:
         nodes_to_remove = [
             node for node in range(backbone_graph.numberOfNodes())
-            if backbone_graph.degree(node) == 0
+            if backbone_graph.hasNode(node) and backbone_graph.degree(node) == 0
         ]
         for node in nodes_to_remove:
             backbone_graph.removeNode(node)
@@ -1002,6 +1045,82 @@ def _apply_bipartite_svn_filter(
 def _build_empty_like(graph: nk.Graph) -> nk.Graph:
     """Create an empty graph with the same directed/weighted flags."""
     return nk.Graph(0, weighted=graph.isWeighted(), directed=graph.isDirected())
+
+
+def _svn_node_level_mask(
+    p_values: np.ndarray,
+    u_arr: np.ndarray,
+    v_arr: np.ndarray,
+    n_nodes: int,
+    alpha: float,
+    correction: str,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Node-level SVN: combine each node's edges' p-values via Fisher's method,
+    apply the chosen multiple-testing correction across nodes, and return:
+
+      (edge_keep_mask, node_keep_mask, n_edges_kept)
+
+    edge_keep_mask is True for an edge iff BOTH its endpoints survive.
+    """
+    from scipy.stats import chi2
+
+    # Fisher's combined statistic per node:
+    #     T_v = -2 · Σ_{e ∈ E(v)} ln(p_e)
+    # Under H_0 (every incident edge is null), T_v ~ χ²(2·k_v).
+    # A large T_v ⇒ small combined p-value ⇒ node carries real signal ⇒ keep.
+    #
+    # Edges contribute to BOTH endpoints' sums (each edge has two endpoints,
+    # one per partition), which is the correct accounting because each
+    # node's test is over its own incident set.
+    p_clipped = np.clip(p_values, 1e-300, 1.0)
+    log_p = np.log(p_clipped)
+
+    log_p_sum = np.zeros(n_nodes, dtype=np.float64)
+    np.add.at(log_p_sum, u_arr, log_p)
+    np.add.at(log_p_sum, v_arr, log_p)
+
+    node_degree = np.zeros(n_nodes, dtype=np.int64)
+    np.add.at(node_degree, u_arr, 1)
+    np.add.at(node_degree, v_arr, 1)
+
+    T = -2.0 * log_p_sum
+    dof = 2 * node_degree
+
+    # Nodes with degree 0 (e.g. dangling from keep_disconnected upstream) get
+    # a non-significant placeholder p so they aren't accidentally kept.
+    tested = node_degree > 0
+    node_p_values = np.full(n_nodes, 1.0, dtype=np.float64)
+    if tested.any():
+        with np.errstate(invalid="ignore"):
+            node_p_values[tested] = chi2.sf(T[tested], dof[tested])
+
+    # Apply correction across the TESTED nodes only.
+    n_tested = int(tested.sum())
+    node_keep_mask = np.zeros(n_nodes, dtype=bool)
+    if n_tested == 0:
+        return (
+            np.zeros(p_values.shape[0], dtype=bool),
+            node_keep_mask,
+            0,
+        )
+
+    tested_p = node_p_values[tested]
+    if correction == "bonferroni":
+        tested_keep = tested_p <= (alpha / n_tested)
+    elif correction == "fdr_bh":
+        tested_keep = _benjamini_hochberg_mask(tested_p, alpha)
+    elif correction == "none":
+        tested_keep = tested_p <= alpha
+    else:
+        raise ValidationError(
+            f"Invalid correction: {correction!r}. "
+            f"Expected 'fdr_bh', 'bonferroni', or 'none'."
+        )
+    node_keep_mask[tested] = tested_keep
+
+    # An edge survives iff BOTH endpoints are kept.
+    edge_keep_mask = node_keep_mask[u_arr] & node_keep_mask[v_arr]
+    return edge_keep_mask, node_keep_mask, int(edge_keep_mask.sum())
 
 
 def _benjamini_hochberg_mask(p_values: np.ndarray, alpha: float) -> np.ndarray:

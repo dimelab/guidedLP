@@ -236,18 +236,28 @@ print(f"Bipartite:   {bipartite.numberOfNodes():>6} nodes, {bipartite.numberOfEd
 # Statistically Validated Network filter on the bipartite layer.
 # For each edge (u, item), test whether the observed weight is more than
 # expected under a configuration-model null preserving node strengths.
-# - alpha       = per-edge p-value cutoff (0.01–0.05 typical)
-# - correction  = multiple-testing correction across all |E| edge tests:
+# - alpha       = significance cutoff (0.01–0.05 typical)
+# - correction  = multiple-testing correction:
 #                 "fdr_bh" (default): Benjamini-Hochberg FDR — scales to
 #                                     millions of edges; recommended.
 #                 "bonferroni":       very conservative — at |E| ≥ ~10⁵
 #                                     even α = 0.99 can filter everything.
 #                 "none":             use α directly; most permissive.
+# - node_level  = whether the test decides edges or whole nodes:
+#                 False (default): per-edge test; edges with high p-values are
+#                                  dropped. Generic high-degree nodes usually
+#                                  keep many edges and survive trimmed.
+#                 True:  per-NODE test via Fisher's combined p-value
+#                        (−2·Σ log p_i ~ χ²(2k)); entire nodes whose overall
+#                        connectivity is unremarkable are removed. Use this
+#                        when you want to *eliminate* generic items rather
+#                        than just trim them.
 backbone, backbone_mapper = apply_backbone(
     bipartite, full_mapper,
     method="bipartite_svn",
     alpha=0.05,
-    correction="fdr_bh",      # try "none" first on small/exploratory graphs
+    correction="fdr_bh",
+    node_level=True,          # set False for the lighter edge-only filter
     keep_disconnected=False,
 )
 print(f"Backbone:    {backbone.numberOfNodes():>6} nodes, {backbone.numberOfEdges():>8} edges")
@@ -272,7 +282,15 @@ results = guided_label_propagation(
 )
 ```
 
-The `bipartite_svn` filter has only one knob (`alpha`) plus the `correction` choice. Generic targets get filtered out automatically because high-degree nodes have high *expected* weight under the null — no degree threshold to tune. The default `correction="fdr_bh"` (Benjamini-Hochberg) is the one you'll want for any real-size graph; `"bonferroni"` is only sensible for thousands (not millions) of edges, because Bonferroni divides α by |E| and that bar becomes impossibly strict at scale.
+The `bipartite_svn` filter exposes three knobs — `alpha`, `correction`, and `node_level` — all with sensible defaults:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `alpha` | `0.05` | Significance cutoff. Tighter (e.g. `0.01`) keeps fewer edges/nodes. |
+| `correction` | `"fdr_bh"` | Benjamini-Hochberg FDR. Use `"bonferroni"` only on small graphs (thousands of edges); on millions it filters everything. `"none"` disables correction entirely. |
+| `node_level` | `False` | When `True`, combines each node's incident edges' p-values via Fisher's method and tests *nodes* for significance. Drops entire generic-noise nodes rather than just trimming them. Recommended when you want to eliminate the generic items, not just thin their fringes. |
+
+Generic targets get filtered out automatically because high-degree nodes have high *expected* weight under the null — no degree threshold to tune. The `node_level=True` mode is the stronger option: a generic item whose every edge has a high p-value will have a non-significant Fisher-combined p and gets removed entirely.
 
 #### Unipartite case — `disparity` (Serrano et al. 2009)
 
