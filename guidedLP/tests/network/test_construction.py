@@ -260,13 +260,60 @@ class TestEdgeCases:
             "source": [],
             "target": []
         })
-        
+
         with pytest.warns(UserWarning, match="Empty edge list"):
             graph, id_mapper = build_graph_from_edgelist(empty_edges)
-        
+
         assert graph.numberOfNodes() == 0
         assert graph.numberOfEdges() == 0
         assert id_mapper.size() == 0
+
+    def test_null_source_target_rows_dropped(self):
+        """Rows with null source or target should be silently dropped."""
+        edges = pl.DataFrame({
+            "source": ["A", "B", None, "D", "A"],
+            "target": ["B", None, "C", "E", "B"],
+        })
+        with pytest.warns(UserWarning, match="Dropped 2 edge"):
+            graph, mapper = build_graph_from_edgelist(edges)
+        # 3 valid edges: A-B, D-E, and A-B again (duplicate collapses to 1 edge)
+        # since auto_weight is True with duplicates, count becomes 2 for A-B
+        assert graph.numberOfNodes() == 4  # A, B, D, E
+        # Edges: A-B (with weight 2 from auto_weight), D-E
+        assert graph.numberOfEdges() == 2
+
+    def test_null_weight_rows_dropped(self):
+        """When weight_col is set, rows with null weight are also dropped."""
+        edges = pl.DataFrame({
+            "source": ["A", "B", "C"],
+            "target": ["B", "C", "D"],
+            "weight": [1.0, None, 2.0],
+        })
+        with pytest.warns(UserWarning, match="Dropped 1 edge"):
+            graph, mapper = build_graph_from_edgelist(edges, weight_col="weight")
+        assert graph.numberOfEdges() == 2
+
+    def test_null_weight_ignored_when_no_weight_col(self):
+        """If weight_col is not specified, nulls in a 'weight' column don't trigger the drop."""
+        edges = pl.DataFrame({
+            "source": ["A", "B", "C"],
+            "target": ["B", "C", "D"],
+            "weight": [1.0, None, 2.0],  # this column isn't being used
+        })
+        # No warning about dropped rows — null weight column is irrelevant.
+        graph, mapper = build_graph_from_edgelist(edges)  # weight_col is None
+        assert graph.numberOfEdges() == 3
+
+    def test_all_null_rows_returns_empty_graph(self):
+        """If every row has a null source/target, the function falls through to empty-graph."""
+        edges = pl.DataFrame({
+            "source": [None, None, None],
+            "target": ["A", "B", "C"],
+        }, strict=False)
+        with pytest.warns(UserWarning):
+            graph, mapper = build_graph_from_edgelist(edges)
+        assert graph.numberOfNodes() == 0
+        assert graph.numberOfEdges() == 0
     
     def test_self_loops_allowed(self):
         """Test that self-loops are allowed by default."""
@@ -330,14 +377,16 @@ class TestEdgeCases:
             build_graph_from_edgelist(edges)
     
     def test_null_values_in_nodes(self):
-        """Test error handling for null node values."""
+        """Null source/target rows are now silently dropped (with a warning),
+        not treated as a hard error — covered by test_null_source_target_rows_dropped
+        above. This test stays as a stub to document the policy change."""
         edges = pl.DataFrame({
             "source": ["A", None, "C"],
-            "target": ["B", "C", "A"]
+            "target": ["B", "C", "A"],
         })
-        
-        with pytest.raises(ValidationError, match="null values"):
-            build_graph_from_edgelist(edges)
+        with pytest.warns(UserWarning, match="Dropped 1 edge"):
+            graph, mapper = build_graph_from_edgelist(edges)
+        assert graph.numberOfEdges() == 2
 
 
 class TestFileLoading:

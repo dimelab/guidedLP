@@ -128,6 +128,12 @@ def build_graph_from_edgelist(
     
     For bipartite graphs, the function validates that source and target nodes
     form completely distinct sets with no overlap.
+
+    Rows with null values in the source, target, or weight (when ``weight_col``
+    is set) columns are silently dropped before validation, with a
+    ``UserWarning`` reporting the count. This makes the function tolerant of
+    the small fraction of null cells that real-world edgelists routinely
+    accumulate from joins and missing log data.
     """
     log_function_entry("build_graph_from_edgelist", 
                       edgelist=type(edgelist).__name__, 
@@ -144,6 +150,46 @@ def build_graph_from_edgelist(
             # is a non-fatal case — the function returns an empty graph.
             if df.is_empty():
                 warnings.warn("Empty edge list provided. Creating empty graph.")
+                empty_graph = nk.Graph(0, weighted=(weight_col is not None), directed=directed)
+                empty_mapper = IDMapper()
+                return empty_graph, empty_mapper
+
+            # Step 2b: Confirm the requested columns exist BEFORE attempting
+            # any per-column operations (drop_nulls would otherwise raise a
+            # raw ColumnNotFoundError that gets wrapped as a generic
+            # GraphConstructionError, hiding the real problem).
+            required_cols = [source_col, target_col]
+            if weight_col is not None:
+                required_cols.append(weight_col)
+            missing_cols = [c for c in required_cols if c not in df.columns]
+            if missing_cols:
+                raise ValidationError(
+                    f"Missing required columns: {missing_cols}. "
+                    f"Available columns: {df.columns}"
+                )
+
+            # Step 2c: Drop rows with null source/target (and null weight if a
+            # weight column was specified). Treated as a non-fatal data-quality
+            # issue rather than a hard error — large real-world edgelists
+            # routinely contain a handful of null cells from joins or missing
+            # log data, and dropping them is the universally expected
+            # behaviour. Mirrors how check_seed_coverage handles null labels.
+            null_check_cols = [source_col, target_col]
+            if weight_col is not None:
+                null_check_cols.append(weight_col)
+            rows_before = len(df)
+            df = df.drop_nulls(subset=null_check_cols)
+            n_dropped = rows_before - len(df)
+            if n_dropped > 0:
+                warnings.warn(
+                    f"Dropped {n_dropped} edge(s) with null value(s) in "
+                    f"{null_check_cols} (from {rows_before} input rows)."
+                )
+            if df.is_empty():
+                warnings.warn(
+                    "All edges had null source/target/weight values; "
+                    "creating empty graph."
+                )
                 empty_graph = nk.Graph(0, weighted=(weight_col is not None), directed=directed)
                 empty_mapper = IDMapper()
                 return empty_graph, empty_mapper
