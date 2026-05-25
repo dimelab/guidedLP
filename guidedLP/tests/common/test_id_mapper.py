@@ -563,6 +563,84 @@ class TestIDMapperBipartitePartitions:
         assert restored.has_bipartite_partitions() is False
 
 
+class TestIDMapperFromOriginals:
+    """Test the bulk constructor IDMapper.from_originals."""
+
+    def test_basic_construction(self):
+        mapper = IDMapper.from_originals(["alice", "bob", "carol"])
+
+        assert mapper.size() == 3
+        assert mapper.get_internal("alice") == 0
+        assert mapper.get_internal("bob") == 1
+        assert mapper.get_internal("carol") == 2
+        assert mapper.get_original(0) == "alice"
+        assert mapper.get_original(1) == "bob"
+        assert mapper.get_original(2) == "carol"
+
+    def test_internal_ids_follow_input_order(self):
+        """from_originals assigns internal IDs in the input iteration order."""
+        ids = ["zeta", "alpha", "mu", "beta"]
+        mapper = IDMapper.from_originals(ids)
+        for expected_internal, original in enumerate(ids):
+            assert mapper.get_internal(original) == expected_internal
+
+    def test_round_trip_consistency(self):
+        """Every original maps back to itself via internal."""
+        ids = [f"node_{i}" for i in range(50)]
+        mapper = IDMapper.from_originals(ids)
+        for original in ids:
+            assert mapper.get_original(mapper.get_internal(original)) == original
+
+    def test_empty_input(self):
+        mapper = IDMapper.from_originals([])
+        assert mapper.size() == 0
+        assert mapper.is_empty()
+
+    def test_mixed_id_types(self):
+        ids = ["alice", 42, (1, 2), uuid.uuid4()]
+        mapper = IDMapper.from_originals(ids)
+        assert mapper.size() == 4
+        for i, original in enumerate(ids):
+            assert mapper.get_internal(original) == i
+            assert mapper.get_original(i) == original
+
+    def test_accepts_generator(self):
+        """Iterable, not just list. Generators must work."""
+        mapper = IDMapper.from_originals(f"u{i}" for i in range(5))
+        assert mapper.size() == 5
+        assert mapper.get_internal("u0") == 0
+        assert mapper.get_internal("u4") == 4
+
+    def test_equivalent_to_add_mapping_loop(self):
+        """from_originals produces dicts identical to a sequential add_mapping loop."""
+        ids = ["a", "b", "c", 10, (1, 2)]
+
+        bulk = IDMapper.from_originals(ids)
+
+        loop = IDMapper()
+        for i, original in enumerate(ids):
+            loop.add_mapping(original, i)
+
+        assert bulk.original_to_internal == loop.original_to_internal
+        assert bulk.internal_to_original == loop.internal_to_original
+
+    def test_does_not_set_bipartite_partitions(self):
+        """from_originals is partition-agnostic; partitions stay unset until explicitly recorded."""
+        mapper = IDMapper.from_originals(["a", "b", "c"])
+        assert mapper.has_bipartite_partitions() is False
+        assert mapper.source_partition_originals is None
+        assert mapper.target_partition_originals is None
+
+    def test_scales_to_many_nodes(self):
+        """Performance smoke test — should complete quickly for 100K nodes."""
+        n = 100_000
+        mapper = IDMapper.from_originals(f"node_{i}" for i in range(n))
+        assert mapper.size() == n
+        # Spot-check edges of the range
+        assert mapper.get_internal("node_0") == 0
+        assert mapper.get_internal(f"node_{n - 1}") == n - 1
+
+
 class TestIDMapperTypeHints:
     """Test type checking and hint validation."""
     

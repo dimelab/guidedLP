@@ -16,6 +16,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.edgelist import EdgeList
 from guidedLP.common.exceptions import (
     GraphConstructionError,
     ValidationError,
@@ -41,6 +42,23 @@ def _print_build_summary(
         f"[build_graph_from_edgelist] {dt:.2f}s | "
         f"{input_rows:,} input rows → "
         f"{graph.numberOfNodes():,} nodes, {graph.numberOfEdges():,} edges"
+    )
+
+
+def _print_edgelist_build_summary(
+    verbose: bool, t_start: float, input_rows: int, edge_list: "EdgeList"
+) -> None:
+    """One-line summary printed at the bottom of build_edgelist_from_frame."""
+    if not verbose:
+        return
+    import time as _time
+    dt = _time.perf_counter() - t_start
+    print(
+        f"[build_edgelist_from_frame] {dt:.2f}s | "
+        f"{input_rows:,} input rows → "
+        f"{edge_list.number_of_nodes():,} nodes, "
+        f"{edge_list.number_of_edges():,} edges "
+        f"({edge_list.code_dtype})"
     )
 
 
@@ -245,30 +263,171 @@ def build_graph_from_edgelist(
 
     import time as _time
     _t_start = _time.perf_counter()
-    _input_rows: Optional[int] = None  # filled in once we've loaded the df
-
 
     with LoggingTimer("build_graph_from_edgelist"):
         try:
-            # Step 1: Load edge list data
+            # Pre-load so we can include the input row count in the summary.
+            # build_edgelist_from_frame accepts either str or DataFrame, so
+            # passing the already-loaded frame avoids a double-load.
+            df = _load_edge_list(edgelist)
+            input_rows = len(df)
+
+            # Compose through build_edgelist_from_frame to share all the
+            # pre-encoding logic (null drop, validation, weight aggregation,
+            # bipartite overlap handling, min-degree filter, ID mapping).
+            # verbose=False suppresses the inner summary so only the
+            # graph-level one prints.
+            edge_list, id_mapper = build_edgelist_from_frame(
+                df,
+                source_col=source_col,
+                target_col=target_col,
+                weight_col=weight_col,
+                directed=directed,
+                bipartite=bipartite,
+                auto_weight=auto_weight,
+                allow_self_loops=allow_self_loops,
+                remove_duplicates=remove_duplicates,
+                bipartite_overlap=bipartite_overlap,
+                min_source_degree=min_source_degree,
+                min_target_degree=min_target_degree,
+                verbose=False,
+            )
+
+            graph, _ = edgelist_to_graph(
+                edge_list, id_mapper, chunk_size=chunk_size,
+            )
+
+            logger.info(
+                "Graph construction completed: %d nodes, %d edges, directed=%s, weighted=%s",
+                graph.numberOfNodes(), graph.numberOfEdges(), directed,
+                graph.isWeighted(),
+            )
+
+            _print_build_summary(verbose, _t_start, input_rows, graph)
+            return graph, id_mapper
+
+        except Exception as e:
+            if isinstance(e, (ValidationError, GraphConstructionError, DataFormatError, ConfigurationError)):
+                raise
+            else:
+                raise GraphConstructionError(
+                    f"Unexpected error during graph construction: {str(e)}",
+                    operation="build_graph_from_edgelist",
+                    cause=e
+                )
+
+
+def build_edgelist_from_frame(
+    edgelist: Union[str, pl.DataFrame],
+    source_col: str = "source",
+    target_col: str = "target",
+    weight_col: Optional[str] = None,
+    directed: bool = False,
+    bipartite: bool = False,
+    auto_weight: bool = True,
+    allow_self_loops: bool = True,
+    remove_duplicates: bool = False,
+    bipartite_overlap: str = "raise",
+    min_source_degree: Optional[int] = None,
+    min_target_degree: Optional[int] = None,
+    code_dtype: Any = pl.UInt32,
+    verbose: bool = True,
+) -> Tuple[EdgeList, IDMapper]:
+    """
+    Build a coded :class:`EdgeList` + paired :class:`IDMapper` from raw input.
+
+    Peer of :func:`build_graph_from_edgelist`: it runs the same loading,
+    validation, null-dropping, weight/duplicate processing, bipartite
+    overlap handling, and min-degree filtering — but instead of constructing
+    a NetworkIt graph at the end, it encodes the source/target columns into
+    fixed-width integer codes (``code_dtype``) and wraps the resulting frame
+    in an :class:`EdgeList`. Use this when you want a memory-efficient edge
+    container without paying for graph construction up front, or when an
+    operation (e.g. bipartite projection) is faster on coded edges than on
+    a NetworkIt graph.
+
+    Parameters
+    ----------
+    edgelist, source_col, target_col, weight_col, directed, bipartite, \
+    auto_weight, allow_self_loops, remove_duplicates, bipartite_overlap, \
+    min_source_degree, min_target_degree, verbose :
+        See :func:`build_graph_from_edgelist` — semantics are identical.
+    code_dtype : pl.DataType, default ``pl.UInt32``
+        Integer width for the encoded ``src``/``tgt`` columns. ``pl.UInt32``
+        supports up to ~4.29B unique nodes; pass ``pl.UInt64`` for larger
+        graphs. The chosen dtype is recorded on the returned EdgeList.
+
+    Returns
+    -------
+    edge_list : EdgeList
+        Coded edge container. ``edge_list.df`` has columns ``src``, ``tgt``
+        (both ``code_dtype``) and optional ``weight`` (``Float64``).
+    id_mapper : IDMapper
+        Bidirectional mapping between original IDs and the codes used in
+        ``edge_list.df``. Code value ``k`` corresponds to original ID
+        ``id_mapper.get_original(k)``.
+
+    Raises
+    ------
+    ValidationError
+        If edge list data is invalid, columns are missing, or the node
+        count exceeds the capacity of ``code_dtype``.
+    GraphConstructionError
+        If the underlying encoding step fails.
+    DataFormatError
+        If a file path is provided and the file cannot be read or parsed.
+
+    Examples
+    --------
+    >>> import polars as pl
+    >>> edges = pl.DataFrame({
+    ...     "source": ["A", "B", "C", "A"],
+    ...     "target": ["B", "C", "A", "B"],
+    ... })
+    >>> el, mapper = build_edgelist_from_frame(edges)
+    >>> el.number_of_nodes()
+    3
+    >>> el.code_dtype
+    UInt32
+
+    Notes
+    -----
+    Memory: ``UInt32`` codes occupy 4 bytes/value vs. ~12–40 bytes for typical
+    Utf8 node IDs, so a frame with two coded columns is roughly 6–20× smaller
+    than the original Utf8 edgelist. This is the win that makes large bipartite
+    projections tractable: the intermediate result of a hub-heavy projection
+    (which can produce hundreds of millions of edges) stays small.
+
+    Time Complexity: O(E) with one extra O(V) pass to build the IDMapper.
+    """
+    log_function_entry(
+        "build_edgelist_from_frame",
+        edgelist=type(edgelist).__name__,
+        directed=directed, bipartite=bipartite, code_dtype=str(code_dtype),
+    )
+
+    import time as _time
+    _t_start = _time.perf_counter()
+    _input_rows: Optional[int] = None
+
+    with LoggingTimer("build_edgelist_from_frame"):
+        try:
+            # Step 1: Load.
             df = _load_edge_list(edgelist)
             _input_rows = len(df)
 
-            # Step 2: Handle empty edge list BEFORE running schema validation,
-            # which would otherwise raise on the empty DataFrame and prevent
-            # the warn-and-return path below from firing. An empty edgelist
-            # is a non-fatal case — the function returns an empty graph.
+            # Step 2: Empty-input warn-and-return.
             if df.is_empty():
-                warnings.warn("Empty edge list provided. Creating empty graph.")
-                empty_graph = nk.Graph(0, weighted=(weight_col is not None), directed=directed)
+                warnings.warn("Empty edge list provided. Creating empty EdgeList.")
+                empty_el = _empty_edgelist(
+                    directed=directed, bipartite=bipartite,
+                    weighted=(weight_col is not None), code_dtype=code_dtype,
+                )
                 empty_mapper = IDMapper()
-                _print_build_summary(verbose, _t_start, _input_rows or 0, empty_graph)
-                return empty_graph, empty_mapper
+                _print_edgelist_build_summary(verbose, _t_start, _input_rows or 0, empty_el)
+                return empty_el, empty_mapper
 
-            # Step 2b: Confirm the requested columns exist BEFORE attempting
-            # any per-column operations (drop_nulls would otherwise raise a
-            # raw ColumnNotFoundError that gets wrapped as a generic
-            # GraphConstructionError, hiding the real problem).
+            # Step 2b: Required-column check before any per-column ops.
             required_cols = [source_col, target_col]
             if weight_col is not None:
                 required_cols.append(weight_col)
@@ -279,12 +438,7 @@ def build_graph_from_edgelist(
                     f"Available columns: {df.columns}"
                 )
 
-            # Step 2c: Drop rows with null source/target (and null weight if a
-            # weight column was specified). Treated as a non-fatal data-quality
-            # issue rather than a hard error — large real-world edgelists
-            # routinely contain a handful of null cells from joins or missing
-            # log data, and dropping them is the universally expected
-            # behaviour. Mirrors how check_seed_coverage handles null labels.
+            # Step 2c: Drop rows with nulls in src/tgt (and weight if specified).
             null_check_cols = [source_col, target_col]
             if weight_col is not None:
                 null_check_cols.append(weight_col)
@@ -299,26 +453,23 @@ def build_graph_from_edgelist(
             if df.is_empty():
                 warnings.warn(
                     "All edges had null source/target/weight values; "
-                    "creating empty graph."
+                    "creating empty EdgeList."
                 )
-                empty_graph = nk.Graph(0, weighted=(weight_col is not None), directed=directed)
+                empty_el = _empty_edgelist(
+                    directed=directed, bipartite=bipartite,
+                    weighted=(weight_col is not None), code_dtype=code_dtype,
+                )
                 empty_mapper = IDMapper()
-                _print_build_summary(verbose, _t_start, _input_rows or 0, empty_graph)
-                return empty_graph, empty_mapper
+                _print_edgelist_build_summary(verbose, _t_start, _input_rows or 0, empty_el)
+                return empty_el, empty_mapper
 
-            # Step 3: Validate edge list structure and data
+            # Step 3: Schema/data validation.
             _validate_edge_list(df, source_col, target_col, weight_col)
-            
-            # Step 4: Process edges (weights, duplicates, self-loops).
-            # When auto_weight is on and the user didn't pass weight_col,
-            # _process_edges injects a 'weight' column from duplicate counts.
-            # Treat the graph as weighted only when those counts actually
-            # carry information (i.e. there was at least one duplicate); for
-            # a fully-unique edgelist all counts are 1, and producing a
-            # weighted graph would be a surprising default.
+
+            # Step 4: Process edges (auto-weight, duplicates, self-loops).
             processed_df = _process_edges(
                 df, source_col, target_col, weight_col,
-                auto_weight, allow_self_loops, remove_duplicates
+                auto_weight, allow_self_loops, remove_duplicates,
             )
             if (
                 weight_col is None
@@ -327,88 +478,133 @@ def build_graph_from_edgelist(
                 and processed_df["weight"].max() > 1
             ):
                 weight_col = "weight"
-            
-            # Step 5: Handle bipartite source/target overlap BEFORE building
-            # the id mapper, so the "drop" policy can remove offending edges
-            # cleanly. The "raise" path delegates to the existing strict
-            # validator; "warn" keeps everything and "drop" filters the
-            # processed DataFrame.
+
+            # Step 5: Bipartite overlap policy.
             bipartite_overlap_used = False
             if bipartite:
                 processed_df, bipartite_overlap_used = _apply_bipartite_overlap_policy(
-                    processed_df, source_col, target_col, bipartite_overlap
+                    processed_df, source_col, target_col, bipartite_overlap,
                 )
 
-            # Step 5b: Drop low-degree source/target nodes (and their edges).
-            # Counted on the post-dedup edgelist so "degree" matches the
-            # graph-theoretic meaning. Independent thresholds — not iterative.
+            # Step 5b: Min-degree filter.
             if min_source_degree is not None or min_target_degree is not None:
                 processed_df = _apply_min_degree_filter(
-                    processed_df,
-                    source_col,
-                    target_col,
-                    min_source_degree,
-                    min_target_degree,
+                    processed_df, source_col, target_col,
+                    min_source_degree, min_target_degree,
                 )
                 if processed_df.is_empty():
                     warnings.warn(
                         "All edges removed by min_source_degree / "
-                        "min_target_degree filtering; creating empty graph."
+                        "min_target_degree filtering; creating empty EdgeList."
                     )
-                    empty_graph = nk.Graph(
-                        0, weighted=(weight_col is not None), directed=directed,
+                    empty_el = _empty_edgelist(
+                        directed=directed, bipartite=bipartite,
+                        weighted=(weight_col is not None), code_dtype=code_dtype,
                     )
                     empty_mapper = IDMapper()
-                    _print_build_summary(verbose, _t_start, _input_rows or 0, empty_graph)
-                    return empty_graph, empty_mapper
+                    _print_edgelist_build_summary(verbose, _t_start, _input_rows or 0, empty_el)
+                    return empty_el, empty_mapper
 
-
-            # Step 6: Create ID mapping (over the possibly-filtered df).
-            # _create_id_mapping returns the source/target unique lists too,
-            # so we can reuse them for bipartite partition recording without
-            # a redundant .unique() pass over the (potentially huge) df.
+            # Step 6: ID mapping over the (possibly-filtered) edge list.
             id_mapper, source_unique, target_unique = _create_id_mapping(
                 processed_df, source_col, target_col,
             )
 
-            # Step 7: Record partition info on the id mapper so
-            # project_bipartite and similar functions don't have to fall back
-            # to BFS coloring (which produces arbitrary labels).
+            # Step 7: Record bipartite partitions on the mapper.
             if bipartite:
                 source_set = set(source_unique)
                 target_set = set(target_unique)
                 if bipartite_overlap_used:
-                    # "warn" mode: partitions intentionally overlap. Set the
-                    # attributes directly because set_bipartite_partitions()
-                    # rejects overlap by design.
                     id_mapper.source_partition_originals = source_set
                     id_mapper.target_partition_originals = target_set
                 else:
                     id_mapper.set_bipartite_partitions(source_set, target_set)
 
-            # Step 8: Construct NetworkIt graph
-            graph = _construct_graph(
-                processed_df, id_mapper, source_col, target_col,
-                weight_col, directed, bipartite,
-                chunk_size=chunk_size,
+            # Step 8: Encode the edge frame to integer codes and wrap in EdgeList.
+            coded_df = _encode_to_codes(
+                processed_df, source_col, target_col,
+                id_mapper, code_dtype, weight_col,
             )
-            
-            logger.info("Graph construction completed: %d nodes, %d edges, directed=%s, weighted=%s",
-                       graph.numberOfNodes(), graph.numberOfEdges(), directed,
-                       weight_col is not None)
+            edge_list = EdgeList(
+                df=coded_df,
+                directed=directed,
+                bipartite=bipartite,
+                n_nodes=id_mapper.size(),
+                code_dtype=code_dtype,
+            )
 
-            _print_build_summary(verbose, _t_start, _input_rows or 0, graph)
-            return graph, id_mapper
-            
+            logger.info(
+                "EdgeList construction completed: %d nodes, %d edges, "
+                "directed=%s, weighted=%s, code_dtype=%s",
+                edge_list.number_of_nodes(), edge_list.number_of_edges(),
+                directed, weight_col is not None, code_dtype,
+            )
+
+            _print_edgelist_build_summary(verbose, _t_start, _input_rows or 0, edge_list)
+            return edge_list, id_mapper
+
         except Exception as e:
             if isinstance(e, (ValidationError, GraphConstructionError, DataFormatError, ConfigurationError)):
                 raise
-            else:
-                raise GraphConstructionError(
-                    f"Unexpected error during graph construction: {str(e)}",
-                    operation="build_graph_from_edgelist",
-                    cause=e
-                )
+            raise GraphConstructionError(
+                f"Unexpected error during EdgeList construction: {str(e)}",
+                operation="build_edgelist_from_frame",
+                cause=e,
+            )
+
+
+def _empty_edgelist(
+    *, directed: bool, bipartite: bool, weighted: bool, code_dtype: Any,
+) -> EdgeList:
+    """Build an EdgeList with zero edges and zero nodes."""
+    cols = [
+        pl.Series("src", [], dtype=code_dtype),
+        pl.Series("tgt", [], dtype=code_dtype),
+    ]
+    if weighted:
+        cols.append(pl.Series("weight", [], dtype=pl.Float64))
+    return EdgeList(
+        df=pl.DataFrame(cols),
+        directed=directed,
+        bipartite=bipartite,
+        n_nodes=0,
+        code_dtype=code_dtype,
+    )
+
+
+def _encode_to_codes(
+    df: pl.DataFrame,
+    source_col: str,
+    target_col: str,
+    id_mapper: IDMapper,
+    code_dtype: Any,
+    weight_col: Optional[str],
+) -> pl.DataFrame:
+    """Translate ``source_col``/``target_col`` values from original IDs to
+    integer codes using ``id_mapper``.
+
+    Uses Polars ``replace_strict`` (Rust-level dict lookup) for vectorized
+    mapping — the same primitive ``_add_edges_chunk`` already relies on for
+    the NetworkIt build path.
+    """
+    mapping = id_mapper.original_to_internal
+    old = list(mapping.keys())
+    new = list(mapping.values())
+
+    select_exprs = [
+        pl.col(source_col)
+        .replace_strict(old=old, new=new, return_dtype=pl.Int64)
+        .cast(code_dtype)
+        .alias("src"),
+        pl.col(target_col)
+        .replace_strict(old=old, new=new, return_dtype=pl.Int64)
+        .cast(code_dtype)
+        .alias("tgt"),
+    ]
+    if weight_col is not None and weight_col in df.columns:
+        select_exprs.append(pl.col(weight_col).cast(pl.Float64).alias("weight"))
+
+    return df.select(select_exprs)
 
 
 def _load_edge_list(edgelist: Union[str, pl.DataFrame]) -> pl.DataFrame:
@@ -877,152 +1073,6 @@ def _validate_bipartite_structure(
                 len(source_ids), len(target_ids))
 
 
-def _construct_graph(
-    df: pl.DataFrame,
-    id_mapper: IDMapper,
-    source_col: str,
-    target_col: str,
-    weight_col: Optional[str],
-    directed: bool,
-    bipartite: bool,
-    chunk_size: Optional[int] = None,
-) -> nk.Graph:
-    """
-    Construct NetworkIt graph from processed edge list.
-
-    The implementation maps original IDs to internal IDs using a single
-    polars expression (C-level lookup against the IDMapper's dict), then
-    iterates a tight ``zip`` over numpy int64 arrays to call ``addEdge``.
-    The previous ``for row in df.iter_rows(named=True)`` path created a
-    Python dict per row and did two dict lookups *through* the IDMapper's
-    Python wrapper per edge — roughly an order of magnitude more overhead
-    per edge.
-
-    Parameters
-    ----------
-    df : pl.DataFrame
-        Processed edge list with weights
-    id_mapper : IDMapper
-        ID mapping between original and internal IDs
-    source_col : str
-        Source column name
-    target_col : str
-        Target column name
-    weight_col : str, optional
-        Weight column name
-    directed : bool
-        Whether graph is directed
-    bipartite : bool
-        Whether graph is bipartite (informational; NetworkIt has no
-        bipartite-aware storage so this is recorded on the IDMapper, not
-        the graph)
-    chunk_size : Optional[int], default None
-        If set, process edges in batches of this size. Slightly slower
-        overall but keeps peak memory close to the input DataFrame size by
-        not materializing all source/target/weight columns simultaneously.
-        Leave as ``None`` for fastest construction when the graph fits in
-        RAM comfortably.
-
-    Returns
-    -------
-    nk.Graph
-        Constructed NetworkIt graph
-
-    Raises
-    ------
-    GraphConstructionError
-        If graph construction fails
-    """
-    try:
-        n_nodes = id_mapper.size()
-        weighted = weight_col is not None
-        n_edges = len(df)
-
-        logger.debug(
-            "Creating NetworkIt graph: %d nodes, %d edges, weighted=%s, directed=%s, chunk_size=%s",
-            n_nodes, n_edges, weighted, directed, chunk_size,
-        )
-
-        graph = nk.Graph(n_nodes, weighted=weighted, directed=directed)
-
-        if n_edges == 0:
-            return graph
-
-        # Vectorized original-id → internal-id mapping. polars'
-        # `replace_strict` does the lookup in Rust against the dict we pass
-        # in — equivalent to a Python-level `[mapping[x] for x in col]` but
-        # without the per-element Python overhead.
-        mapping = id_mapper.original_to_internal
-
-        # Use chunk_size if specified to keep peak memory bounded.
-        if chunk_size is None or chunk_size >= n_edges:
-            _add_edges_chunk(graph, df, source_col, target_col, weight_col, mapping, weighted)
-        else:
-            for start in range(0, n_edges, chunk_size):
-                end = min(start + chunk_size, n_edges)
-                chunk = df.slice(start, end - start)
-                _add_edges_chunk(graph, chunk, source_col, target_col, weight_col, mapping, weighted)
-                # Let polars/numpy intermediates GC between chunks.
-                del chunk
-
-        logger.debug("Graph construction completed: %d edges added", graph.numberOfEdges())
-        return graph
-
-    except Exception as e:
-        raise GraphConstructionError(
-            f"Failed to construct NetworkIt graph: {str(e)}",
-            operation="construct_graph",
-            node_count=id_mapper.size() if id_mapper else None,
-            edge_count=len(df) if df is not None else None,
-            cause=e
-        )
-
-
-def _add_edges_chunk(
-    graph: nk.Graph,
-    chunk: pl.DataFrame,
-    source_col: str,
-    target_col: str,
-    weight_col: Optional[str],
-    mapping: Dict[Any, int],
-    weighted: bool,
-) -> None:
-    """Translate a chunk of edges to internal IDs and emit ``addEdge`` calls.
-
-    The id translation happens in polars (Rust) via ``replace_strict``;
-    everything below the zip is a tight Python loop wrapping the C
-    addEdge call.
-    """
-    src_arr = (
-        chunk[source_col]
-        .replace_strict(
-            old=list(mapping.keys()),
-            new=list(mapping.values()),
-            return_dtype=pl.Int64,
-        )
-        .to_numpy()
-    )
-    tgt_arr = (
-        chunk[target_col]
-        .replace_strict(
-            old=list(mapping.keys()),
-            new=list(mapping.values()),
-            return_dtype=pl.Int64,
-        )
-        .to_numpy()
-    )
-
-    add_edge = graph.addEdge  # local binding avoids attribute lookup per call
-
-    if weighted:
-        w_arr = chunk[weight_col].cast(pl.Float64).to_numpy()
-        for u, v, w in zip(src_arr, tgt_arr, w_arr):
-            add_edge(int(u), int(v), float(w))
-    else:
-        for u, v in zip(src_arr, tgt_arr):
-            add_edge(int(u), int(v))
-
-
 def _extract_edge_arrays(
     graph: nk.Graph,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1088,6 +1138,156 @@ def graph_to_edges(graph: nk.Graph, id_mapper: IDMapper) -> pl.DataFrame:
             "target_id": id_mapper.get_original_batch(targets.tolist()),
             "weight": weights,
         }
+    )
+
+
+def edgelist_to_graph(
+    edge_list: EdgeList,
+    id_mapper: IDMapper,
+    chunk_size: Optional[int] = None,
+) -> Tuple[nk.Graph, IDMapper]:
+    """
+    Materialize a NetworkIt :class:`nk.Graph` from a coded :class:`EdgeList`.
+
+    No new ID mapping is created — the codes in ``edge_list.df`` *are* the
+    NetworkIt internal IDs, so the passed-in mapper is returned unchanged.
+    This is the inexpensive complement to :func:`build_graph_from_edgelist`:
+    when you already have a coded EdgeList (e.g. from
+    :func:`build_edgelist_from_frame` or :func:`graph_to_edgelist`), this
+    skips the unique-pass and dict-build steps entirely.
+
+    Parameters
+    ----------
+    edge_list : EdgeList
+        Coded edge container. ``edge_list.df["src"]`` and ``["tgt"]`` must
+        contain values in ``0..edge_list.n_nodes-1``.
+    id_mapper : IDMapper
+        The mapper paired with ``edge_list`` at construction time. Returned
+        unchanged.
+    chunk_size : Optional[int], default None
+        If set, materialize the src/tgt numpy arrays in batches of this
+        many edges instead of all at once. Slightly slower overall but
+        keeps the peak numpy-array overhead bounded — useful when the
+        EdgeList has tens of millions of edges.
+
+    Returns
+    -------
+    Tuple[nk.Graph, IDMapper]
+        The materialized graph (with ``edge_list.n_nodes`` nodes) and the
+        unchanged mapper.
+
+    Raises
+    ------
+    GraphConstructionError
+        If NetworkIt rejects an edge (e.g. code out of range).
+
+    Notes
+    -----
+    Time Complexity: O(E) — one ``addEdge`` call per row, no per-edge dict
+    lookup. Roughly the same speed as the inner loop of
+    :func:`build_graph_from_edgelist`, but without the upfront
+    ``replace_strict`` mapping pass.
+    """
+    try:
+        weighted = edge_list.is_weighted()
+        n_edges = edge_list.number_of_edges()
+        graph = nk.Graph(
+            edge_list.n_nodes, weighted=weighted, directed=edge_list.directed,
+        )
+
+        if n_edges == 0:
+            return graph, id_mapper
+
+        if chunk_size is None or chunk_size >= n_edges:
+            _add_coded_edges(graph, edge_list.df, weighted)
+        else:
+            for start in range(0, n_edges, chunk_size):
+                end = min(start + chunk_size, n_edges)
+                chunk = edge_list.df.slice(start, end - start)
+                _add_coded_edges(graph, chunk, weighted)
+                del chunk
+
+        return graph, id_mapper
+
+    except Exception as e:
+        raise GraphConstructionError(
+            f"Failed to materialize NetworkIt graph from EdgeList: {str(e)}",
+            operation="edgelist_to_graph",
+            node_count=edge_list.n_nodes,
+            edge_count=edge_list.number_of_edges(),
+            cause=e,
+        )
+
+
+def _add_coded_edges(graph: nk.Graph, coded_df: pl.DataFrame, weighted: bool) -> None:
+    """Inner ``addEdge`` loop for a coded edge frame.
+
+    Codes are already NetworkIt internal IDs, so no per-edge dict lookup
+    is needed — just materialize the columns as numpy arrays and iterate.
+    """
+    src_arr = coded_df["src"].to_numpy()
+    tgt_arr = coded_df["tgt"].to_numpy()
+    add_edge = graph.addEdge
+
+    if weighted:
+        w_arr = coded_df["weight"].to_numpy()
+        for u, v, w in zip(src_arr, tgt_arr, w_arr):
+            add_edge(int(u), int(v), float(w))
+    else:
+        for u, v in zip(src_arr, tgt_arr):
+            add_edge(int(u), int(v))
+
+
+def graph_to_edgelist(
+    graph: nk.Graph,
+    id_mapper: IDMapper,
+    code_dtype: Any = pl.UInt32,
+) -> EdgeList:
+    """
+    Extract a NetworkIt :class:`nk.Graph`'s edges into a coded
+    :class:`EdgeList`.
+
+    Sibling of :func:`graph_to_edges`, which emits a frame in **original**
+    IDs. This one emits internal-ID codes — useful when you want a
+    memory-efficient edge container without paying the original-ID
+    translation cost.
+
+    Parameters
+    ----------
+    graph : nk.Graph
+        Source graph.
+    id_mapper : IDMapper
+        The graph's paired mapper. Used to detect bipartite status (via
+        ``has_bipartite_partitions``); not used for translation since codes
+        are already internal IDs.
+    code_dtype : pl.DataType, default ``pl.UInt32``
+        Integer width for the encoded columns.
+
+    Returns
+    -------
+    EdgeList
+        Coded EdgeList with ``directed`` and ``bipartite`` flags taken from
+        the graph and mapper respectively.
+
+    Notes
+    -----
+    Time Complexity: O(E) — single walk of ``graph.iterEdges()``.
+    """
+    sources, targets, weights = _extract_edge_arrays(graph)
+
+    cols = [
+        pl.Series("src", sources, dtype=code_dtype),
+        pl.Series("tgt", targets, dtype=code_dtype),
+    ]
+    if graph.isWeighted():
+        cols.append(pl.Series("weight", weights, dtype=pl.Float64))
+
+    return EdgeList(
+        df=pl.DataFrame(cols),
+        directed=graph.isDirected(),
+        bipartite=id_mapper.has_bipartite_partitions(),
+        n_nodes=graph.numberOfNodes(),
+        code_dtype=code_dtype,
     )
 
 
@@ -1176,53 +1376,61 @@ def validate_graph_construction(
 
 
 def project_bipartite(
-    edges: Union[nk.Graph, pl.DataFrame],
+    edges: Union[nk.Graph, pl.DataFrame, EdgeList],
     id_mapper: Optional[IDMapper] = None,
     projection_mode: str = "source",
     weight_method: str = "count",
     verbose: bool = True,
     *,
     output_format: Optional[str] = None,
-) -> Union[Tuple[nk.Graph, IDMapper], pl.DataFrame]:
+) -> Union[Tuple[nk.Graph, IDMapper], Tuple[EdgeList, IDMapper], pl.DataFrame]:
     """
     Project a bipartite network to unipartite by connecting nodes with shared neighbors.
 
-    Accepts either a NetworkIt graph (with an ``id_mapper``) or a Polars edge
-    frame (with columns ``source_id``, ``target_id``). The output format
-    defaults to matching the input but can be forced via ``output_format``.
-    ``frame → graph`` is intentionally not supported — call
-    :func:`build_graph_from_edgelist` on the returned frame if you need a
-    graph.
+    Accepts a NetworkIt graph (with an ``id_mapper``), a Polars edge frame
+    (with columns ``source_id``, ``target_id``), or a coded :class:`EdgeList`
+    (also with an ``id_mapper``). The output format defaults to matching
+    the input but can be forced via ``output_format``. ``frame → graph``
+    is intentionally not supported — call :func:`build_graph_from_edgelist`
+    on the returned frame if you need a graph.
 
     Parameters
     ----------
-    edges : nk.Graph or pl.DataFrame
-        Either a bipartite NetworkIt graph or a Polars edge frame with columns
-        ``source_id``, ``target_id`` (and optionally ``weight``, ignored — the
-        projection always produces its own computed weights).
+    edges : nk.Graph, pl.DataFrame, or EdgeList
+        - ``nk.Graph``: bipartite NetworkIt graph (requires ``id_mapper``).
+        - ``pl.DataFrame``: bipartite edge frame with columns ``source_id``,
+          ``target_id`` (and optionally ``weight``, ignored — the projection
+          always produces its own computed weights).
+        - ``EdgeList``: coded bipartite EdgeList where ``src`` is the source
+          partition and ``tgt`` is the target partition (requires
+          ``id_mapper`` paired at construction).
     id_mapper : IDMapper, optional
-        Required when ``edges`` is a Graph; ignored when it's a frame
-        (frames already use original IDs, and the source/target partitions
-        are implicit in the column names).
+        Required when ``edges`` is a ``Graph`` or ``EdgeList``; ignored when
+        it's a frame (frames already use original IDs).
     projection_mode : str, default "source"
         Which partition to project onto:
-        - "source": Project onto the source partition (nodes that appear as sources)
-        - "target": Project onto the target partition (nodes that appear as targets)
+        - "source": Project onto the source partition.
+        - "target": Project onto the target partition.
     weight_method : str, default "count"
         Method for calculating projection weights:
-        - "count": Number of shared neighbors
-        - "jaccard": Jaccard similarity of neighbor sets
-        - "overlap": Overlap coefficient (min of neighbor set sizes)
+        - "count": Number of shared neighbors.
+        - "jaccard": |A ∩ B| / |A ∪ B|.
+        - "overlap": |A ∩ B| / min(|A|, |B|).
     verbose : bool, default True
         Print a one-line summary at the end.
     output_format : str, optional
-        ``"graph"``, ``"dataframe"``, or ``None`` (default — match input).
-        ``output_format="graph"`` with a frame input is not supported.
+        ``"graph"``, ``"edgelist"``, ``"dataframe"``, or ``None`` (default —
+        match input). ``output_format="graph"`` with a frame input is not
+        supported (call :func:`build_graph_from_edgelist` on the returned
+        frame instead).
 
     Returns
     -------
     Tuple[nk.Graph, IDMapper]
         Graph-output path; the projected unipartite graph and a new ID mapper.
+    Tuple[EdgeList, IDMapper]
+        EdgeList-output path; the projected edges as a coded EdgeList and a
+        new ID mapper whose internal IDs match the EdgeList's codes.
     pl.DataFrame
         DataFrame-output path; the projected edges with columns
         ``source_id``, ``target_id``, ``weight``.
@@ -1233,7 +1441,8 @@ def project_bipartite(
         If the input graph is not bipartite or projection fails.
     ValidationError
         If invalid ``projection_mode``, ``weight_method``, or ``output_format``
-        is specified, or if a frame input lacks required columns.
+        is specified, or if a frame input lacks required columns, or an
+        EdgeList input lacks ``id_mapper``.
 
     Examples
     --------
@@ -1257,19 +1466,33 @@ def project_bipartite(
     ... })
     >>> projected_df = project_bipartite(bipartite_edges, projection_mode="source")
 
+    EdgeList input — coded edges, lowest peak memory:
+
+    >>> el, mapper = build_edgelist_from_frame(
+    ...     bipartite_edges, source_col="source_id", target_col="target_id",
+    ...     bipartite=True,
+    ... )
+    >>> projected_el, projected_mapper = project_bipartite(
+    ...     el, mapper, projection_mode="source",
+    ... )
+
     Notes
     -----
-    Time Complexity: O(N² × D) worst case, where N is the size of the projection
-    partition and D is the average degree in the other partition.
+    Time Complexity: O(E × log E) for the Polars dedup + O(N_proj² × D)
+    worst case for the SciPy sparse multiply (where N_proj is the
+    projection-partition size and D is the average degree in the other
+    partition).
 
-    Space Complexity: O(N²) in the worst case for a fully connected projection.
+    Space Complexity: O(E + N_proj²) — the bipartite incidence matrix plus
+    the projected adjacency. The EdgeList/frame paths hold the bipartite
+    side as UInt32 codes, so a hub-heavy projection that explodes the
+    projection-edge count stays manageable.
 
     The graph-input path identifies bipartite partitions either from the
     IDMapper's recorded partitions (when the graph was built with
-    ``bipartite=True``) or via BFS 2-coloring. The frame-input path treats
-    the ``source_id`` column as the source partition and ``target_id`` as
-    the target partition — partitions are implicit in the convention, so no
-    detection step is needed.
+    ``bipartite=True``) or via BFS 2-coloring. The frame and EdgeList
+    paths treat the ``source_id``/``src`` column as the source partition
+    and ``target_id``/``tgt`` as the target partition.
 
     Weight Methods:
     - **Count**: Simple count of shared neighbors. Fast and intuitive.
@@ -1279,9 +1502,25 @@ def project_bipartite(
     # Validate parameters (do this before any dispatch so messages are consistent).
     validate_parameter(projection_mode, ["source", "target"], "projection_mode", "project_bipartite")
     validate_parameter(weight_method, ["count", "jaccard", "overlap"], "weight_method", "project_bipartite")
+    if output_format not in (None, "graph", "edgelist", "dataframe"):
+        raise ValidationError(
+            f"output_format must be 'graph', 'edgelist', 'dataframe', or None; "
+            f"got {output_format!r}"
+        )
 
     import time as _time
     _t_start = _time.perf_counter()
+
+    # EdgeList-input branch (vectorized coded path).
+    if isinstance(edges, EdgeList):
+        if id_mapper is None:
+            raise ValidationError(
+                "`id_mapper` is required when `edges` is an EdgeList"
+            )
+        return _project_bipartite_edgelist_path(
+            edges, id_mapper, projection_mode, weight_method,
+            output_format, verbose, _t_start,
+        )
 
     # Frame-input branch.
     if isinstance(edges, pl.DataFrame):
@@ -1291,22 +1530,21 @@ def project_bipartite(
                 "Call build_graph_from_edgelist() on the returned frame instead."
             )
         return _project_bipartite_frame_path(
-            edges, projection_mode, weight_method, verbose, _t_start
+            edges, projection_mode, weight_method, verbose, _t_start,
+            output_format=output_format,
         )
 
     if not isinstance(edges, nk.Graph):
         raise ValidationError(
-            f"`edges` must be a NetworkIt graph or a Polars DataFrame, got {type(edges).__name__}"
+            f"`edges` must be a NetworkIt graph, Polars DataFrame, or EdgeList; "
+            f"got {type(edges).__name__}"
         )
     if id_mapper is None:
         raise ValidationError("`id_mapper` is required when `edges` is a NetworkIt graph")
-    if output_format not in (None, "graph", "dataframe"):
-        raise ValidationError(
-            f"output_format must be 'graph', 'dataframe', or None; got {output_format!r}"
-        )
 
     graph = edges  # readability
     want_df_only = output_format == "dataframe"
+    want_el_only = output_format == "edgelist"
 
     log_function_entry("project_bipartite",
                       projection_mode=projection_mode, weight_method=weight_method)
@@ -1346,6 +1584,26 @@ def project_bipartite(
                         f"projected frame: {edge_df.height:,} edges"
                     )
                 return edge_df
+
+            # Step 4b: Short-circuit for EdgeList output — compute arrays via
+            # the legacy kernel (we already have a neighbor map) and wrap.
+            if want_el_only:
+                i_arr, j_arr, weights, sorted_projection = _compute_projection_arrays(
+                    projection_partition, neighbor_map, weight_method,
+                )
+                projected_el, new_id_mapper = _projection_arrays_to_edgelist(
+                    i_arr, j_arr, weights, sorted_projection,
+                )
+                if verbose:
+                    dt = _time.perf_counter() - _t_start
+                    print(
+                        f"[project_bipartite] {dt:.2f}s | mode={projection_mode}, "
+                        f"weight={weight_method} | "
+                        f"bipartite: {graph.numberOfNodes():,} nodes, "
+                        f"{graph.numberOfEdges():,} edges → "
+                        f"projected EdgeList: {projected_el.number_of_edges():,} edges"
+                    )
+                return projected_el, new_id_mapper
 
             # Step 5: Create projected graph and new ID mapper
             projected_graph, new_id_mapper = _create_projected_graph(
@@ -1600,12 +1858,23 @@ def _project_bipartite_frame_path(
     weight_method: str,
     verbose: bool,
     t_start: float,
-) -> pl.DataFrame:
+    output_format: Optional[str] = None,
+) -> Union[pl.DataFrame, Tuple[EdgeList, IDMapper]]:
     """Frame-input branch of :func:`project_bipartite`.
 
-    Builds the neighbor map via Polars ``group_by`` (no BFS, no
-    NetworkIt walk) and dispatches to the shared sparse-matrix kernel.
-    Returns the projected edges as a frame keyed by original IDs.
+    Builds a coded :class:`EdgeList` from the input frame (which encodes
+    the bipartite edges as ``UInt32`` codes paired with an IDMapper),
+    dispatches to the vectorized
+    :func:`_compute_projection_arrays_coded` kernel, then translates the
+    projection arrays into the requested output format.
+
+    Parameters
+    ----------
+    output_format : str, optional
+        ``None`` or ``"dataframe"`` (default behaviour — return an
+        original-IDs ``source_id``/``target_id``/``weight`` frame),
+        ``"edgelist"`` (return ``(EdgeList, IDMapper)`` for the projected
+        unipartite graph). ``"graph"`` is rejected upstream.
     """
     required = {"source_id", "target_id"}
     missing = required - set(df.columns)
@@ -1615,16 +1884,48 @@ def _project_bipartite_frame_path(
             f"Expected {sorted(required)}."
         )
 
-    projection_partition, neighbor_map = _neighbor_map_from_edges(df, projection_mode)
+    # Build a coded EdgeList from the frame, then run the vectorized
+    # kernel on its UInt32 src/tgt columns. The replace_strict in
+    # build_edgelist_from_frame plus the np.unique inside the kernel
+    # replace the legacy Dict[Any, Set[Any]] neighbor-map step.
+    edge_list, mapper = build_edgelist_from_frame(
+        df,
+        source_col="source_id",
+        target_col="target_id",
+        bipartite=True,
+        auto_weight=False,        # projection treats each (src, tgt) once
+        remove_duplicates=False,  # _compute_projection_arrays_coded dedupes
+        verbose=False,
+    )
+
+    projection_side = "src" if projection_mode == "source" else "tgt"
+    i_arr, j_arr, weights, sorted_projection = _compute_projection_arrays_coded(
+        edge_list, mapper, projection_side, weight_method,
+    )
 
     logger.info(
         "Projecting bipartite frame: %d nodes in projection partition "
         "(mode=%s, weight=%s)",
-        len(projection_partition), projection_mode, weight_method,
+        len(sorted_projection), projection_mode, weight_method,
     )
 
-    edge_df = _compute_projection_edges(
-        projection_partition, neighbor_map, weight_method
+    if output_format == "edgelist":
+        projected_el, projected_mapper = _projection_arrays_to_edgelist(
+            i_arr, j_arr, weights, sorted_projection,
+        )
+        if verbose:
+            import time as _time
+            dt = _time.perf_counter() - t_start
+            print(
+                f"[project_bipartite] {dt:.2f}s | mode={projection_mode}, "
+                f"weight={weight_method} | frame: {df.height:,} bipartite edges → "
+                f"projected EdgeList: {projected_el.number_of_edges():,} edges"
+            )
+        return projected_el, projected_mapper
+
+    # Default: original-IDs DataFrame.
+    edge_df = _projection_arrays_to_edge_frame(
+        i_arr, j_arr, weights, sorted_projection,
     )
 
     if verbose:
@@ -1637,6 +1938,81 @@ def _project_bipartite_frame_path(
         )
 
     return edge_df
+
+
+def _project_bipartite_edgelist_path(
+    edge_list: EdgeList,
+    id_mapper: IDMapper,
+    projection_mode: str,
+    weight_method: str,
+    output_format: Optional[str],
+    verbose: bool,
+    t_start: float,
+) -> Union[Tuple[EdgeList, IDMapper], Tuple[nk.Graph, IDMapper], pl.DataFrame]:
+    """EdgeList-input branch of :func:`project_bipartite`.
+
+    Dispatches to the vectorized
+    :func:`_compute_projection_arrays_coded` kernel directly — no
+    re-encoding, no neighbor-map construction. The output format defaults
+    to a coded :class:`EdgeList` (match input) but can be forced to
+    ``"graph"`` or ``"dataframe"`` via ``output_format``.
+    """
+    projection_side = "src" if projection_mode == "source" else "tgt"
+    i_arr, j_arr, weights, sorted_projection = _compute_projection_arrays_coded(
+        edge_list, id_mapper, projection_side, weight_method,
+    )
+
+    logger.info(
+        "Projecting bipartite EdgeList: %d nodes in projection partition "
+        "(mode=%s, weight=%s)",
+        len(sorted_projection), projection_mode, weight_method,
+    )
+
+    n_in_edges = edge_list.number_of_edges()
+
+    if output_format == "dataframe":
+        edge_df = _projection_arrays_to_edge_frame(
+            i_arr, j_arr, weights, sorted_projection,
+        )
+        if verbose:
+            import time as _time
+            dt = _time.perf_counter() - t_start
+            print(
+                f"[project_bipartite] {dt:.2f}s | mode={projection_mode}, "
+                f"weight={weight_method} | EdgeList: {n_in_edges:,} bipartite edges → "
+                f"{edge_df.height:,} projected edges"
+            )
+        return edge_df
+
+    if output_format == "graph":
+        projected_graph, new_id_mapper = _projection_arrays_to_graph(
+            i_arr, j_arr, weights, sorted_projection,
+        )
+        if verbose:
+            import time as _time
+            dt = _time.perf_counter() - t_start
+            print(
+                f"[project_bipartite] {dt:.2f}s | mode={projection_mode}, "
+                f"weight={weight_method} | EdgeList: {n_in_edges:,} bipartite edges → "
+                f"projected graph: {projected_graph.numberOfNodes():,} nodes, "
+                f"{projected_graph.numberOfEdges():,} edges"
+            )
+        return projected_graph, new_id_mapper
+
+    # Default ("edgelist" or None → match input).
+    projected_el, new_id_mapper = _projection_arrays_to_edgelist(
+        i_arr, j_arr, weights, sorted_projection,
+        code_dtype=edge_list.code_dtype,
+    )
+    if verbose:
+        import time as _time
+        dt = _time.perf_counter() - t_start
+        print(
+            f"[project_bipartite] {dt:.2f}s | mode={projection_mode}, "
+            f"weight={weight_method} | EdgeList: {n_in_edges:,} bipartite edges → "
+            f"projected EdgeList: {projected_el.number_of_edges():,} edges"
+        )
+    return projected_el, new_id_mapper
 
 
 def _compute_projection_arrays(
@@ -1734,6 +2110,250 @@ def _compute_projection_arrays(
     )
 
 
+def _compute_projection_arrays_coded(
+    edge_list: EdgeList,
+    id_mapper: IDMapper,
+    projection_side: str,
+    weight_method: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Any]]:
+    """Vectorized projection kernel that consumes a coded :class:`EdgeList`.
+
+    Computes the same bipartite co-occurrence projection as
+    :func:`_compute_projection_arrays` (``AAT[i,j] = |N(i) ∩ N(j)|`` then
+    weight-method normalization), but skips the
+    ``Dict[Any, Set[Any]]`` neighbor-map construction entirely. The
+    EdgeList's ``src``/``tgt`` columns already hold compact integer codes,
+    so we can hand them straight to ``np.unique(return_inverse=True)`` to
+    build a dense bipartite incidence and let SciPy do the rest.
+
+    Parameters
+    ----------
+    edge_list : EdgeList
+        Coded bipartite edge container. The convention is that ``src``
+        codes belong to the source partition and ``tgt`` codes to the
+        target partition (mirrors the frame-input path of
+        :func:`project_bipartite`).
+    id_mapper : IDMapper
+        Used only to translate projection-side codes back to their
+        original IDs for the returned ``sorted_projection``.
+    projection_side : str
+        ``"src"`` (project onto unique src codes, target codes are
+        intermediates) or ``"tgt"`` (the other direction).
+    weight_method : str
+        ``"count"``, ``"jaccard"``, or ``"overlap"``.
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray, np.ndarray, List[Any]]
+        Same shape as :func:`_compute_projection_arrays`:
+        ``i_arr``, ``j_arr`` are integer indices into ``sorted_projection``
+        (strict upper triangle, no self-loops, no duplicates); ``weights``
+        are float64 and > 0; ``sorted_projection`` lists the projection
+        partition's original IDs in code-ascending (equivalently
+        ``str``-ascending — IDMapper preserves that order) sequence.
+
+    Notes
+    -----
+    Ordering matches :func:`_compute_projection_arrays` because IDMapper
+    assigns internal IDs in ``sorted(..., key=str)`` order of originals,
+    so ``np.unique`` on codes returns them in the same lexicographic
+    order as ``sorted(partition, key=str)`` would.
+
+    Memory: peak roughly proportional to the bipartite EdgeList (~4 bytes
+    per coded edge) plus the projection's CSR adjacency (sparse). The
+    Python ``Dict[Any, Set[Any]]`` step in the legacy kernel is gone, so
+    huge hub-heavy projections (where a single popular intermediate node
+    fans out to millions of projection-edge pairs) stay tractable.
+
+    Time Complexity: O(E) for Polars dedup + O(E_proj) for the SciPy
+    sparse multiply, where E_proj is the number of projection edges.
+    """
+    if projection_side == "src":
+        proj_col, inter_col = "src", "tgt"
+    elif projection_side == "tgt":
+        proj_col, inter_col = "tgt", "src"
+    else:
+        raise ValueError(
+            f"projection_side must be 'src' or 'tgt', got {projection_side!r}"
+        )
+
+    empty_arrays = (
+        np.zeros(0, dtype=np.int64),
+        np.zeros(0, dtype=np.int64),
+        np.zeros(0, dtype=np.float64),
+        [],
+    )
+
+    if edge_list.number_of_edges() == 0:
+        return empty_arrays
+
+    # Dedupe (proj, inter) pairs to mirror the set() semantics of
+    # _neighbor_map_from_edges. Without this, a duplicate edge would
+    # contribute 2 to A[i,k] and inflate AAT shared-neighbor counts.
+    pairs = edge_list.df.select(proj_col, inter_col).unique()
+
+    proj_codes = pairs[proj_col].to_numpy()
+    inter_codes = pairs[inter_col].to_numpy()
+
+    # Densify both sides to contiguous 0..n-1 ranges so the incidence
+    # matrix is sized (n_proj × n_inter), not (n_total × n_total).
+    # np.unique returns sorted ascending values; return_inverse gives
+    # the matching dense indices for each input element.
+    proj_unique, proj_dense = np.unique(proj_codes, return_inverse=True)
+    inter_unique, inter_dense = np.unique(inter_codes, return_inverse=True)
+
+    n_proj = len(proj_unique)
+    n_inter = len(inter_unique)
+
+    sorted_projection = [
+        id_mapper.get_original(int(c)) for c in proj_unique.tolist()
+    ]
+
+    if n_proj == 0 or n_inter == 0:
+        # No edges in the partition: return empty arrays with the
+        # projection node list populated for downstream introspection.
+        return (
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.float64),
+            sorted_projection,
+        )
+
+    # int32 incidence values — binary (0/1) entries, with headroom for
+    # A @ A.T to accumulate up to ~2.1B shared neighbors per cell before
+    # overflow. int8 would overflow at 127.
+    A = sp.csr_matrix(
+        (np.ones(len(proj_dense), dtype=np.int32),
+         (proj_dense, inter_dense)),
+        shape=(n_proj, n_inter),
+    )
+
+    AAT_upper = sp.triu((A @ A.T).tocsr(), k=1).tocoo()
+
+    if AAT_upper.nnz == 0:
+        return (
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.float64),
+            sorted_projection,
+        )
+
+    i_arr = AAT_upper.row.astype(np.int64, copy=False)
+    j_arr = AAT_upper.col.astype(np.int64, copy=False)
+    shared = AAT_upper.data.astype(np.int64, copy=False)
+
+    if weight_method == "count":
+        weights = shared.astype(np.float64)
+    elif weight_method == "jaccard":
+        degrees = np.asarray(A.sum(axis=1)).flatten().astype(np.int64)
+        union = degrees[i_arr] + degrees[j_arr] - shared
+        with np.errstate(divide="ignore", invalid="ignore"):
+            weights = np.where(union > 0, shared / union, 0.0)
+    elif weight_method == "overlap":
+        degrees = np.asarray(A.sum(axis=1)).flatten().astype(np.int64)
+        min_deg = np.minimum(degrees[i_arr], degrees[j_arr])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            weights = np.where(min_deg > 0, shared / min_deg, 0.0)
+    else:
+        raise ValueError(f"Unknown weight method: {weight_method}")
+
+    nonzero = weights > 0
+    return (
+        i_arr[nonzero],
+        j_arr[nonzero],
+        weights[nonzero],
+        sorted_projection,
+    )
+
+
+def _projection_arrays_to_edge_frame(
+    i_arr: np.ndarray,
+    j_arr: np.ndarray,
+    weights: np.ndarray,
+    sorted_projection: List[Any],
+) -> pl.DataFrame:
+    """Translate projection arrays into a (source_id, target_id, weight) frame.
+
+    Centralizes the small array→frame conversion used by both the legacy
+    :func:`_compute_projection_edges` wrapper and the new coded path
+    (frame-input branch of :func:`project_bipartite`).
+    """
+    if i_arr.size == 0:
+        return pl.DataFrame(
+            schema={
+                "source_id": pl.Object,
+                "target_id": pl.Object,
+                "weight": pl.Float64,
+            }
+        )
+    src_originals = [sorted_projection[i] for i in i_arr.tolist()]
+    tgt_originals = [sorted_projection[j] for j in j_arr.tolist()]
+    return pl.DataFrame({
+        "source_id": src_originals,
+        "target_id": tgt_originals,
+        "weight": weights,
+    })
+
+
+def _projection_arrays_to_graph(
+    i_arr: np.ndarray,
+    j_arr: np.ndarray,
+    weights: np.ndarray,
+    sorted_projection: List[Any],
+) -> Tuple[nk.Graph, IDMapper]:
+    """Materialize a projected unipartite :class:`nk.Graph` from projection arrays.
+
+    Internal IDs in the returned graph match the densified row indices
+    used by :func:`_compute_projection_arrays` /
+    :func:`_compute_projection_arrays_coded` — i.e. ``sorted_projection[k]``
+    is the original ID for internal node ``k``. The returned graph is
+    always weighted and undirected.
+    """
+    n = len(sorted_projection)
+    new_id_mapper = IDMapper.from_originals(sorted_projection)
+    projected_graph = nk.Graph(n, weighted=True, directed=False)
+
+    add_edge = projected_graph.addEdge
+    for u, v, w in zip(i_arr, j_arr, weights):
+        add_edge(int(u), int(v), float(w))
+
+    return projected_graph, new_id_mapper
+
+
+def _projection_arrays_to_edgelist(
+    i_arr: np.ndarray,
+    j_arr: np.ndarray,
+    weights: np.ndarray,
+    sorted_projection: List[Any],
+    code_dtype: Any = pl.UInt32,
+) -> Tuple[EdgeList, IDMapper]:
+    """Wrap projection arrays into a coded :class:`EdgeList` + new IDMapper.
+
+    Codes in the returned EdgeList are densified row indices (the same
+    indices ``i_arr``/``j_arr`` use); the new IDMapper translates code
+    ``k`` back to ``sorted_projection[k]``. The result is always
+    weighted and undirected, with ``bipartite=False`` (it's a projected
+    unipartite graph).
+    """
+    n = len(sorted_projection)
+    new_id_mapper = IDMapper.from_originals(sorted_projection)
+
+    df = pl.DataFrame({
+        "src": pl.Series(i_arr.astype(np.int64), dtype=code_dtype),
+        "tgt": pl.Series(j_arr.astype(np.int64), dtype=code_dtype),
+        "weight": pl.Series(weights, dtype=pl.Float64),
+    })
+
+    edge_list = EdgeList(
+        df=df,
+        directed=False,
+        bipartite=False,
+        n_nodes=n,
+        code_dtype=code_dtype,
+    )
+    return edge_list, new_id_mapper
+
+
 def _compute_projection_edges(
     projection_partition: List[Any],
     neighbor_map: Dict[Any, Set[Any]],
@@ -1754,21 +2374,7 @@ def _compute_projection_edges(
     i_arr, j_arr, weights, sorted_projection = _compute_projection_arrays(
         projection_partition, neighbor_map, weight_method
     )
-    if i_arr.size == 0:
-        return pl.DataFrame(
-            schema={
-                "source_id": pl.Object,
-                "target_id": pl.Object,
-                "weight": pl.Float64,
-            }
-        )
-    src_originals = [sorted_projection[i] for i in i_arr.tolist()]
-    tgt_originals = [sorted_projection[j] for j in j_arr.tolist()]
-    return pl.DataFrame({
-        "source_id": src_originals,
-        "target_id": tgt_originals,
-        "weight": weights,
-    })
+    return _projection_arrays_to_edge_frame(i_arr, j_arr, weights, sorted_projection)
 
 
 def _create_projected_graph(
@@ -1805,18 +2411,7 @@ def _create_projected_graph(
     i_arr, j_arr, weights, sorted_projection = _compute_projection_arrays(
         projection_partition, neighbor_map, weight_method
     )
-
-    n = len(sorted_projection)
-    new_id_mapper = IDMapper()
-    for internal_id, original_id in enumerate(sorted_projection):
-        new_id_mapper.add_mapping(original_id, internal_id)
-
-    projected_graph = nk.Graph(n, weighted=True, directed=False)
-
-    for u, v, w in zip(i_arr, j_arr, weights):
-        projected_graph.addEdge(int(u), int(v), float(w))
-
-    return projected_graph, new_id_mapper
+    return _projection_arrays_to_graph(i_arr, j_arr, weights, sorted_projection)
 
 
 def _calculate_projection_weight(

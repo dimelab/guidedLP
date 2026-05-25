@@ -25,7 +25,6 @@ from guidedLP.network.construction import (
     _process_edges,
     _create_id_mapping,
     _validate_bipartite_structure,
-    _construct_graph,
     _identify_bipartite_partitions,
     _calculate_projection_weight
 )

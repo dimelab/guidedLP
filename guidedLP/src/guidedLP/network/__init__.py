@@ -14,10 +14,13 @@ This module provides core network analysis capabilities:
 # Network construction functions
 from .construction import (
     build_graph_from_edgelist,
+    build_edgelist_from_frame,
+    edgelist_to_graph,
+    graph_to_edgelist,
     project_bipartite,
     get_graph_info,
     get_bipartite_info,
-    validate_graph_construction
+    validate_graph_construction,
 )
 
 # Network analysis functions

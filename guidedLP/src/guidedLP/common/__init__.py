@@ -25,6 +25,7 @@ from .exceptions import (
 
 # Core utilities
 from .id_mapper import IDMapper
+from .edgelist import EdgeList
 from .seed_input import SeedInput, normalize_seed_input
 from .validators import (
     validate_edgelist_dataframe,
