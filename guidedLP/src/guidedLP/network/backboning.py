@@ -27,6 +27,7 @@ import polars as pl
 from scipy.stats import poisson
 
 from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.edgelist import EdgeList
 from guidedLP.common.exceptions import (
     ComputationError,
     ConfigurationError,
@@ -50,7 +51,7 @@ AVAILABLE_METHODS = AVAILABLE_BACKBONE_METHODS
 
 
 def apply_backbone(
-    edges: Union[nk.Graph, pl.DataFrame],
+    edges: Union[nk.Graph, pl.DataFrame, EdgeList],
     id_mapper: Optional[IDMapper] = None,
     method: str = "disparity",
     *,
@@ -70,26 +71,32 @@ def apply_backbone(
 ) -> Union[
     Tuple[nk.Graph, IDMapper],
     Tuple[nk.Graph, IDMapper, pl.DataFrame],
+    Tuple[EdgeList, IDMapper],
     pl.DataFrame,
 ]:
     """
     Extract a network backbone by filtering edges with one of several methods.
 
-    Accepts either a NetworkIt graph (with an ``id_mapper``) or a Polars edge
-    frame (with columns ``source_id``, ``target_id``, ``weight``). The output
-    format defaults to matching the input but can be forced via
-    ``output_format``. ``frame → graph`` is intentionally not supported — call
-    :func:`build_graph_from_edgelist` on the returned frame if you need a
-    graph.
+    Accepts a NetworkIt graph (with an ``id_mapper``), a Polars edge frame
+    (with columns ``source_id``, ``target_id``, ``weight``), or a coded
+    :class:`EdgeList` (with an ``id_mapper``). The output format defaults to
+    matching the input but can be forced via ``output_format``.
+    ``frame/EdgeList → graph`` is intentionally not supported — call
+    :func:`build_graph_from_edgelist` or :func:`edgelist_to_graph` on the
+    returned object if you need a graph.
 
     Parameters
     ----------
-    edges : nk.Graph or pl.DataFrame
+    edges : nk.Graph, pl.DataFrame, or EdgeList
         Either a NetworkIt graph (weighted is required for
-        ``method="disparity"`` and ``method="noise_corrected"``) or a Polars
-        edge frame with columns ``source_id``, ``target_id``, ``weight``.
+        ``method="disparity"`` and ``method="noise_corrected"``), a Polars
+        edge frame with columns ``source_id``, ``target_id``, ``weight``, or
+        a coded :class:`EdgeList` whose ``src``/``tgt`` columns are integer
+        node codes paired with the supplied ``id_mapper``.
     id_mapper : IDMapper, optional
-        Required when ``edges`` is a Graph; ignored when it's a frame.
+        Required when ``edges`` is a Graph or EdgeList; ignored when it's a
+        frame. For EdgeList input the mapper is returned unchanged
+        (isolated-node renumbering is not performed on the EdgeList path).
     method : str, default "disparity"
         Backbone extraction method. One of
         ``{"disparity", "noise_corrected", "bipartite_svn", "weight", "degree"}``.
@@ -164,12 +171,14 @@ def apply_backbone(
         Print a one-line summary at the end (timing + node/edge retention).
     directed : bool, default False
         Whether the underlying graph is directed. Only used when ``edges`` is
-        a DataFrame (a graph carries this intrinsically).
+        a DataFrame (Graph and EdgeList carry this intrinsically).
     output_format : str, optional
         ``"graph"`` (returns ``(graph, mapper)`` or
         ``(graph, mapper, df)``), ``"dataframe"`` (returns the per-edge
-        results frame), or ``None`` (default — matches input type).
-        ``output_format="graph"`` with a frame input is not supported.
+        results frame), or ``None`` (default — matches input type, so an
+        ``EdgeList`` input returns ``(EdgeList, IDMapper)``).
+        ``output_format="graph"`` with a frame or EdgeList input is not
+        supported.
     include_scores : bool, default False
         Only relevant when the function returns a DataFrame
         (frame-in or ``output_format="dataframe"``). Default
@@ -189,6 +198,9 @@ def apply_backbone(
         If ``return_filtered_edges=True``, additionally a per-edge results
         DataFrame (always the full diagnostic shape — all edges, all score
         columns, plus ``kept``).
+    Tuple[EdgeList, IDMapper]
+        EdgeList-output path; the backbone EdgeList (filtered to surviving
+        edges, codes preserved) and the unchanged ID mapper.
     pl.DataFrame
         DataFrame-output path. Default: lean frame
         (``source_id``/``target_id``/``weight``, kept rows only). With
@@ -239,6 +251,24 @@ def apply_backbone(
     _t_start = _time.perf_counter()
 
     # Dispatch on input type.
+    if isinstance(edges, EdgeList):
+        return _apply_backbone_edgelist_path(
+            edge_list=edges,
+            id_mapper=id_mapper,
+            method=method,
+            alpha=alpha,
+            threshold=threshold,
+            target_edges=target_edges,
+            target_nodes=target_nodes,
+            weight_threshold=weight_threshold,
+            correction=correction,
+            min_node_retention=min_node_retention,
+            verbose=verbose,
+            t_start=_t_start,
+            output_format=output_format,
+            include_scores=include_scores,
+        )
+
     if isinstance(edges, pl.DataFrame):
         if output_format == "graph":
             raise ValidationError(
@@ -263,7 +293,8 @@ def apply_backbone(
 
     if not isinstance(edges, nk.Graph):
         raise ValidationError(
-            f"`edges` must be a NetworkIt graph or a Polars DataFrame, got {type(edges).__name__}"
+            f"`edges` must be a NetworkIt graph, Polars DataFrame, or EdgeList; "
+            f"got {type(edges).__name__}"
         )
     if id_mapper is None:
         raise ValidationError("`id_mapper` is required when `edges` is a NetworkIt graph")
@@ -491,6 +522,160 @@ def _print_backbone_frame_summary(
     pct = (100 * n_kept / n_in) if n_in else 0.0
     print(
         f"[apply_backbone] {dt:.2f}s | method={method} | frame: "
+        f"{n_in:,} → {n_kept:,} edges kept ({pct:.1f}%)"
+    )
+
+
+def _apply_backbone_edgelist_path(
+    edge_list: EdgeList,
+    id_mapper: Optional[IDMapper],
+    method: str,
+    *,
+    alpha: float,
+    threshold: float,
+    target_edges: Optional[int],
+    target_nodes: Optional[int],
+    weight_threshold: Optional[float],
+    correction: str,
+    min_node_retention: Optional[float],
+    verbose: bool,
+    t_start: float,
+    output_format: Optional[str],
+    include_scores: bool,
+) -> Union[Tuple[EdgeList, IDMapper], pl.DataFrame]:
+    """EdgeList-input branch of :func:`apply_backbone`.
+
+    Routes through the same vectorized Polars helpers as the frame path.
+    The EdgeList ``src``/``tgt`` columns (integer codes) are aliased to
+    ``source_id``/``target_id`` and handed to the helpers as-is — the
+    helpers do group-by / join operations that are dtype-agnostic, so codes
+    stay UInt32/UInt64 throughout. The mapper is returned unchanged.
+    """
+    if id_mapper is None:
+        raise ValidationError("`id_mapper` is required when `edges` is an EdgeList")
+
+    if output_format == "graph":
+        raise ValidationError(
+            "output_format='graph' with an EdgeList input is not supported. "
+            "Call edgelist_to_graph() on the returned EdgeList instead."
+        )
+    if output_format not in (None, "dataframe"):
+        raise ValidationError(
+            f"output_format must be 'dataframe' or None for EdgeList input; "
+            f"got {output_format!r}"
+        )
+
+    _validate_backbone_parameters(
+        method=method,
+        alpha=alpha,
+        threshold=threshold,
+        target_nodes=target_nodes,
+        target_edges=target_edges,
+        weight_threshold=weight_threshold,
+        correction=correction,
+        min_node_retention=min_node_retention,
+        graph=None,
+    )
+
+    want_df_only = output_format == "dataframe"
+    n_in = edge_list.number_of_edges()
+
+    # Build a frame in the column shape the per-method helpers expect.
+    # Codes pass through unchanged — Polars group_by/joins don't care about
+    # dtype. Synthesize weight=1.0 if the EdgeList is unweighted.
+    edges_df = edge_list.df.rename({"src": "source_id", "tgt": "target_id"})
+    if "weight" not in edges_df.columns:
+        edges_df = edges_df.with_columns(pl.lit(1.0).cast(pl.Float64).alias("weight"))
+
+    if n_in == 0:
+        warnings.warn("Empty EdgeList provided. Returning empty result.")
+        _print_backbone_edgelist_summary(verbose, t_start, n_in, 0, method)
+        if want_df_only:
+            empty_df = _empty_edges_df(method)
+            return empty_df if include_scores else _slim_edges_df(empty_df)
+        return edge_list, id_mapper
+
+    with LoggingTimer("apply_backbone", {"method": method, "edges": n_in, "input": "edgelist"}):
+        try:
+            if method == "disparity":
+                result_df = _disparity_on_edges(
+                    edges_df, edge_list.directed, alpha, target_edges,
+                )
+            elif method == "noise_corrected":
+                result_df = _noise_corrected_on_edges(
+                    edges_df, edge_list.directed, threshold,
+                )
+            elif method == "bipartite_svn":
+                w = edges_df["weight"].to_numpy()
+                is_weighted_effective = w.size > 0 and not np.allclose(w, 1.0)
+                result_df, _ = _bipartite_svn_on_edges(
+                    edges_df, alpha, correction, min_node_retention, is_weighted_effective,
+                )
+            elif method == "weight":
+                result_df = _weight_threshold_on_edges(
+                    edges_df, target_edges, weight_threshold,
+                )
+            elif method == "degree":
+                result_df, _ = _degree_threshold_on_edges(edges_df, target_nodes)
+            else:
+                raise ValidationError(f"Unsupported backbone method: {method}")
+
+            n_kept = int(result_df.filter(pl.col("kept")).height)
+            logger.info(
+                "Backbone extraction completed (EdgeList): %d → %d edges kept",
+                n_in, n_kept,
+            )
+            _print_backbone_edgelist_summary(verbose, t_start, n_in, n_kept, method)
+
+            if want_df_only:
+                return result_df if include_scores else _slim_edges_df(result_df)
+
+            # Default: re-wrap surviving edges as an EdgeList in the original
+            # code dtype, paired with the unchanged mapper.
+            kept_df = (
+                result_df.filter(pl.col("kept"))
+                .select(["source_id", "target_id", "weight"])
+                .rename({"source_id": "src", "target_id": "tgt"})
+                .with_columns([
+                    pl.col("src").cast(edge_list.code_dtype),
+                    pl.col("tgt").cast(edge_list.code_dtype),
+                ])
+            )
+            if not edge_list.is_weighted():
+                kept_df = kept_df.drop("weight")
+
+            new_edge_list = EdgeList(
+                df=kept_df,
+                directed=edge_list.directed,
+                bipartite=edge_list.bipartite,
+                n_nodes=edge_list.n_nodes,
+                code_dtype=edge_list.code_dtype,
+            )
+            return new_edge_list, id_mapper
+
+        except (ConfigurationError, ComputationError, ValidationError):
+            raise
+        except Exception as e:
+            raise ComputationError(
+                f"Backbone extraction failed: {e}",
+                context={
+                    "operation": "apply_backbone",
+                    "method": method,
+                    "error_type": "computation",
+                },
+            ) from e
+
+
+def _print_backbone_edgelist_summary(
+    verbose: bool, t_start: float, n_in: int, n_kept: int, method: str
+) -> None:
+    """EdgeList-input variant of :func:`_print_backbone_summary`."""
+    if not verbose:
+        return
+    dt = _time.perf_counter() - t_start
+    pct = (100 * n_kept / n_in) if n_in else 0.0
+    print(
+        f"[apply_backbone] {dt:.2f}s | method={method} | EdgeList: "
         f"{n_in:,} → {n_kept:,} edges kept ({pct:.1f}%)"
     )
 

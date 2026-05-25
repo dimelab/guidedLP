@@ -29,7 +29,8 @@ logger = get_logger(__name__)
 
 # Available centrality metrics and their implementations
 AVAILABLE_METRICS = [
-    "degree", "betweenness", "closeness", "eigenvector", "pagerank", "katz"
+    "degree", "in_degree", "out_degree",
+    "betweenness", "closeness", "eigenvector", "pagerank", "katz"
 ]
 
 
@@ -55,7 +56,14 @@ def extract_centrality(
         Bidirectional mapping between original and internal node IDs
     metrics : List[str], default ["degree", "betweenness", "closeness", "eigenvector"]
         List of centrality metrics to calculate. Available options:
-        - "degree": Node degree (number of connections)
+        - "degree": Total connections; on directed graphs this is in + out.
+        - "in_degree": Incoming connections only. On directed graphs this
+          equals what the user typically calls "influence" when an edge
+          ``u → v`` means "u reshares from v" or "u cites v" — i.e., when
+          edges point at the influential party. Falls back to total
+          degree on undirected graphs.
+        - "out_degree": Outgoing connections only. The dual of in_degree;
+          falls back to total degree on undirected graphs.
         - "betweenness": Fraction of shortest paths passing through node
         - "closeness": Inverse of average distance to all other nodes
         - "eigenvector": Importance based on importance of neighbors
@@ -120,7 +128,11 @@ def extract_centrality(
     Space Complexity: O(V) for result storage
     
     Centrality Interpretations:
-    - **Degree**: Simple connectivity measure; higher = more connections
+    - **Degree**: Simple connectivity measure; higher = more connections.
+      On directed graphs, equals in_degree + out_degree.
+    - **In-degree / Out-degree**: Direction-aware connectivity. On a
+      directed graph these are usually more interpretable than total
+      degree; on an undirected graph they collapse to plain degree.
     - **Betweenness**: Bridge/broker measure; higher = more shortest paths pass through
     - **Closeness**: Efficiency measure; higher = shorter average distance to others
     - **Eigenvector**: Prestige measure; higher = connected to other important nodes
@@ -398,13 +410,37 @@ def _calculate_single_centrality(
                 values = in_degrees + out_degrees
             else:
                 values = np.array([graph.degree(v) for v in graph.iterNodes()])
-            
+
             if normalized and graph.numberOfNodes() > 1:
                 max_possible = graph.numberOfNodes() - 1
                 if graph.isDirected():
                     max_possible *= 2  # In directed graphs, max degree is 2*(n-1)
                 values = values / max_possible
-                
+
+        elif metric == "in_degree":
+            # Incoming-edge degree. On undirected graphs, collapses to plain
+            # degree (every edge counts once on each endpoint).
+            if graph.isDirected():
+                values = np.array([graph.degreeIn(v) for v in graph.iterNodes()],
+                                  dtype=np.float64)
+            else:
+                values = np.array([graph.degree(v) for v in graph.iterNodes()],
+                                  dtype=np.float64)
+            if normalized and graph.numberOfNodes() > 1:
+                values = values / (graph.numberOfNodes() - 1)
+
+        elif metric == "out_degree":
+            # Outgoing-edge degree. On undirected graphs, collapses to plain
+            # degree (mirrors in_degree behavior for symmetry).
+            if graph.isDirected():
+                values = np.array([graph.degreeOut(v) for v in graph.iterNodes()],
+                                  dtype=np.float64)
+            else:
+                values = np.array([graph.degree(v) for v in graph.iterNodes()],
+                                  dtype=np.float64)
+            if normalized and graph.numberOfNodes() > 1:
+                values = values / (graph.numberOfNodes() - 1)
+
         elif metric == "betweenness":
             # Betweenness centrality
             bc = nk.centrality.Betweenness(graph, normalized=normalized)

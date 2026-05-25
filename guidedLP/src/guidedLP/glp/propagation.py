@@ -12,8 +12,13 @@ Mathematical Foundation:
 - Continue until convergence: max|F^(t+1) - F^(t)| < threshold
 
 For directed graphs, run propagation twice:
-- Out-degree: Use A as-is (influence propagation)
-- In-degree: Use A^T (receptivity propagation)
+- Out-degree pass: A as-is, row-normalized by out-degree. Each node is
+  labeled by the (weighted) average of its OUT-neighbors' labels.
+- In-degree pass: A^T, row-normalized by in-degree. Each node is labeled
+  by the (weighted) average of its IN-neighbors' labels.
+
+The semantic interpretation ("influence" vs. "audience" etc.) depends on
+what edges mean in your graph — see docs/architecture/glp.md.
 """
 
 from typing import Callable, Dict, List, Tuple, Union, Optional, Any
@@ -124,8 +129,11 @@ def guided_label_propagation(
     Propagate labels from seed nodes through network using guided label propagation.
     
     This function implements the guided label propagation algorithm using efficient
-    sparse matrix operations. For directed graphs, it can compute both out-degree
-    (influence) and in-degree (receptivity) propagation.
+    sparse matrix operations. For directed graphs, it can compute both an
+    out-degree pass (each node labeled by its out-neighbors) and an in-degree
+    pass (each node labeled by its in-neighbors). The semantic reading of each
+    pass — e.g. "influence" vs. "audience" — depends on what edges mean in your
+    graph; see ``docs/architecture/glp.md`` for the two common conventions.
     
     Mathematical Algorithm:
     1. Initialize label matrix Y (n × k) where n=nodes, k=labels
@@ -165,7 +173,12 @@ def guided_label_propagation(
     normalize : bool, default True
         Normalize final probabilities to sum to 1.0 per node
     directional : bool, default True
-        For directed graphs, compute both out-degree and in-degree propagation
+        For directed graphs, compute both passes and return them as a tuple
+        ``(out_degree_df, in_degree_df)``. The out-degree pass labels each
+        node by its out-neighbors; the in-degree pass labels each node by
+        its in-neighbors. Ignored for undirected graphs (the two passes are
+        equivalent there). See ``docs/architecture/glp.md`` for how to
+        interpret each pass under different edge conventions.
     n_jobs : int, default 1
         Number of parallel jobs (reserved for future multi-label parallelization)
     enable_noise_category : bool, default True
@@ -241,7 +254,13 @@ def guided_label_propagation(
     - Seeds must be present in the graph (original IDs must map to internal IDs)
     - For disconnected components without seeds, nodes get uniform probability
     - Zero-degree nodes (isolates) retain their initial state
-    - For directed graphs, out-degree measures influence, in-degree measures receptivity
+    - For directed graphs, the out-degree pass aggregates over each node's
+      out-neighbors and the in-degree pass aggregates over its in-neighbors.
+      Whether "out" or "in" corresponds to "influence" depends on your edge
+      convention — e.g. for a reshare graph (``u → v`` means *u reshares from v*),
+      influencers are high-in-degree and the out-degree pass classifies
+      resharers by the affinity of their sources. See
+      ``docs/architecture/glp.md``.
     - Algorithm uses sparse matrix operations for memory efficiency on large graphs
     """
     
@@ -288,7 +307,7 @@ def guided_label_propagation(
     else:
         logger.info("Running directional propagation for directed graph")
         
-        # Out-degree propagation (influence)
+        # Out-degree pass: each node labeled by avg of its out-neighbors' labels
         out_result = _run_single_propagation(
             graph, id_mapper, processed_seed_labels, processed_labels, alpha,
             max_iterations, convergence_threshold, normalize,
@@ -296,7 +315,8 @@ def guided_label_propagation(
             weight_transform=weight_transform,
         )
 
-        # In-degree propagation (receptivity) - use transposed adjacency
+        # In-degree pass: each node labeled by avg of its in-neighbors' labels
+        # (transposed adjacency, row-normalized by in-degree)
         in_result = _run_single_propagation(
             graph, id_mapper, processed_seed_labels, processed_labels, alpha,
             max_iterations, convergence_threshold, normalize,
