@@ -68,6 +68,7 @@ def apply_backbone(
     directed: bool = False,
     output_format: Optional[str] = None,
     include_scores: bool = False,
+    streaming: bool = False,
 ) -> Union[
     Tuple[nk.Graph, IDMapper],
     Tuple[nk.Graph, IDMapper, pl.DataFrame],
@@ -189,6 +190,12 @@ def apply_backbone(
         Independent of ``return_filtered_edges`` — that flag's graph-mode
         third-element frame is always the full diagnostic shape, regardless
         of ``include_scores``.
+    streaming : bool, default False
+        Collect the lazy per-method pipeline with Polars's streaming engine
+        to bound peak memory by processing in batches. Slower than the
+        in-memory engine on small inputs (per-batch overhead) but avoids
+        OOM on very large graphs. Currently honored by ``method="noise_corrected"``;
+        a no-op for other methods.
 
     Returns
     -------
@@ -267,6 +274,7 @@ def apply_backbone(
             t_start=_t_start,
             output_format=output_format,
             include_scores=include_scores,
+            streaming=streaming,
         )
 
     if isinstance(edges, pl.DataFrame):
@@ -289,6 +297,7 @@ def apply_backbone(
             verbose=verbose,
             t_start=_t_start,
             include_scores=include_scores,
+            streaming=streaming,
         )
 
     if not isinstance(edges, nk.Graph):
@@ -365,6 +374,7 @@ def apply_backbone(
                 result = _apply_noise_corrected_filter(
                     graph, id_mapper, threshold,
                     keep_disconnected, return_edges_for_path,
+                    streaming=streaming,
                 )
             elif method == "bipartite_svn":
                 result = _apply_bipartite_svn_filter(
@@ -431,6 +441,7 @@ def _apply_backbone_frame_path(
     verbose: bool,
     t_start: float,
     include_scores: bool = False,
+    streaming: bool = False,
 ) -> pl.DataFrame:
     """Frame-input branch of :func:`apply_backbone`.
 
@@ -465,7 +476,9 @@ def _apply_backbone_frame_path(
             if method == "disparity":
                 result_df = _disparity_on_edges(edges_df, directed, alpha, target_edges)
             elif method == "noise_corrected":
-                result_df = _noise_corrected_on_edges(edges_df, directed, threshold)
+                result_df = _noise_corrected_on_edges(
+                    edges_df, directed, threshold, streaming=streaming
+                )
             elif method == "bipartite_svn":
                 # Treat as weighted if the column actually carries variation.
                 w = edges_df["weight"].to_numpy()
@@ -542,6 +555,7 @@ def _apply_backbone_edgelist_path(
     t_start: float,
     output_format: Optional[str],
     include_scores: bool,
+    streaming: bool = False,
 ) -> Union[Tuple[EdgeList, IDMapper], pl.DataFrame]:
     """EdgeList-input branch of :func:`apply_backbone`.
 
@@ -603,7 +617,7 @@ def _apply_backbone_edgelist_path(
                 )
             elif method == "noise_corrected":
                 result_df = _noise_corrected_on_edges(
-                    edges_df, edge_list.directed, threshold,
+                    edges_df, edge_list.directed, threshold, streaming=streaming,
                 )
             elif method == "bipartite_svn":
                 w = edges_df["weight"].to_numpy()
@@ -1030,6 +1044,8 @@ def _noise_corrected_on_edges(
     df: pl.DataFrame,
     directed: bool,
     threshold: float,
+    *,
+    streaming: bool = False,
 ) -> pl.DataFrame:
     """Coscia & Neffke (2017) noise-corrected backbone on an edge frame.
 
@@ -1040,132 +1056,160 @@ def _noise_corrected_on_edges(
         Node-ID column types may be anything Polars can group_by on.
     directed : bool
         Whether the underlying graph is directed. For undirected graphs the
-        frame is symmetrized internally before computing node strengths, and
-        only the canonical ``source_id <= target_id`` orientation is returned.
+        per-node strength is computed by aggregating source- and target-side
+        weight sums separately and combining them on V-row intermediates —
+        the edge frame itself is never symmetrized, so peak working memory
+        stays proportional to E (not 2E).
     threshold : float
         Posterior-standard-deviation multiplier. Edges are kept iff
         ``score − threshold · sdev_cij > 0``.
+    streaming : bool, default False
+        Collect the lazy pipeline with Polars's streaming engine. Slower than
+        the in-memory engine on small inputs (per-batch overhead) but bounds
+        peak memory by processing in chunks — flip this on for graphs large
+        enough that the in-memory engine would OOM.
 
     Returns
     -------
     pl.DataFrame
         Columns: ``source_id``, ``target_id``, ``weight``, ``score``,
-        ``sdev_cij``, ``kept`` — one row per (oriented) edge.
+        ``sdev_cij``, ``kept`` — one row per input edge. Orientation is
+        preserved from the input frame (no canonical reordering on the
+        undirected path — the noise-corrected score is symmetric in
+        s_u/s_v, so input orientation is observationally equivalent).
 
     Raises
     ------
     ComputationError
         If the total edge weight is non-positive.
     """
-    if directed:
-        work = df.select(
-            pl.col("source_id").alias("o"),
-            pl.col("target_id").alias("e"),
-            pl.col("weight").alias("w"),
-        )
-    else:
-        # Symmetrize so per-node group_by sums give full incident strengths.
-        work = pl.concat([
-            df.select(
-                pl.col("source_id").alias("o"),
-                pl.col("target_id").alias("e"),
-                pl.col("weight").alias("w"),
-            ),
-            df.select(
-                pl.col("target_id").alias("o"),
-                pl.col("source_id").alias("e"),
-                pl.col("weight").alias("w"),
-            ),
-        ])
-
-    n_total = float(work["w"].sum())
-    if n_total <= 0:
+    # n_total convention preserved from the previous symmetrized formulation:
+    # undirected ⇒ 2 · Σw (the canonical "2m"); directed ⇒ Σw. Downstream
+    # formulae are derived against this scale.
+    total_w = float(df["weight"].sum())
+    if total_w <= 0:
         raise ComputationError(
             "Noise-corrected backbone requires positive total edge weight",
             context={"operation": "noise_corrected"},
         )
+    n_total = 2.0 * total_w if not directed else total_w
 
-    src_sum = work.group_by("o").agg(pl.col("w").sum().alias("o_sum"))
-    trg_sum = work.group_by("e").agg(pl.col("w").sum().alias("e_sum"))
-    work = work.join(src_sum, on="o", how="left").join(trg_sum, on="e", how="left")
+    # Per-endpoint strengths. Directed graphs distinguish out-strength (used
+    # on the source side) from in-strength (used on the target side).
+    # Undirected graphs use a single strength per node — sum of all incident
+    # edge weights — computed without symmetrizing the edge frame by unioning
+    # the two side-aggregates and re-grouping (a V-row, not 2E-row, op).
+    if directed:
+        u_strength = (
+            df.group_by("source_id")
+            .agg(pl.col("weight").sum().alias("s_u"))
+        )
+        v_strength = (
+            df.group_by("target_id")
+            .agg(pl.col("weight").sum().alias("s_v"))
+        )
+    else:
+        src_part = (
+            df.lazy()
+            .group_by("source_id")
+            .agg(pl.col("weight").sum().alias("s"))
+            .rename({"source_id": "node"})
+        )
+        tgt_part = (
+            df.lazy()
+            .group_by("target_id")
+            .agg(pl.col("weight").sum().alias("s"))
+            .rename({"target_id": "node"})
+        )
+        node_strength = (
+            pl.concat([src_part, tgt_part])
+            .group_by("node")
+            .agg(pl.col("s").sum().alias("strength"))
+            .collect()
+        )
+        u_strength = node_strength.rename({"node": "source_id", "strength": "s_u"})
+        v_strength = node_strength.rename({"node": "target_id", "strength": "s_v"})
 
-    work = work.with_columns([
-        ((pl.col("o_sum") * pl.col("e_sum")) / (n_total * n_total))
-            .alias("mean_prior_probability"),
-        (n_total / (pl.col("o_sum") * pl.col("e_sum"))).alias("kappa"),
-    ])
-    work = work.with_columns(
-        ((pl.col("kappa") * pl.col("w") - 1) / (pl.col("kappa") * pl.col("w") + 1))
-            .alias("score")
-    )
-    work = work.with_columns(
-        (
-            (pl.col("o_sum") * pl.col("e_sum")
-             * (n_total - pl.col("o_sum")) * (n_total - pl.col("e_sum")))
-            / ((n_total ** 4) * (n_total - 1))
-        ).alias("var_prior_probability")
-    )
-    work = work.with_columns([
-        (
-            (pl.col("mean_prior_probability") ** 2 / pl.col("var_prior_probability"))
-            * (1 - pl.col("mean_prior_probability"))
-            - pl.col("mean_prior_probability")
-        ).alias("alpha_prior"),
-        (
-            (pl.col("mean_prior_probability") / pl.col("var_prior_probability"))
-            * (1 - pl.col("mean_prior_probability") ** 2)
-            - (1 - pl.col("mean_prior_probability"))
-        ).alias("beta_prior"),
-    ])
-    work = work.with_columns([
-        (pl.col("alpha_prior") + pl.col("w")).alias("alpha_post"),
-        (n_total - pl.col("w") + pl.col("beta_prior")).alias("beta_post"),
-    ])
-    work = work.with_columns(
-        (pl.col("alpha_post") / (pl.col("alpha_post") + pl.col("beta_post")))
-            .alias("expected_pij")
-    )
-    work = work.with_columns(
-        (pl.col("expected_pij") * (1 - pl.col("expected_pij")) * n_total)
-            .alias("variance_nij")
-    )
-    work = work.with_columns(
-        (
-            (1.0 / (pl.col("o_sum") * pl.col("e_sum")))
-            - (n_total * (pl.col("o_sum") + pl.col("e_sum"))
-               / ((pl.col("o_sum") * pl.col("e_sum")) ** 2))
-        ).alias("d")
-    )
-    work = work.with_columns(
-        (
-            pl.col("variance_nij")
-            * ((2 * (pl.col("kappa") + pl.col("w") * pl.col("d")))
-               / ((pl.col("kappa") * pl.col("w") + 1) ** 2)) ** 2
-        ).alias("variance_cij")
-    )
-    work = work.with_columns(
-        pl.col("variance_cij").clip(lower_bound=0.0).sqrt().alias("sdev_cij")
+    # Build the per-edge math as one lazy plan. The chained with_columns are
+    # kept separate for readability; projection-pushdown in the optimizer
+    # ensures only the columns referenced by the final select survive into
+    # the collected frame, so the wide intermediate schema (alpha_prior,
+    # beta_prior, expected_pij, …) doesn't pin memory.
+    plan = (
+        df.lazy()
+        .join(u_strength.lazy(), on="source_id", how="left")
+        .join(v_strength.lazy(), on="target_id", how="left")
+        .with_columns([
+            ((pl.col("s_u") * pl.col("s_v")) / (n_total * n_total))
+                .alias("mean_prior_probability"),
+            (n_total / (pl.col("s_u") * pl.col("s_v"))).alias("kappa"),
+        ])
+        .with_columns(
+            ((pl.col("kappa") * pl.col("weight") - 1)
+             / (pl.col("kappa") * pl.col("weight") + 1)).alias("score")
+        )
+        .with_columns(
+            (
+                (pl.col("s_u") * pl.col("s_v")
+                 * (n_total - pl.col("s_u")) * (n_total - pl.col("s_v")))
+                / ((n_total ** 4) * (n_total - 1))
+            ).alias("var_prior_probability")
+        )
+        .with_columns([
+            (
+                (pl.col("mean_prior_probability") ** 2 / pl.col("var_prior_probability"))
+                * (1 - pl.col("mean_prior_probability"))
+                - pl.col("mean_prior_probability")
+            ).alias("alpha_prior"),
+            (
+                (pl.col("mean_prior_probability") / pl.col("var_prior_probability"))
+                * (1 - pl.col("mean_prior_probability") ** 2)
+                - (1 - pl.col("mean_prior_probability"))
+            ).alias("beta_prior"),
+        ])
+        .with_columns([
+            (pl.col("alpha_prior") + pl.col("weight")).alias("alpha_post"),
+            (n_total - pl.col("weight") + pl.col("beta_prior")).alias("beta_post"),
+        ])
+        .with_columns(
+            (pl.col("alpha_post") / (pl.col("alpha_post") + pl.col("beta_post")))
+                .alias("expected_pij")
+        )
+        .with_columns(
+            (pl.col("expected_pij") * (1 - pl.col("expected_pij")) * n_total)
+                .alias("variance_nij")
+        )
+        .with_columns(
+            (
+                (1.0 / (pl.col("s_u") * pl.col("s_v")))
+                - (n_total * (pl.col("s_u") + pl.col("s_v"))
+                   / ((pl.col("s_u") * pl.col("s_v")) ** 2))
+            ).alias("d")
+        )
+        .with_columns(
+            (
+                pl.col("variance_nij")
+                * ((2 * (pl.col("kappa") + pl.col("weight") * pl.col("d")))
+                   / ((pl.col("kappa") * pl.col("weight") + 1) ** 2)) ** 2
+            ).alias("variance_cij")
+        )
+        .with_columns(
+            pl.col("variance_cij").clip(lower_bound=0.0).sqrt().alias("sdev_cij")
+        )
+        .with_columns(
+            ((pl.col("score") - threshold * pl.col("sdev_cij")) > 0).alias("kept")
+        )
+        .select([
+            "source_id",
+            "target_id",
+            "weight",
+            "score",
+            "sdev_cij",
+            "kept",
+        ])
     )
 
-    if not directed:
-        # Collapse the symmetrized frame back to the canonical orientation.
-        # Comparing IDs only makes sense when they're orderable; for non-orderable
-        # types (e.g. arbitrary strings) Polars still does lexicographic order,
-        # which is a stable canonical choice even if not semantically meaningful.
-        work = work.filter(pl.col("o") <= pl.col("e"))
-
-    work = work.with_columns(
-        ((pl.col("score") - threshold * pl.col("sdev_cij")) > 0).alias("kept")
-    )
-
-    return work.select([
-        pl.col("o").alias("source_id"),
-        pl.col("e").alias("target_id"),
-        pl.col("w").alias("weight"),
-        pl.col("score"),
-        pl.col("sdev_cij"),
-        pl.col("kept"),
-    ])
+    return plan.collect(engine="streaming") if streaming else plan.collect()
 
 
 def _apply_noise_corrected_filter(
@@ -1174,6 +1218,8 @@ def _apply_noise_corrected_filter(
     threshold: float,
     keep_disconnected: bool,
     return_filtered_edges: bool,
+    *,
+    streaming: bool = False,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
     """Graph-shim around :func:`_noise_corrected_on_edges`."""
     logger.debug("Applying noise-corrected backbone with threshold=%.3f", threshold)
@@ -1194,7 +1240,7 @@ def _apply_noise_corrected_filter(
         "target_id": targets,
         "weight": weights,
     })
-    scored = _noise_corrected_on_edges(edge_df, directed, threshold)
+    scored = _noise_corrected_on_edges(edge_df, directed, threshold, streaming=streaming)
 
     kept_df = scored.filter(pl.col("kept"))
     backbone_graph, updated_mapper = _assemble_backbone(

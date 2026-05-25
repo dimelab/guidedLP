@@ -22,7 +22,10 @@ what edges mean in your graph — see docs/architecture/glp.md.
 """
 
 from typing import Callable, Dict, List, Tuple, Union, Optional, Any
+from concurrent.futures import ThreadPoolExecutor
 import math
+import os
+import random
 import warnings
 import numpy as np
 import scipy.sparse as sp
@@ -178,7 +181,9 @@ def guided_label_propagation(
         node by its out-neighbors; the in-degree pass labels each node by
         its in-neighbors. Ignored for undirected graphs (the two passes are
         equivalent there). See ``docs/architecture/glp.md`` for how to
-        interpret each pass under different edge conventions.
+        interpret each pass under different edge conventions. The two
+        passes execute concurrently on a two-thread pool when this branch
+        is taken — see ``docs/architecture/performance.md``.
     n_jobs : int, default 1
         Number of parallel jobs (reserved for future multi-label parallelization)
     enable_noise_category : bool, default True
@@ -303,32 +308,44 @@ def guided_label_propagation(
         logger.info("Completed single propagation")
         return result
     
-    # For directed graphs with directional=True, run both directions
+    # For directed graphs with directional=True, run both directions. The
+    # two passes are fully independent (each builds its own P, F, Y; only
+    # graph and id_mapper are shared, read-only) so they run in parallel on
+    # two worker threads. Sparse matmul and dense arithmetic in the inner
+    # loop release the GIL; expect ~1.5–1.9× wall-clock vs. sequential on
+    # typical workloads. Results are deterministic: each thread's compute
+    # depends only on its own inputs.
     else:
-        logger.info("Running directional propagation for directed graph")
-        
-        # Out-degree pass: each node labeled by avg of its out-neighbors' labels
-        out_result = _run_single_propagation(
-            graph, id_mapper, processed_seed_labels, processed_labels, alpha,
-            max_iterations, convergence_threshold, normalize,
-            direction="out_degree",
-            weight_transform=weight_transform,
+        logger.info(
+            "Running directional propagation for directed graph (2 threads)"
         )
 
-        # In-degree pass: each node labeled by avg of its in-neighbors' labels
-        # (transposed adjacency, row-normalized by in-degree)
-        in_result = _run_single_propagation(
-            graph, id_mapper, processed_seed_labels, processed_labels, alpha,
-            max_iterations, convergence_threshold, normalize,
-            direction="in_degree",
-            weight_transform=weight_transform,
-        )
-        
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Out-degree pass: each node labeled by avg of its out-neighbors
+            out_future = executor.submit(
+                _run_single_propagation,
+                graph, id_mapper, processed_seed_labels, processed_labels, alpha,
+                max_iterations, convergence_threshold, normalize,
+                direction="out_degree",
+                weight_transform=weight_transform,
+            )
+            # In-degree pass: each node labeled by avg of its in-neighbors
+            # (transposed adjacency, row-normalized by in-degree)
+            in_future = executor.submit(
+                _run_single_propagation,
+                graph, id_mapper, processed_seed_labels, processed_labels, alpha,
+                max_iterations, convergence_threshold, normalize,
+                direction="in_degree",
+                weight_transform=weight_transform,
+            )
+            out_result = out_future.result()
+            in_result = in_future.result()
+
         # Apply confidence thresholding if enabled
         if confidence_threshold > 0.0:
             out_result = _apply_confidence_threshold(out_result, confidence_threshold)
             in_result = _apply_confidence_threshold(in_result, confidence_threshold)
-        
+
         logger.info("Completed directional propagation")
         return out_result, in_result
 
@@ -514,40 +531,62 @@ def ensemble_label_propagation(
     n_epochs: int = 10,
     base_seed: int = 42,
     return_variance: bool = False,
+    n_workers: Optional[int] = None,
     **glp_kwargs: Any,
 ) -> Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]:
     """
     Average ``n_epochs`` independent GLP runs with resampled noise seeds.
 
-    Repeatedly calls :func:`guided_label_propagation` with a per-epoch
-    ``random_seed = base_seed + epoch_index`` and averages the resulting
-    probability matrices using Welford's online algorithm. This recovers the
-    bagging-style variance reduction from the legacy ``stlp`` implementation's
-    ``epochs`` loop, where each epoch sampled fresh noise seeds.
+    Each epoch uses ``random_seed = base_seed + epoch_index`` and the
+    probability matrices are combined with Welford's online algorithm. This
+    recovers the bagging-style variance reduction from the legacy ``stlp``
+    implementation's ``epochs`` loop.
 
     Only meaningful when ``enable_noise_category=True`` — otherwise each
-    epoch produces an identical deterministic result and ensembling reduces
-    to a single run. A warning is emitted in that case and a single GLP run
-    is returned instead.
+    epoch produces an identical deterministic result. A warning is emitted
+    in that case and a single GLP run is returned instead.
 
-    Time complexity: ``O(n_epochs · cost(guided_label_propagation))``.
-    Space complexity: ``O(n · k)`` — running mean/variance only, no
-    per-epoch matrices retained.
+    Parallelism
+    -----------
+    The transition matrix ``P`` (and ``P_in`` for the directional in-degree
+    pass) is built **once** outside the epoch loop and shared across worker
+    threads. Each worker only allocates a per-epoch ``Y`` and ``F`` matrix
+    of shape ``(n_nodes, n_labels)``, so peak memory scales as
+    ``cost(P) + n_workers · cost(F)`` rather than ``n_workers · cost(P)``.
+
+    Workers run in a :class:`~concurrent.futures.ThreadPoolExecutor`. The
+    heavy per-iteration work — sparse matmul ``P @ F``, dense arithmetic,
+    convergence-check arrays — releases the GIL, so threads scale until
+    the Python-level reduction in the main loop catches up (typically
+    around physical core count for non-trivial graphs).
+
+    Welford updates are applied in **epoch-submission order** (workers run
+    in parallel; the main thread reads ``futures[i].result()`` in order).
+    This makes ensembles bitwise-deterministic for a given ``base_seed``
+    regardless of ``n_workers``.
+
+    Time complexity: ``O(P_build + n_epochs · iter_cost / min(n_workers, cores))``.
+    Space complexity: ``O(nnz(P) + n_workers · n · k)``.
 
     Parameters
     ----------
     graph, id_mapper, seed_labels, labels
-        Forwarded to :func:`guided_label_propagation`. See that function's
-        docstring for details.
+        Forwarded to the underlying propagation routine. See
+        :func:`guided_label_propagation`.
     n_epochs : int, default 10
         Number of independent runs to average. Must be ``>= 2``.
     base_seed : int, default 42
-        Each epoch ``i`` uses ``random_seed = base_seed + i``. Together with
-        ``n_epochs`` this makes the ensemble fully deterministic.
+        Each epoch ``i`` uses ``random_seed = base_seed + i``. Together
+        with ``n_epochs`` and (independently of) ``n_workers`` this makes
+        the ensemble fully deterministic.
     return_variance : bool, default False
         If True, the returned DataFrame(s) include ``{label}_prob_std``
-        columns alongside the means (sample standard deviation across
-        epochs, with Bessel's correction).
+        columns (sample standard deviation across epochs, Bessel-corrected).
+    n_workers : Optional[int], default None
+        Number of worker threads. ``None`` (default) auto-detects to
+        ``min(n_epochs, os.cpu_count())``. Pass ``1`` for serial execution
+        (still gets the build-P-once optimization). Values larger than
+        ``n_epochs`` are clamped down.
     **glp_kwargs
         Any other :func:`guided_label_propagation` keyword arguments. Any
         ``random_seed`` value is overridden per epoch.
@@ -556,10 +595,10 @@ def ensemble_label_propagation(
     -------
     Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]
         Same shape as :func:`guided_label_propagation` — single DataFrame
-        for undirected/``directional=False``, tuple for directed +
+        for undirected / ``directional=False``, tuple for directed +
         ``directional=True``. ``{label}_prob`` columns hold averaged
         probabilities; ``dominant_label`` and ``confidence`` are recomputed
-        from the averaged probabilities (not voted across epochs).
+        from the averaged probabilities.
 
     Raises
     ------
@@ -568,10 +607,16 @@ def ensemble_label_propagation(
 
     Examples
     --------
-    >>> # 20 noise-resampled runs, with per-label std for confidence intervals
+    >>> # 20 noise-resampled runs across all cores, with per-label std
     >>> result = ensemble_label_propagation(
     ...     graph, mapper, seeds, ["left", "right"],
     ...     n_epochs=20, enable_noise_category=True, return_variance=True,
+    ... )
+
+    >>> # Serial execution (useful for profiling or debugging)
+    >>> result = ensemble_label_propagation(
+    ...     graph, mapper, seeds, ["left", "right"],
+    ...     n_epochs=10, enable_noise_category=True, n_workers=1,
     ... )
 
     Notes
@@ -581,12 +626,8 @@ def ensemble_label_propagation(
       averaged like any other label.
     - Probability averaging (not vote averaging) is what gives the bagging
       variance reduction. Recomputing ``dominant_label`` from averaged
-      probabilities means a node can have a different dominant label in the
-      ensemble than in any single epoch — this is correct, not a bug.
-    - Epochs run serially. Parallelization is straightforward (each epoch
-      is independent and reads ``graph`` read-only) but is not yet wired;
-      see ``_ensemble_run_epoch`` for the natural ``ProcessPoolExecutor``
-      entry point.
+      probabilities means a node can have a different dominant label in
+      the ensemble than in any single epoch — this is correct, not a bug.
     """
     if n_epochs < 2:
         raise ConfigurationError(
@@ -595,7 +636,9 @@ def ensemble_label_propagation(
             value=n_epochs,
         )
 
-    if not glp_kwargs.get("enable_noise_category", False):
+    enable_noise = glp_kwargs.get("enable_noise_category", False)
+
+    if not enable_noise:
         warnings.warn(
             "ensemble_label_propagation with enable_noise_category=False "
             "produces n_epochs identical runs (no noise resampling to ensemble "
@@ -612,28 +655,89 @@ def ensemble_label_propagation(
     # random_seed is set per epoch; drop any user-supplied value.
     glp_kwargs.pop("random_seed", None)
 
-    # Normalize seed_labels once so is_seed in the output reflects the
-    # user-supplied seeds only (noise seeds vary across epochs and would
-    # otherwise leak epoch-0's random sample into the ensemble result).
+    # Extract propagation parameters with defaults matching
+    # guided_label_propagation's signature. Explicit unpacking keeps the
+    # worker-call site honest and makes validation happen up front.
+    alpha = glp_kwargs.get("alpha", 0.85)
+    max_iterations = glp_kwargs.get("max_iterations", 100)
+    convergence_threshold = glp_kwargs.get("convergence_threshold", 1e-6)
+    normalize = glp_kwargs.get("normalize", True)
+    directional = glp_kwargs.get("directional", True)
+    noise_ratio = glp_kwargs.get("noise_ratio", 0.1)
+    confidence_threshold = glp_kwargs.get("confidence_threshold", 0.0)
+    weight_transform = glp_kwargs.get("weight_transform", None)
     seed_node_col = glp_kwargs.get("seed_node_col", "node_id")
     seed_label_col = glp_kwargs.get("seed_label_col", "label")
-    original_seed_ids = set(
-        normalize_seed_input(seed_labels, seed_node_col, seed_label_col).keys()
+
+    # Normalize seed input once; is_seed in the output reflects only these
+    # user-supplied seeds (per-epoch noise seeds would otherwise leak
+    # epoch-0's random sample into the ensemble result).
+    seed_labels = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
+    original_seed_ids = set(seed_labels.keys())
+
+    _validate_inputs(
+        graph, id_mapper, seed_labels, labels, alpha,
+        max_iterations, convergence_threshold, enable_noise,
+        noise_ratio, confidence_threshold,
     )
+
+    # Append the auto-noise label if not already present. Matches
+    # _process_noise_category's behavior so column ordering is identical
+    # to the single-GLP path.
+    processed_labels = labels.copy()
+    if "noise" not in processed_labels:
+        processed_labels.append("noise")
+
+    # base_Y: user seeds only, no noise. Workers copy this and write noise
+    # rows in-place; the original stays read-only and shared.
+    base_Y = _initialize_label_matrix(
+        graph, id_mapper, seed_labels, processed_labels
+    )
+
+    # Noise-sampling setup. If the user explicitly tagged seeds as "noise"
+    # the legacy path skips noise generation entirely (and all epochs become
+    # identical) — preserve that behavior here.
+    if "noise" in seed_labels.values():
+        noise_label_idx: Optional[int] = None
+        non_seed_pool: List[int] = []
+        n_noise_seeds = 0
+    else:
+        noise_label_idx = processed_labels.index("noise")
+        # Order must match _generate_noise_seeds: list(set(all) - set(seeds))
+        all_nodes = set(range(graph.numberOfNodes()))
+        seed_internals = {
+            id_mapper.get_internal(sid) for sid in seed_labels.keys()
+        }
+        non_seed_pool = list(all_nodes - seed_internals)
+        n_noise_seeds = max(1, int(noise_ratio * len(seed_labels)))
+        n_noise_seeds = min(n_noise_seeds, len(non_seed_pool))
+
+    # Build P once. For directed + directional=True, also build P_in (the
+    # in-degree pass uses A^T row-normalized by in-degree).
+    is_directed = graph.isDirected()
+    do_directional = is_directed and directional
+
+    if do_directional:
+        direction_out = "out_degree"
+    else:
+        direction_out = "undirected" if not is_directed else "out_degree"
+
+    P_out = _create_transition_matrix(graph, direction_out, weight_transform)
+    P_in = (
+        _create_transition_matrix(graph, "in_degree", weight_transform)
+        if do_directional else None
+    )
+
+    # Resolve worker count. None → use all cores up to n_epochs.
+    if n_workers is None:
+        n_workers = min(n_epochs, max(1, os.cpu_count() or 1))
+    n_workers = max(1, min(n_workers, n_epochs))
 
     logger.info(
-        f"Starting ensemble propagation: n_epochs={n_epochs}, base_seed={base_seed}"
+        f"Starting ensemble propagation: n_epochs={n_epochs}, "
+        f"base_seed={base_seed}, n_workers={n_workers}, "
+        f"directional={do_directional}"
     )
-
-    # Buffers populated on first epoch (we discover result shape from it).
-    mean_out: Optional[np.ndarray] = None
-    mean_in: Optional[np.ndarray] = None
-    m2_out: Optional[np.ndarray] = None
-    m2_in: Optional[np.ndarray] = None
-    template_out: Optional[pl.DataFrame] = None
-    template_in: Optional[pl.DataFrame] = None
-    label_cols: Optional[List[str]] = None
-    all_labels: Optional[List[str]] = None
 
     def _welford_update(
         mean: np.ndarray,
@@ -649,55 +753,59 @@ def ensemble_label_propagation(
             m2 = m2 + delta * delta2
         return mean, m2
 
-    for epoch in range(n_epochs):
-        epoch_seed = base_seed + epoch
-        logger.debug(f"Ensemble epoch {epoch + 1}/{n_epochs} (random_seed={epoch_seed})")
+    mean_out: Optional[np.ndarray] = None
+    mean_in: Optional[np.ndarray] = None
+    m2_out: Optional[np.ndarray] = None
+    m2_in: Optional[np.ndarray] = None
 
-        result = guided_label_propagation(
-            graph, id_mapper, seed_labels, labels,
-            random_seed=epoch_seed, **glp_kwargs,
-        )
-        is_tuple = isinstance(result, tuple)
-        out_df = result[0] if is_tuple else result
-        in_df = result[1] if is_tuple else None
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = [
+            executor.submit(
+                _ensemble_run_epoch,
+                P_out, P_in, base_Y, non_seed_pool, n_noise_seeds,
+                noise_label_idx, alpha, max_iterations, convergence_threshold,
+                normalize, base_seed + epoch,
+            )
+            for epoch in range(n_epochs)
+        ]
 
-        if epoch == 0:
-            # Discover the label column set from the first result. When
-            # enable_noise_category is on, the result has an extra noise_prob
-            # column that we need to average too.
-            label_cols = [c for c in out_df.columns if c.endswith("_prob")]
-            all_labels = [c[: -len("_prob")] for c in label_cols]
-            template_out = out_df
-            mean_out = out_df.select(label_cols).to_numpy().copy()
-            m2_out = np.zeros_like(mean_out) if return_variance else None
-            if is_tuple:
-                template_in = in_df
-                mean_in = in_df.select(label_cols).to_numpy().copy()
-                m2_in = np.zeros_like(mean_in) if return_variance else None
-            continue
+        # Consume in submission order so Welford's floating-point reduction
+        # is deterministic regardless of which thread finishes first.
+        for epoch_idx, fut in enumerate(futures):
+            F_out, F_in = fut.result()
 
-        new_out = out_df.select(label_cols).to_numpy()
-        mean_out, m2_out = _welford_update(mean_out, m2_out, new_out, epoch + 1)
-        if is_tuple:
-            new_in = in_df.select(label_cols).to_numpy()
-            mean_in, m2_in = _welford_update(mean_in, m2_in, new_in, epoch + 1)
+            if epoch_idx == 0:
+                mean_out = F_out.copy()
+                m2_out = np.zeros_like(F_out) if return_variance else None
+                if F_in is not None:
+                    mean_in = F_in.copy()
+                    m2_in = np.zeros_like(F_in) if return_variance else None
+            else:
+                mean_out, m2_out = _welford_update(
+                    mean_out, m2_out, F_out, epoch_idx + 1
+                )
+                if F_in is not None:
+                    mean_in, m2_in = _welford_update(
+                        mean_in, m2_in, F_in, epoch_idx + 1
+                    )
 
-    def _assemble(
-        template: pl.DataFrame,
-        mean: np.ndarray,
-        m2: Optional[np.ndarray],
-    ) -> pl.DataFrame:
+    logger.info(f"Completed ensemble: averaged {n_epochs} epochs")
+
+    n_nodes = graph.numberOfNodes()
+    original_ids = id_mapper.get_original_batch(list(range(n_nodes)))
+    label_cols = [f"{label}_prob" for label in processed_labels]
+
+    def _assemble(mean: np.ndarray, m2: Optional[np.ndarray]) -> pl.DataFrame:
         dom_idx = np.argmax(mean, axis=1)
-        dom_labels = [all_labels[i] for i in dom_idx]
+        dom_labels = [processed_labels[i] for i in dom_idx]
         conf = mean.max(axis=1)
 
-        cols: Dict[str, Any] = {"node_id": template["node_id"]}
+        cols: Dict[str, Any] = {"node_id": original_ids}
         for i, col_name in enumerate(label_cols):
             cols[col_name] = mean[:, i]
         cols["dominant_label"] = dom_labels
         cols["confidence"] = conf
-        # is_seed reflects user-supplied seeds only, not per-epoch noise seeds.
-        cols["is_seed"] = [nid in original_seed_ids for nid in template["node_id"].to_list()]
+        cols["is_seed"] = [nid in original_seed_ids for nid in original_ids]
 
         if m2 is not None:
             # Sample variance with Bessel's correction (n_epochs >= 2 enforced above).
@@ -706,16 +814,16 @@ def ensemble_label_propagation(
             for i, col_name in enumerate(label_cols):
                 cols[f"{col_name}_std"] = std[:, i]
 
-        return pl.DataFrame(cols)
+        df = pl.DataFrame(cols)
 
-    logger.info(f"Completed ensemble: averaged {n_epochs} epochs")
+        if confidence_threshold > 0.0:
+            df = _apply_confidence_threshold(df, confidence_threshold)
 
-    if template_in is not None:
-        return (
-            _assemble(template_out, mean_out, m2_out),
-            _assemble(template_in, mean_in, m2_in),
-        )
-    return _assemble(template_out, mean_out, m2_out)
+        return df
+
+    if mean_in is not None:
+        return _assemble(mean_out, m2_out), _assemble(mean_in, m2_in)
+    return _assemble(mean_out, m2_out)
 
 
 def _validate_inputs(
@@ -1151,16 +1259,7 @@ def _create_results_dataframe(
         
         # Normalize probabilities if requested
         if normalize:
-            row_sums = F.sum(axis=1, keepdims=True)
-            # Handle rows with zero probabilities
-            zero_mask = (row_sums.flatten() == 0)
-            if zero_mask.any():
-                # For nodes with no probabilities, set uniform distribution
-                uniform_prob = 1.0 / n_labels
-                F[zero_mask, :] = uniform_prob
-                row_sums = F.sum(axis=1, keepdims=True)
-            
-            F = F / row_sums
+            F = _normalize_F(F)
         
         # Calculate dominant label and confidence
         dominant_indices = np.argmax(F, axis=1)
@@ -1273,6 +1372,116 @@ def _iterative_propagation(
             threshold=convergence_threshold
         )
 
+
+def _normalize_F(F: np.ndarray) -> np.ndarray:
+    """
+    Row-normalize a label-probability matrix so each row sums to 1.
+
+    Rows that sum to zero (e.g., zero-degree nodes that never received any
+    mass) are filled with a uniform distribution. Extracted from
+    :func:`_create_results_dataframe` so the ensemble worker can normalize
+    without going through DataFrame construction.
+
+    Returns
+    -------
+    np.ndarray
+        Normalized matrix. May be the same object as ``F`` (modified in
+        place) — always assign the return value.
+    """
+    n_labels = F.shape[1]
+    row_sums = F.sum(axis=1, keepdims=True)
+    zero_mask = (row_sums.flatten() == 0)
+    if zero_mask.any():
+        F[zero_mask, :] = 1.0 / n_labels
+        row_sums = F.sum(axis=1, keepdims=True)
+    return F / row_sums
+
+
+def _ensemble_run_epoch(
+    P_out: sp.csr_matrix,
+    P_in: Optional[sp.csr_matrix],
+    base_Y: np.ndarray,
+    non_seed_pool: List[int],
+    n_noise_seeds: int,
+    noise_label_idx: Optional[int],
+    alpha: float,
+    max_iterations: int,
+    convergence_threshold: float,
+    normalize: bool,
+    epoch_seed: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Run one ensemble epoch on shared, pre-built transition matrices.
+
+    Samples ``n_noise_seeds`` noise nodes from ``non_seed_pool`` with a local
+    RNG seeded by ``epoch_seed``, builds the epoch's Y matrix by writing 1.0
+    at the noise column of those rows, and runs propagation. All heavy work
+    (sparse matmul, dense arithmetic, copies) happens in NumPy/SciPy C
+    extensions that release the GIL, so multiple threads calling this with
+    the same ``P_out``/``P_in`` scale across cores.
+
+    ``P_out``, ``P_in``, ``base_Y``, and ``non_seed_pool`` MUST be treated
+    as read-only — the function ``.copy()``s ``base_Y`` before mutating.
+
+    Parameters
+    ----------
+    P_out : sp.csr_matrix
+        Transition matrix for out-degree (or undirected) propagation. Shared
+        across threads; must not be mutated.
+    P_in : Optional[sp.csr_matrix]
+        Transition matrix for in-degree propagation, or ``None`` if
+        directional propagation was not requested.
+    base_Y : np.ndarray
+        ``(n_nodes, n_labels)`` matrix with user-supplied seed positions
+        already marked. The ``"noise"`` column (if any) is left zero —
+        noise seeds are added per epoch.
+    non_seed_pool : List[int]
+        Internal node IDs eligible to be sampled as noise. Order matters
+        for reproducibility — must match ``list(set(all) - set(seeds))``
+        from :func:`_generate_noise_seeds`.
+    n_noise_seeds : int
+        Number of noise nodes to sample. Already clamped to
+        ``min(ceil(noise_ratio * n_user_seeds), len(non_seed_pool))``.
+        Set to 0 to skip noise sampling entirely.
+    noise_label_idx : Optional[int]
+        Column index of the ``"noise"`` label in ``base_Y``, or ``None``
+        when there is no noise category (then no noise seeds are added
+        regardless of ``n_noise_seeds``).
+    alpha, max_iterations, convergence_threshold, normalize
+        Forwarded to :func:`_iterative_propagation` and :func:`_normalize_F`.
+    epoch_seed : int
+        RNG seed for this epoch's noise sample. Distinct values produce
+        independent samples — this is what gives the ensemble its
+        variance reduction.
+
+    Returns
+    -------
+    Tuple[np.ndarray, Optional[np.ndarray]]
+        ``(F_out, F_in)`` where ``F_in`` is ``None`` iff ``P_in`` is.
+    """
+    Y = base_Y.copy()
+    if noise_label_idx is not None and n_noise_seeds > 0 and non_seed_pool:
+        rng = random.Random(epoch_seed)
+        noise_internals = rng.sample(non_seed_pool, n_noise_seeds)
+        Y[noise_internals, noise_label_idx] = 1.0
+
+    F_out = Y.copy()
+    _iterative_propagation(
+        F_out, P_out, Y, alpha, max_iterations, convergence_threshold
+    )
+    if normalize:
+        F_out = _normalize_F(F_out)
+
+    F_in: Optional[np.ndarray] = None
+    if P_in is not None:
+        F_in = Y.copy()
+        _iterative_propagation(
+            F_in, P_in, Y, alpha, max_iterations, convergence_threshold
+        )
+        if normalize:
+            F_in = _normalize_F(F_in)
+
+    return F_out, F_in
 
 
 def get_propagation_info(
