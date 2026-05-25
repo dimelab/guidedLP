@@ -94,25 +94,31 @@ results = guided_label_propagation(
 print(f"Classified {len(results)} nodes with community probabilities")
 ```
 
-## Graph or DataFrame: pick your shape
+## Graph, DataFrame, or EdgeList: pick your shape
 
-`apply_backbone`, `filter_graph`, and `project_bipartite` all accept **either** a NetworkIt graph **or** a Polars edge frame with columns `source_id`, `target_id`, `weight`. The output type defaults to matching the input but can be forced with `output_format="graph"` or `output_format="dataframe"`.
+`apply_backbone`, `filter_graph`, and `project_bipartite` all accept **either** a NetworkIt graph, a Polars edge frame (columns `source_id`, `target_id`, `weight`), or a coded **EdgeList**. The output type defaults to matching the input but can be forced with `output_format="graph"`, `output_format="dataframe"`, or `output_format="edgelist"`.
 
 Supported combos:
 
 | Input → Output | When to use |
 |---|---|
 | `graph → graph` (default for graph in) | Existing workflows — nothing changes. |
-| `graph → dataframe` | Inspect or chain a result in Polars without rebuilding. |
+| `graph → dataframe` / `graph → edgelist` | Inspect or chain a result without rebuilding. |
 | `frame → frame`  (default for frame in) | Stay in dataframe land — chain filtering, backboning, projection without ever building a graph. Faster when you don't need NetworkIt's traversals between steps. |
+| `edgelist → edgelist` (default for edgelist in) | Hub-heavy bipartite projection at scale. The coded path is ~3–7× more memory-efficient than the dataframe path on hub-heavy data, and handles projections (~200M edges) that OOM the graph path. |
 | `frame → graph` | Not supported — call `build_graph_from_edgelist()` on the returned frame instead. |
 
-Two utilities bridge the two worlds:
+`EdgeList` is a small wrapper around a Polars DataFrame whose `src` / `tgt` columns hold `UInt32` codes (NetworkIt-style internal IDs) plus an optional `weight`. It pairs with an `IDMapper` for translation back to original IDs. Use it when the raw frame is too large to keep around as strings, or when you're about to do a bipartite projection big enough that the legacy `Dict[Any, Set[Any]]` neighbor map matters.
 
-- `build_graph_from_edgelist(df, …)` — frame → graph
+Utilities to bridge the three worlds:
+
+- `build_graph_from_edgelist(df, …)` — frame → graph (composes through `build_edgelist_from_frame` + `edgelist_to_graph` internally)
+- `build_edgelist_from_frame(df, …)` — frame → EdgeList (same pre-processing as the graph builder, but skips the NetworkIt build)
+- `edgelist_to_graph(el, mapper)` — EdgeList → graph (cheap; codes are already internal IDs)
+- `graph_to_edgelist(graph, mapper)` — graph → EdgeList (cheap; sibling of `graph_to_edges`)
 - `graph_to_edges(graph, mapper)` — graph → frame (originals, ready for the dataframe path)
 
-Functions that genuinely *need* graph traversal (`filter_by_seed_proximity`, the `"giant_component_only"` / `"centrality"` filters in `filter_graph`, all GLP propagation and centrality algorithms) only accept graph input; they'll raise a clear error if handed a frame, naming the conversion utility to call.
+Functions that genuinely *need* graph traversal (`filter_by_seed_proximity`, the `"giant_component_only"` / `"centrality"` filters in `filter_graph`, all GLP propagation and centrality algorithms) only accept graph input; they'll raise a clear error if handed a frame or EdgeList, naming the conversion utility to call.
 
 ## Examples
 
@@ -222,6 +228,26 @@ user_graph, user_mapper = project_bipartite(
 
 # Seeds must refer to nodes in the projected partition (here: users).
 # The new mapper contains only users — verify with check_seed_coverage(user_mapper, seeds).
+```
+
+**For hub-heavy bipartites at scale** — datasets where a few popular intermediate items (a viral hashtag, a popular URL) are touched by thousands of users — switch to the `EdgeList` path. The projection edge count can explode by orders of magnitude through a single hub, and the coded path delivers ~3–7× peak-RSS reduction. On a 20K-user × 2K-item Zipf-popular bipartite (~240K input edges → 199M projection edges), the legacy graph path runs out of memory; the EdgeList path completes cleanly.
+
+```python
+from guidedLP.network.construction import build_edgelist_from_frame, project_bipartite
+
+# build_edgelist_from_frame takes the same kwargs as build_graph_from_edgelist
+# plus an optional code_dtype (UInt32 default; pass UInt64 above ~4.29B nodes).
+bipartite_el, full_mapper = build_edgelist_from_frame(
+    edges, source_col="user", target_col="hashtag", weight_col="count",
+    bipartite=True,
+)
+# Default output matches input: EdgeList in → (EdgeList, IDMapper) out.
+user_el, user_mapper = project_bipartite(
+    bipartite_el, full_mapper, projection_mode="source", weight_method="jaccard",
+)
+# Force a graph or frame if downstream needs one:
+#   output_format="graph"     → (nk.Graph, IDMapper)
+#   output_format="dataframe" → pl.DataFrame  (source_id, target_id, weight)
 ```
 
 For temporal bipartite data where edge order matters (A shared an item before B → B may attribute back to A), use `temporal_bipartite_to_unipartite` instead. It produces a *directed* unipartite graph using **citation convention**: edges point from later sharer → earlier sharer, so PageRank / HITS-Authority naturally surface the original sources. The function trusts your row order — pre-sort the edgelist by intermediate column ascending, then timestamp descending.

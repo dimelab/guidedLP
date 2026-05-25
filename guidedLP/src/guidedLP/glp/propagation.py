@@ -16,7 +16,8 @@ For directed graphs, run propagation twice:
 - In-degree: Use A^T (receptivity propagation)
 """
 
-from typing import Dict, List, Tuple, Union, Optional, Any
+from typing import Callable, Dict, List, Tuple, Union, Optional, Any
+import math
 import warnings
 import numpy as np
 import scipy.sparse as sp
@@ -39,6 +40,67 @@ from guidedLP.common.seed_input import SeedInput, normalize_seed_input
 logger = get_logger(__name__)
 
 
+# Edge-weight transforms ----------------------------------------------------
+# A WeightTransform maps a raw edge weight to a propagation weight. It is
+# applied at transition-matrix build time, not graph-construction time, so the
+# same graph can be propagated under multiple transforms without rebuilding.
+#
+# Transforms must satisfy ``f(w) > 0`` for ``w > 0`` — the zero-degree
+# handling in ``_create_transition_matrix`` treats a zero row-sum as an
+# isolated node, so a transform that maps positive weights to zero will
+# silently disconnect parts of the graph.
+
+WeightTransform = Callable[[float], float]
+
+
+def tanh_transform(scale: float = 100.0, offset: float = 1.0) -> WeightTransform:
+    """
+    Tanh-based weight compression (the historical ``stlp`` transform).
+
+    Returns ``f(w) = tanh((w + offset) / scale)``. Saturates as ``w`` grows
+    large, so a single very heavy edge cannot dominate its neighborhood.
+
+    Parameters
+    ----------
+    scale : float, default 100.0
+        Larger values delay saturation; smaller values compress harder.
+    offset : float, default 1.0
+        Shifts the input so small weights still produce nonzero output.
+
+    Returns
+    -------
+    WeightTransform
+    """
+    return lambda w: math.tanh((w + offset) / scale)
+
+
+def log1p_transform() -> WeightTransform:
+    """
+    Logarithmic compression: ``f(w) = log(1 + w)``.
+
+    Gentler than tanh — no upper bound, but high weights still grow much
+    more slowly than linear. Good first choice when edge weights span
+    several orders of magnitude.
+    """
+    return math.log1p
+
+
+def winsorize_transform(cap: float) -> WeightTransform:
+    """
+    Hard cap: ``f(w) = min(w, cap)``.
+
+    Cheapest outlier control. Linear up to ``cap``, then flat. Useful when
+    you want to neutralize a known number of anomalous high-weight edges
+    without changing the rest of the weight distribution.
+    """
+    if cap <= 0:
+        raise ConfigurationError(
+            f"winsorize_transform requires cap > 0, got {cap}",
+            parameter="cap", value=cap,
+        )
+    return lambda w: min(w, cap)
+
+
 def guided_label_propagation(
     graph: nk.Graph,
     id_mapper: IDMapper,
@@ -55,6 +117,8 @@ def guided_label_propagation(
     confidence_threshold: float = 0.0,
     seed_node_col: str = "node_id",
     seed_label_col: str = "label",
+    weight_transform: Optional[WeightTransform] = None,
+    random_seed: Optional[int] = 42,
 ) -> Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]:
     """
     Propagate labels from seed nodes through network using guided label propagation.
@@ -117,6 +181,18 @@ def guided_label_propagation(
         Column name for node IDs when ``seed_labels`` is a DataFrame.
     seed_label_col : str, default "label"
         Column name for labels when ``seed_labels`` is a DataFrame.
+    weight_transform : Optional[WeightTransform], default None
+        Callable applied to each raw edge weight when the transition matrix
+        is built. Use :func:`tanh_transform`, :func:`log1p_transform`, or
+        :func:`winsorize_transform` to compress heavy-tailed weight
+        distributions. Must satisfy ``f(w) > 0`` for ``w > 0`` — otherwise
+        nodes whose edges all map to zero become treated as isolates.
+    random_seed : Optional[int], default 42
+        Seed for the local RNG used when generating noise seeds
+        (``enable_noise_category=True``). Distinct values produce
+        independent noise samples — :func:`ensemble_label_propagation`
+        relies on this. Pass ``None`` to use the global :mod:`random`
+        state. No effect when ``enable_noise_category=False``.
 
     Returns
     -------
@@ -183,7 +259,8 @@ def guided_label_propagation(
     
     # Process labels and seeds with noise category support
     processed_labels, processed_seed_labels = _process_noise_category(
-        graph, id_mapper, seed_labels, labels, enable_noise_category, noise_ratio
+        graph, id_mapper, seed_labels, labels, enable_noise_category, noise_ratio,
+        random_seed=random_seed,
     )
     
     # Check if graph is directed
@@ -196,7 +273,8 @@ def guided_label_propagation(
         result = _run_single_propagation(
             graph, id_mapper, processed_seed_labels, processed_labels, alpha,
             max_iterations, convergence_threshold, normalize,
-            direction="undirected" if not is_directed else "out_degree"
+            direction="undirected" if not is_directed else "out_degree",
+            weight_transform=weight_transform,
         )
         
         # Apply confidence thresholding if enabled
@@ -214,14 +292,16 @@ def guided_label_propagation(
         out_result = _run_single_propagation(
             graph, id_mapper, processed_seed_labels, processed_labels, alpha,
             max_iterations, convergence_threshold, normalize,
-            direction="out_degree"
+            direction="out_degree",
+            weight_transform=weight_transform,
         )
-        
+
         # In-degree propagation (receptivity) - use transposed adjacency
         in_result = _run_single_propagation(
             graph, id_mapper, processed_seed_labels, processed_labels, alpha,
             max_iterations, convergence_threshold, normalize,
-            direction="in_degree"
+            direction="in_degree",
+            weight_transform=weight_transform,
         )
         
         # Apply confidence thresholding if enabled
@@ -231,6 +311,391 @@ def guided_label_propagation(
         
         logger.info("Completed directional propagation")
         return out_result, in_result
+
+
+def audience_composition_pass(
+    graph: nk.Graph,
+    id_mapper: IDMapper,
+    forward_result: pl.DataFrame,
+    labels: List[str],
+    weight_transform: Optional[WeightTransform] = None,
+    normalize: bool = True,
+) -> pl.DataFrame:
+    """
+    Compute audience composition by one-hop aggregation of converged forward labels.
+
+    For each node ``n``, computes the in-degree-weighted average of the
+    forward-pass label probabilities of nodes pointing at ``n``:
+
+    .. math::
+
+        \\text{audience}[n, j] = \\frac{1}{\\deg_{in}(n)}
+            \\sum_{m: m \\to n} w(m, n) \\cdot F_\\text{forward}[m, j]
+
+    Semantically, this answers "what is the (forward-pass) label profile of
+    nodes that point at ``n``?" — i.e., a measurement of audience or
+    reception, given that the forward pass has labeled each node by its own
+    outgoing structure.
+
+    This is **distinct** from running :func:`guided_label_propagation` with
+    ``directional=True``: the latter's in-degree pass is a full backward
+    random walk starting from the *original* seeds, answering "is ``n``
+    upstream of a seed?" The audience pass instead consumes the converged
+    forward labels at every node and aggregates them one hop along incoming
+    edges, without iteration.
+
+    This recovers the semantics of the legacy ``stlp`` reverse-direction
+    pass in ``guidedLP_OLD/network/net_utils.py``. See
+    ``docs/architecture/glp.md`` for the broader semantic distinction.
+
+    Time complexity: ``O(E + n·k)`` — single sparse matmul.
+    Space complexity: ``O(n·k + E)``.
+
+    Parameters
+    ----------
+    graph : nk.Graph
+        Directed graph. Must be the same graph used to compute
+        ``forward_result``.
+    id_mapper : IDMapper
+        Bidirectional mapping for the graph.
+    forward_result : pl.DataFrame
+        Output of :func:`guided_label_propagation` (single DataFrame, not the
+        tuple form). Must contain columns ``node_id`` and one ``{label}_prob``
+        per entry in ``labels``. The ``is_seed`` column, if present, is
+        carried through to the output.
+    labels : List[str]
+        Labels to compute audience for. Each must have a corresponding
+        ``{label}_prob`` column in ``forward_result``. To include the noise
+        column, pass ``"noise"`` explicitly in this list.
+    weight_transform : Optional[WeightTransform], default None
+        Same edge-weight transform as for the forward pass. Pass the same
+        callable that was used in :func:`guided_label_propagation` so the
+        two passes are consistent.
+    normalize : bool, default True
+        Row-normalize the result so each node's probabilities sum to 1.
+        Disable to read raw aggregated mass.
+
+    Returns
+    -------
+    pl.DataFrame
+        Same schema as :func:`guided_label_propagation` output:
+        ``node_id``, ``{label}_prob`` columns, ``dominant_label``,
+        ``confidence``, ``is_seed``. The ``is_seed`` column is carried
+        through from ``forward_result`` (audience pass has no seeds of its
+        own — this column identifies forward-pass seeds).
+
+    Raises
+    ------
+    ValidationError
+        If ``graph`` is undirected, ``forward_result`` is missing required
+        columns, or ``forward_result.node_id`` references nodes not in
+        ``id_mapper``.
+
+    Examples
+    --------
+    >>> forward = guided_label_propagation(
+    ...     graph, mapper, seeds, ["left", "right"], directional=False
+    ... )
+    >>> audience = audience_composition_pass(
+    ...     graph, mapper, forward, ["left", "right"]
+    ... )
+    >>> # audience["left_prob"] now reads as: "fraction of in-neighbors that
+    >>> # the forward pass labeled left"
+
+    Notes
+    -----
+    - Nodes with zero in-degree receive a uniform distribution after
+      normalization (no in-neighbors to aggregate from).
+    - The historical ``stlp`` reverse pass also skipped iteration and
+      disabled distance decay; this implementation matches that behavior
+      exactly (one matmul, no ``α``, no ``Y`` term).
+    """
+    if not graph.isDirected():
+        raise ValidationError(
+            "audience_composition_pass requires a directed graph. For undirected "
+            "graphs, the in-neighbor aggregation is symmetric with the forward "
+            "pass and produces no additional information."
+        )
+
+    required_cols = {"node_id"} | {f"{label}_prob" for label in labels}
+    missing = required_cols - set(forward_result.columns)
+    if missing:
+        raise ValidationError(
+            f"forward_result missing required columns: {sorted(missing)}",
+            details={"missing_columns": sorted(missing), "labels": labels},
+        )
+
+    n_nodes = graph.numberOfNodes()
+    n_labels = len(labels)
+    label_cols = [f"{label}_prob" for label in labels]
+
+    with LoggingTimer("Audience composition pass"):
+        # Reconstruct F_forward (n × k) indexed by internal node IDs
+        F_forward = np.zeros((n_nodes, n_labels), dtype=np.float64)
+        fwd_ids = forward_result["node_id"].to_list()
+        fwd_probs = forward_result.select(label_cols).to_numpy()
+        internal_ids = id_mapper.get_internal_batch(fwd_ids)
+        F_forward[internal_ids] = fwd_probs
+
+        # Build A^T (rows = receivers, cols = senders): for each original edge
+        # u -> v, place weight at row v, col u.
+        rows: List[int] = []
+        cols: List[int] = []
+        weights: List[float] = []
+        for u, v in graph.iterEdges():
+            w = graph.weight(u, v)
+            if weight_transform is not None:
+                w = weight_transform(w)
+            rows.append(v)
+            cols.append(u)
+            weights.append(w)
+
+        A_T = sp.coo_matrix(
+            (weights, (rows, cols)),
+            shape=(n_nodes, n_nodes),
+            dtype=np.float64,
+        ).tocsr()
+
+        # Row-normalize by in-degree (mass per row of A^T = total incoming weight)
+        in_deg = np.array(A_T.sum(axis=1)).flatten()
+        zero_mask = (in_deg == 0)
+        in_deg[zero_mask] = 1.0  # avoid div-by-zero; rows are all-zero anyway
+        in_deg_inv = 1.0 / in_deg
+        in_deg_inv[zero_mask] = 0.0
+        A_T_norm = sp.diags(in_deg_inv).dot(A_T)
+
+        # Single-hop aggregation. No iteration, no Y term, no alpha.
+        F_audience = A_T_norm.dot(F_forward)
+
+        # Build a Y-like indicator for is_seed pass-through. _create_results_dataframe
+        # reads seed_mask = (Y.sum(axis=1) > 0), so we just need any nonzero entry
+        # per forward-seed row.
+        Y_passthrough = np.zeros_like(F_audience)
+        if "is_seed" in forward_result.columns:
+            seed_mask_input = forward_result["is_seed"].to_numpy()
+            seed_internals = [
+                internal_ids[i] for i, was_seed in enumerate(seed_mask_input)
+                if was_seed
+            ]
+            if seed_internals:
+                Y_passthrough[seed_internals, 0] = 1.0
+
+        return _create_results_dataframe(
+            F_audience, Y_passthrough, labels, id_mapper,
+            normalize=normalize, converged_iteration=1, direction="audience",
+        )
+
+
+def ensemble_label_propagation(
+    graph: nk.Graph,
+    id_mapper: IDMapper,
+    seed_labels: SeedInput,
+    labels: List[str],
+    n_epochs: int = 10,
+    base_seed: int = 42,
+    return_variance: bool = False,
+    **glp_kwargs: Any,
+) -> Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]:
+    """
+    Average ``n_epochs`` independent GLP runs with resampled noise seeds.
+
+    Repeatedly calls :func:`guided_label_propagation` with a per-epoch
+    ``random_seed = base_seed + epoch_index`` and averages the resulting
+    probability matrices using Welford's online algorithm. This recovers the
+    bagging-style variance reduction from the legacy ``stlp`` implementation's
+    ``epochs`` loop, where each epoch sampled fresh noise seeds.
+
+    Only meaningful when ``enable_noise_category=True`` — otherwise each
+    epoch produces an identical deterministic result and ensembling reduces
+    to a single run. A warning is emitted in that case and a single GLP run
+    is returned instead.
+
+    Time complexity: ``O(n_epochs · cost(guided_label_propagation))``.
+    Space complexity: ``O(n · k)`` — running mean/variance only, no
+    per-epoch matrices retained.
+
+    Parameters
+    ----------
+    graph, id_mapper, seed_labels, labels
+        Forwarded to :func:`guided_label_propagation`. See that function's
+        docstring for details.
+    n_epochs : int, default 10
+        Number of independent runs to average. Must be ``>= 2``.
+    base_seed : int, default 42
+        Each epoch ``i`` uses ``random_seed = base_seed + i``. Together with
+        ``n_epochs`` this makes the ensemble fully deterministic.
+    return_variance : bool, default False
+        If True, the returned DataFrame(s) include ``{label}_prob_std``
+        columns alongside the means (sample standard deviation across
+        epochs, with Bessel's correction).
+    **glp_kwargs
+        Any other :func:`guided_label_propagation` keyword arguments. Any
+        ``random_seed`` value is overridden per epoch.
+
+    Returns
+    -------
+    Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]
+        Same shape as :func:`guided_label_propagation` — single DataFrame
+        for undirected/``directional=False``, tuple for directed +
+        ``directional=True``. ``{label}_prob`` columns hold averaged
+        probabilities; ``dominant_label`` and ``confidence`` are recomputed
+        from the averaged probabilities (not voted across epochs).
+
+    Raises
+    ------
+    ConfigurationError
+        If ``n_epochs < 2``.
+
+    Examples
+    --------
+    >>> # 20 noise-resampled runs, with per-label std for confidence intervals
+    >>> result = ensemble_label_propagation(
+    ...     graph, mapper, seeds, ["left", "right"],
+    ...     n_epochs=20, enable_noise_category=True, return_variance=True,
+    ... )
+
+    Notes
+    -----
+    - The label set passed in does not need to include ``"noise"``; when
+      ``enable_noise_category=True`` the noise column is auto-added and
+      averaged like any other label.
+    - Probability averaging (not vote averaging) is what gives the bagging
+      variance reduction. Recomputing ``dominant_label`` from averaged
+      probabilities means a node can have a different dominant label in the
+      ensemble than in any single epoch — this is correct, not a bug.
+    - Epochs run serially. Parallelization is straightforward (each epoch
+      is independent and reads ``graph`` read-only) but is not yet wired;
+      see ``_ensemble_run_epoch`` for the natural ``ProcessPoolExecutor``
+      entry point.
+    """
+    if n_epochs < 2:
+        raise ConfigurationError(
+            f"n_epochs must be >= 2 for ensembling, got {n_epochs}",
+            parameter="n_epochs",
+            value=n_epochs,
+        )
+
+    if not glp_kwargs.get("enable_noise_category", False):
+        warnings.warn(
+            "ensemble_label_propagation with enable_noise_category=False "
+            "produces n_epochs identical runs (no noise resampling to ensemble "
+            "over). Returning a single GLP run instead. Pass "
+            "enable_noise_category=True to get the bagging effect.",
+            UserWarning,
+            stacklevel=2,
+        )
+        glp_kwargs.pop("random_seed", None)
+        return guided_label_propagation(
+            graph, id_mapper, seed_labels, labels, **glp_kwargs
+        )
+
+    # random_seed is set per epoch; drop any user-supplied value.
+    glp_kwargs.pop("random_seed", None)
+
+    # Normalize seed_labels once so is_seed in the output reflects the
+    # user-supplied seeds only (noise seeds vary across epochs and would
+    # otherwise leak epoch-0's random sample into the ensemble result).
+    seed_node_col = glp_kwargs.get("seed_node_col", "node_id")
+    seed_label_col = glp_kwargs.get("seed_label_col", "label")
+    original_seed_ids = set(
+        normalize_seed_input(seed_labels, seed_node_col, seed_label_col).keys()
+    )
+
+    logger.info(
+        f"Starting ensemble propagation: n_epochs={n_epochs}, base_seed={base_seed}"
+    )
+
+    # Buffers populated on first epoch (we discover result shape from it).
+    mean_out: Optional[np.ndarray] = None
+    mean_in: Optional[np.ndarray] = None
+    m2_out: Optional[np.ndarray] = None
+    m2_in: Optional[np.ndarray] = None
+    template_out: Optional[pl.DataFrame] = None
+    template_in: Optional[pl.DataFrame] = None
+    label_cols: Optional[List[str]] = None
+    all_labels: Optional[List[str]] = None
+
+    def _welford_update(
+        mean: np.ndarray,
+        m2: Optional[np.ndarray],
+        new: np.ndarray,
+        count: int,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """One step of Welford's online mean/variance update. ``count`` is 1-based."""
+        delta = new - mean
+        mean = mean + delta / count
+        if m2 is not None:
+            delta2 = new - mean
+            m2 = m2 + delta * delta2
+        return mean, m2
+
+    for epoch in range(n_epochs):
+        epoch_seed = base_seed + epoch
+        logger.debug(f"Ensemble epoch {epoch + 1}/{n_epochs} (random_seed={epoch_seed})")
+
+        result = guided_label_propagation(
+            graph, id_mapper, seed_labels, labels,
+            random_seed=epoch_seed, **glp_kwargs,
+        )
+        is_tuple = isinstance(result, tuple)
+        out_df = result[0] if is_tuple else result
+        in_df = result[1] if is_tuple else None
+
+        if epoch == 0:
+            # Discover the label column set from the first result. When
+            # enable_noise_category is on, the result has an extra noise_prob
+            # column that we need to average too.
+            label_cols = [c for c in out_df.columns if c.endswith("_prob")]
+            all_labels = [c[: -len("_prob")] for c in label_cols]
+            template_out = out_df
+            mean_out = out_df.select(label_cols).to_numpy().copy()
+            m2_out = np.zeros_like(mean_out) if return_variance else None
+            if is_tuple:
+                template_in = in_df
+                mean_in = in_df.select(label_cols).to_numpy().copy()
+                m2_in = np.zeros_like(mean_in) if return_variance else None
+            continue
+
+        new_out = out_df.select(label_cols).to_numpy()
+        mean_out, m2_out = _welford_update(mean_out, m2_out, new_out, epoch + 1)
+        if is_tuple:
+            new_in = in_df.select(label_cols).to_numpy()
+            mean_in, m2_in = _welford_update(mean_in, m2_in, new_in, epoch + 1)
+
+    def _assemble(
+        template: pl.DataFrame,
+        mean: np.ndarray,
+        m2: Optional[np.ndarray],
+    ) -> pl.DataFrame:
+        dom_idx = np.argmax(mean, axis=1)
+        dom_labels = [all_labels[i] for i in dom_idx]
+        conf = mean.max(axis=1)
+
+        cols: Dict[str, Any] = {"node_id": template["node_id"]}
+        for i, col_name in enumerate(label_cols):
+            cols[col_name] = mean[:, i]
+        cols["dominant_label"] = dom_labels
+        cols["confidence"] = conf
+        # is_seed reflects user-supplied seeds only, not per-epoch noise seeds.
+        cols["is_seed"] = [nid in original_seed_ids for nid in template["node_id"].to_list()]
+
+        if m2 is not None:
+            # Sample variance with Bessel's correction (n_epochs >= 2 enforced above).
+            variance = m2 / (n_epochs - 1)
+            std = np.sqrt(np.maximum(variance, 0.0))  # clip tiny negatives from FP
+            for i, col_name in enumerate(label_cols):
+                cols[f"{col_name}_std"] = std[:, i]
+
+        return pl.DataFrame(cols)
+
+    logger.info(f"Completed ensemble: averaged {n_epochs} epochs")
+
+    if template_in is not None:
+        return (
+            _assemble(template_out, mean_out, m2_out),
+            _assemble(template_in, mean_in, m2_in),
+        )
+    return _assemble(template_out, mean_out, m2_out)
 
 
 def _validate_inputs(
@@ -333,23 +798,24 @@ def _run_single_propagation(
     max_iterations: int,
     convergence_threshold: float,
     normalize: bool,
-    direction: str
+    direction: str,
+    weight_transform: Optional[WeightTransform] = None,
 ) -> pl.DataFrame:
     """Run a single propagation (either undirected, out-degree, or in-degree)."""
-    
+
     with LoggingTimer(f"Running {direction} propagation"):
-        
+
         # Setup matrices and initial conditions
         n_nodes = graph.numberOfNodes()
         n_labels = len(labels)
-        
+
         logger.debug(f"Matrix dimensions: {n_nodes} nodes × {n_labels} labels")
-        
+
         # Create initial label matrix Y (n × k)
         Y = _initialize_label_matrix(graph, id_mapper, seed_labels, labels)
-        
+
         # Create transition matrix P
-        P = _create_transition_matrix(graph, direction)
+        P = _create_transition_matrix(graph, direction, weight_transform=weight_transform)
         
         # Initialize propagation matrix
         F = Y.copy()
@@ -421,39 +887,45 @@ def _initialize_label_matrix(
     return Y
 
 
-def _create_transition_matrix(graph: nk.Graph, direction: str) -> sp.csr_matrix:
+def _create_transition_matrix(
+    graph: nk.Graph,
+    direction: str,
+    weight_transform: Optional[WeightTransform] = None,
+) -> sp.csr_matrix:
     """Create row-normalized transition matrix P = D^-1 A."""
-    
+
     with LoggingTimer("Creating transition matrix"):
-        
+
         n_nodes = graph.numberOfNodes()
-        
+
         # Build adjacency matrix in COO format for efficiency
         row_indices = []
         col_indices = []
         edge_weights = []
-        
+
         for u, v in graph.iterEdges():
             weight = graph.weight(u, v)
-            
+            if weight_transform is not None:
+                weight = weight_transform(weight)
+
             if direction == "in_degree":
                 # For in-degree: transpose the adjacency matrix (v -> u)
                 row_indices.append(v)
                 col_indices.append(u)
                 edge_weights.append(weight)
-                
+
                 # Add reverse edge for undirected graphs
                 if not graph.isDirected():
                     row_indices.append(u)
                     col_indices.append(v)
                     edge_weights.append(weight)
-                    
+
             else:  # out_degree or undirected
                 # Standard adjacency matrix (u -> v)
                 row_indices.append(u)
                 col_indices.append(v)
                 edge_weights.append(weight)
-                
+
                 # Add reverse edge for undirected graphs
                 if not graph.isDirected():
                     row_indices.append(v)
@@ -917,7 +1389,8 @@ def _process_noise_category(
     seed_labels: Dict[Any, str],
     labels: List[str],
     enable_noise_category: bool,
-    noise_ratio: float
+    noise_ratio: float,
+    random_seed: Optional[int] = 42,
 ) -> Tuple[List[str], Dict[Any, str]]:
     """
     Process labels and seed labels to include noise category if enabled.
@@ -971,7 +1444,7 @@ def _process_noise_category(
     # Generate noise seeds if noise category was added
     if "noise" not in seed_labels.values():
         noise_seeds = _generate_noise_seeds(
-            graph, id_mapper, seed_labels, noise_ratio
+            graph, id_mapper, seed_labels, noise_ratio, random_seed=random_seed
         )
         processed_seed_labels.update(noise_seeds)
         logger.info(f"Generated {len(noise_seeds)} noise seeds")
@@ -983,15 +1456,16 @@ def _generate_noise_seeds(
     graph: nk.Graph,
     id_mapper: IDMapper,
     seed_labels: Dict[Any, str],
-    noise_ratio: float
+    noise_ratio: float,
+    random_seed: Optional[int] = 42,
 ) -> Dict[Any, str]:
     """
     Generate noise seeds from non-seed nodes.
-    
+
     Randomly samples nodes that are not already in the seed set
     and assigns them the "noise" label. This provides the algorithm
     with examples of nodes that don't strongly belong to any category.
-    
+
     Parameters
     ----------
     graph : nk.Graph
@@ -1002,38 +1476,43 @@ def _generate_noise_seeds(
         Existing seed labels
     noise_ratio : float
         Fraction of non-seed nodes to use as noise seeds
-    
+    random_seed : Optional[int], default 42
+        Seed for the local RNG used to sample noise nodes. Use distinct values
+        per call to draw independent noise samples (e.g., from
+        :func:`ensemble_label_propagation`). Pass ``None`` to draw from the
+        global :mod:`random` state.
+
     Returns
     -------
     Dict[Any, str]
         Mapping of selected nodes to "noise" label
     """
     import random
-    
+
     # Get all nodes that are not already seeds
     all_nodes = set(range(graph.numberOfNodes()))
     seed_node_internals = {id_mapper.get_internal(seed_id) for seed_id in seed_labels.keys()}
     non_seed_nodes = all_nodes - seed_node_internals
-    
+
     if not non_seed_nodes:
         logger.warning("No non-seed nodes available for noise seed generation")
         return {}
-    
+
     # Calculate number of noise seeds
     n_existing_seeds = len(seed_labels)
     n_noise_seeds = max(1, int(noise_ratio * n_existing_seeds))
     n_noise_seeds = min(n_noise_seeds, len(non_seed_nodes))
-    
-    # Randomly sample noise seeds
-    random.seed(42)  # For reproducibility
-    selected_internal_ids = random.sample(list(non_seed_nodes), n_noise_seeds)
-    
+
+    # Local RNG so concurrent callers (ensembling) don't fight over global state
+    rng = random.Random(random_seed) if random_seed is not None else random
+    selected_internal_ids = rng.sample(list(non_seed_nodes), n_noise_seeds)
+
     # Convert back to original IDs
     noise_seeds = {}
     for internal_id in selected_internal_ids:
         original_id = id_mapper.get_original(internal_id)
         noise_seeds[original_id] = "noise"
-    
+
     logger.debug(f"Selected {len(noise_seeds)} noise seeds from {len(non_seed_nodes)} candidates")
     return noise_seeds
 

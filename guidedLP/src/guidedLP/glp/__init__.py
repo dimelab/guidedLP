@@ -14,7 +14,14 @@ This module implements the core GLP algorithm for semi-supervised community dete
 # Core propagation functions
 from .propagation import (
     guided_label_propagation,
-    get_propagation_info
+    get_propagation_info,
+    audience_composition_pass,
+    ensemble_label_propagation,
+    # Edge-weight compression
+    WeightTransform,
+    tanh_transform,
+    log1p_transform,
+    winsorize_transform,
 )
 
 # Validation functions

@@ -13,6 +13,7 @@ This project provides efficient network analysis capabilities with a focus on **
 - **NetworkIt backend**: Leverages C++ performance for graph operations  
 - **Sparse matrix operations**: Memory-efficient computations using SciPy
 - **Parallel processing**: Multi-threaded operations where beneficial
+- **`EdgeList` container**: Polars-backed coded edge store paired with an `IDMapper` — peer of `nk.Graph`. Stores `src` / `tgt` as `UInt32` codes (~5–10× smaller than Utf8) and powers a vectorized SciPy projection kernel that delivers ~3–7× peak-RSS reduction on hub-heavy bipartite projections versus the legacy `Dict[Any, Set[Any]]` path.
 
 ### 🎯 Guided Label Propagation (GLP)
 - **Semi-supervised approach**: Uses seed nodes to guide community detection
@@ -442,6 +443,26 @@ results = guided_label_propagation(
 - Projections can blow up edge count: O(N² × D) worst case. On dense bipartite graphs, consider backboning either before projecting (sparsifies the bipartite layer) or after (sparsifies the projection itself).
 - Seeds must be in the projection partition; verify with `check_seed_coverage(user_mapper, seeds)` before propagation.
 
+**For hub-heavy bipartites at scale, use the `EdgeList` path.** When a few popular intermediate items (a viral hashtag, a popular URL) are touched by thousands of users, the projection edge count can explode by orders of magnitude through a single hub. The legacy graph-input path builds a `Dict[Any, Set[Any]]` neighbor map and a per-edge Python accumulator loop that becomes the memory bottleneck; the coded `EdgeList` path skips both and runs entirely on `UInt32` codes through a vectorized SciPy kernel. On synthetic Zipf-popular bipartites we measure ~3–7× peak-RSS reduction; at 240K bipartite → 199M projection edges the legacy path OOMs while the coded path completes cleanly.
+
+```python
+from guidedLP.network.construction import build_edgelist_from_frame, project_bipartite
+
+# build_edgelist_from_frame takes the same kwargs as build_graph_from_edgelist
+# plus an optional code_dtype (UInt32 default; pass UInt64 above ~4.29B nodes).
+bipartite_el, full_mapper = build_edgelist_from_frame(
+    edges, source_col="user", target_col="hashtag", weight_col="count",
+    bipartite=True,
+)
+# Default output matches input: EdgeList in → (EdgeList, IDMapper) out.
+user_el, user_mapper = project_bipartite(
+    bipartite_el, full_mapper, projection_mode="source", weight_method="jaccard",
+)
+# Force a graph or frame if downstream needs one:
+#   output_format="graph"     → (nk.Graph, IDMapper)
+#   output_format="dataframe" → pl.DataFrame  (source_id, target_id, weight)
+```
+
 ### 4. Political Affiliation Analysis
 
 ```python
@@ -573,6 +594,146 @@ print(f"Graph: {attribution_graph.numberOfNodes()} nodes, "
 ```
 
 If your data isn't in the required order, the function silently produces wrong-direction edges — no validation is performed (the assumption is that callers working with large datasets pre-sort once and reuse). When in doubt, re-sort right before the call.
+
+### 8. Refining GLP Output
+
+Three controls layered on top of `guided_label_propagation`, each addressing a different failure mode of the default pipeline. Use them individually or compose them.
+
+#### 8a. Edge-weight compression
+
+When a small fraction of edges have weights orders of magnitude larger than the rest (viral retweets, hub co-occurrences, runaway co-citations), those edges dominate the propagation regardless of `alpha`. The `weight_transform` parameter applies a per-edge callable when the transition matrix is built, so you can dampen weight outliers without rebuilding the graph or pre-normalizing in your data pipeline.
+
+```python
+from guidedLP.glp import (
+    guided_label_propagation,
+    tanh_transform, log1p_transform, winsorize_transform,
+)
+
+# Pick a transform that matches the shape of your weight distribution:
+# - log1p_transform()     : gentle, unbounded. Good first choice when weights
+#                           span several orders of magnitude.
+# - winsorize_transform(c): hard cap at threshold c. Linear up to c, then flat.
+#                           Use when you know which weight value is "too high."
+# - tanh_transform()      : S-curve saturation; mimics the historical stlp
+#                           transform. Most aggressive.
+
+results = guided_label_propagation(
+    graph, id_mapper, seeds, labels,
+    weight_transform=log1p_transform(),
+)
+
+# Any positive-output callable works too — the helpers are just conveniences:
+import math
+results = guided_label_propagation(
+    graph, id_mapper, seeds, labels,
+    weight_transform=lambda w: math.log10(w + 1.0),
+)
+```
+
+**When to use:** edge weights span multiple orders of magnitude and a few hub edges visibly skew the results (e.g. one viral retweet that's 1000× the median weight).
+
+**When to skip:** weights are already roughly uniform, or you've pre-normalized upstream.
+
+**Caveat:** transforms must satisfy `f(w) > 0` for `w > 0`. A transform that maps positive weights to zero will be interpreted as graph isolates by the propagation engine.
+
+#### 8b. Audience-composition pass
+
+The directional GLP (`directional=True`) returns a `(forward, backward)` tuple where the backward pass is a full propagation on `Aᵀ` from the original seeds — answering *"is node n upstream of a seed?"*. A semantically different question — *"what's the label profile of the nodes pointing at n?"* — requires a one-hop aggregation of the converged forward result along incoming edges. `audience_composition_pass` does exactly that.
+
+```python
+from guidedLP.glp import (
+    guided_label_propagation,
+    audience_composition_pass,
+)
+
+# Step 1: forward pass. Use directional=False to get a single DataFrame
+# (audience_composition_pass consumes a single result, not the tuple).
+fwd = guided_label_propagation(
+    graph, id_mapper, seeds, labels, directional=False,
+)
+
+# Step 2: audience pass — single sparse matmul, no iteration.
+audience = audience_composition_pass(
+    graph, id_mapper, fwd, labels,
+    # If the forward pass used a weight_transform, pass the same one here:
+    # weight_transform=log1p_transform(),
+)
+
+# audience["left_prob"] reads as:
+# "in-degree-weighted average of forward-pass left_prob across n's in-neighbors"
+# i.e. "what fraction of accounts pointing at n were forward-labeled left?"
+```
+
+**When to use:**
+- Audience studies — "who is this account/user reaching?"
+- Reception analysis — "what kind of community cites this paper?"
+- Recommender-system diagnostics — "which items are consumed by users with profile X?"
+
+**When to skip:** undirected graphs (the pass requires a directed graph and raises otherwise), or when you specifically want the upstream-reachability question that the `Aᵀ` pass already answers.
+
+**Note:** `is_seed` in the audience output is carried through from `forward_result` and identifies forward-pass seeds — the audience pass has no seeds of its own. Nodes with zero in-degree fall back to a uniform distribution (no in-neighbors to aggregate from).
+
+#### 8c. Stochastic ensembling
+
+When `enable_noise_category=True`, the noise seeds are sampled randomly from non-seed nodes. A single GLP run is sensitive to which nodes happen to be chosen. `ensemble_label_propagation` runs GLP `n_epochs` times with different noise samples and averages the result — bagging that recovers the variance-reduction behavior of the historical `stlp` implementation's `epochs` loop.
+
+```python
+from guidedLP.glp import ensemble_label_propagation
+
+result = ensemble_label_propagation(
+    graph, id_mapper, seeds, labels,
+    n_epochs=20,
+    base_seed=42,                  # per-epoch seed = base_seed + epoch_index
+    enable_noise_category=True,    # required — otherwise ensembling is a no-op
+    noise_ratio=0.3,
+    return_variance=True,          # adds {label}_prob_std columns
+)
+
+# Same return shape as guided_label_propagation:
+# - single DataFrame for undirected / directional=False
+# - (out_df, in_df) tuple for directed + directional=True
+#
+# Probability columns are averages across epochs. With return_variance=True,
+# each {label}_prob is paired with a {label}_prob_std column for confidence
+# intervals (sample std with Bessel's correction).
+```
+
+**When to use:** you're already running GLP with `enable_noise_category=True` and want robust probabilities + per-label confidence intervals.
+
+**When to skip:** noise is disabled (the function warns and short-circuits to a single GLP run, because ensembling deterministic runs reduces to repeating the same answer), or single-run probabilities are precise enough for your purpose.
+
+**Caveats:**
+- `is_seed` in the ensemble output reflects only user-supplied seeds, not per-epoch noise samples (which vary across epochs).
+- `dominant_label` and `confidence` are recomputed from averaged probabilities, not voted across epochs — averaging gives the variance reduction; voting would lose it. A node can have a different dominant label in the ensemble than in any single epoch; this is expected.
+- Epochs run serially. The natural parallelization is `concurrent.futures.ProcessPoolExecutor` over epochs — each epoch is independent and reads `graph` read-only — but isn't yet wired into the function.
+
+#### Composing the three
+
+The three controls are independent and combine cleanly. A typical "robust" pipeline:
+
+```python
+from guidedLP.glp import (
+    ensemble_label_propagation,
+    audience_composition_pass,
+    log1p_transform,
+)
+
+# Ensemble with weight compression + noise resampling
+forward_ensemble = ensemble_label_propagation(
+    graph, id_mapper, seeds, labels,
+    n_epochs=20,
+    directional=False,                 # single DataFrame for audience pass
+    weight_transform=log1p_transform(),
+    enable_noise_category=True,
+    noise_ratio=0.3,
+)
+
+# Audience pass on the averaged forward result, with the same transform
+audience = audience_composition_pass(
+    graph, id_mapper, forward_ensemble, labels + ["noise"],
+    weight_transform=log1p_transform(),
+)
+```
 
 ## Use Cases
 
