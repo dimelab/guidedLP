@@ -6,7 +6,7 @@ while preserving original node IDs and supporting various graph types including
 directed, undirected, weighted, unweighted, and bipartite graphs.
 """
 
-from typing import Union, Tuple, Optional, List, Dict, Any, Set
+from typing import Union, Tuple, Optional, List, Dict, Any, Set, Sequence
 import warnings
 from pathlib import Path
 
@@ -353,6 +353,7 @@ def build_edgelist_from_frame(
     min_source_degree: Optional[int] = None,
     min_target_degree: Optional[int] = None,
     code_dtype: Any = pl.UInt32,
+    passthrough_cols: Optional[Sequence[str]] = None,
     verbose: bool = True,
 ) -> Tuple[EdgeList, IDMapper]:
     """
@@ -378,6 +379,18 @@ def build_edgelist_from_frame(
         Integer width for the encoded ``src``/``tgt`` columns. ``pl.UInt32``
         supports up to ~4.29B unique nodes; pass ``pl.UInt64`` for larger
         graphs. The chosen dtype is recorded on the returned EdgeList.
+    passthrough_cols : Sequence[str], optional
+        Extra columns from the input edgelist to carry through onto the
+        resulting EdgeList's ``df`` alongside ``src``/``tgt``/``weight``.
+        Used by temporal pipelines (e.g.
+        :func:`temporal_bipartite_to_unipartite`) that need to keep a
+        ``timestamp`` column on the coded EdgeList. Passthrough is only
+        compatible with non-aggregating modes — i.e. ``auto_weight=False``
+        AND ``remove_duplicates=False`` — because per-row passthrough
+        values cannot survive a ``group_by`` aggregation. Conflicting
+        combinations raise :class:`ValidationError`. The columns are
+        emitted with their original dtypes; ``src``/``tgt``/``weight``
+        names are reserved and cannot appear in ``passthrough_cols``.
 
     Returns
     -------
@@ -428,6 +441,44 @@ def build_edgelist_from_frame(
         directed=directed, bipartite=bipartite, code_dtype=str(code_dtype),
     )
 
+    # passthrough_cols validation runs up front (before loading anything) so
+    # misuse is surfaced immediately. Aggregation modes drop per-row info, so
+    # they're incompatible with passthrough — see kwarg docs.
+    if passthrough_cols is not None:
+        passthrough_cols = list(passthrough_cols)
+        reserved = {"src", "tgt", "weight"}
+        conflict = [c for c in passthrough_cols if c in reserved]
+        if conflict:
+            raise ValidationError(
+                f"passthrough_cols cannot include reserved names "
+                f"{sorted(reserved)}: got {conflict!r}"
+            )
+        if len(set(passthrough_cols)) != len(passthrough_cols):
+            raise ValidationError(
+                f"passthrough_cols contains duplicates: {passthrough_cols!r}"
+            )
+        # Auto-weight and remove_duplicates both run group_by/unique that
+        # collapse multiple input rows into one — per-row passthrough values
+        # cannot survive that. weight_col + remove_duplicates=False also does
+        # a sum aggregation, blocked for the same reason.
+        if auto_weight and weight_col is None:
+            raise ValidationError(
+                "passthrough_cols requires auto_weight=False (the auto-weight "
+                "branch aggregates rows via group_by, which drops per-row "
+                "passthrough values)."
+            )
+        if weight_col is not None and not remove_duplicates:
+            raise ValidationError(
+                "passthrough_cols requires either weight_col=None or "
+                "remove_duplicates=True (the weight-sum branch aggregates "
+                "rows via group_by, which drops per-row passthrough values)."
+            )
+        if remove_duplicates:
+            raise ValidationError(
+                "passthrough_cols is incompatible with remove_duplicates=True "
+                "(deduplicating rows drops per-row passthrough values)."
+            )
+
     import time as _time
     _t_start = _time.perf_counter()
     _input_rows: Optional[int] = None
@@ -453,6 +504,8 @@ def build_edgelist_from_frame(
             required_cols = [source_col, target_col]
             if weight_col is not None:
                 required_cols.append(weight_col)
+            if passthrough_cols:
+                required_cols.extend(passthrough_cols)
             missing_cols = [c for c in required_cols if c not in df.columns]
             if missing_cols:
                 raise ValidationError(
@@ -461,6 +514,8 @@ def build_edgelist_from_frame(
                 )
 
             # Step 2c: Drop rows with nulls in src/tgt (and weight if specified).
+            # Passthrough columns are NOT null-checked — they're side data and
+            # callers may legitimately have nulls there.
             null_check_cols = [source_col, target_col]
             if weight_col is not None:
                 null_check_cols.append(weight_col)
@@ -546,6 +601,7 @@ def build_edgelist_from_frame(
             coded_df = _encode_to_codes(
                 processed_df, source_col, target_col,
                 id_mapper, code_dtype, weight_col,
+                passthrough_cols=passthrough_cols,
             )
             edge_list = EdgeList(
                 df=coded_df,
@@ -601,6 +657,7 @@ def _encode_to_codes(
     id_mapper: IDMapper,
     code_dtype: Any,
     weight_col: Optional[str],
+    passthrough_cols: Optional[Sequence[str]] = None,
 ) -> pl.DataFrame:
     """Translate ``source_col``/``target_col`` values from original IDs to
     integer codes using ``id_mapper``.
@@ -608,6 +665,11 @@ def _encode_to_codes(
     Uses Polars ``replace_strict`` (Rust-level dict lookup) for vectorized
     mapping — the same primitive ``_add_edges_chunk`` already relies on for
     the NetworkIt build path.
+
+    ``passthrough_cols`` (if provided) names additional columns that ride
+    through onto the output frame with their original dtype, alongside the
+    encoded ``src``/``tgt``/``weight``. Used by temporal pipelines that
+    need a ``timestamp`` column on the coded EdgeList.
     """
     mapping = id_mapper.original_to_internal
     old = list(mapping.keys())
@@ -625,6 +687,9 @@ def _encode_to_codes(
     ]
     if weight_col is not None and weight_col in df.columns:
         select_exprs.append(pl.col(weight_col).cast(pl.Float64).alias("weight"))
+    if passthrough_cols:
+        for col in passthrough_cols:
+            select_exprs.append(pl.col(col))
 
     return df.select(select_exprs)
 
@@ -778,26 +843,35 @@ def _process_edges(
         if removed_count > 0:
             logger.info("Removed %d self-loop edges", removed_count)
     
-    # Handle weights and duplicates
+    # Handle weights and duplicates. maintain_order=True keeps the input row
+    # order so downstream EdgeList consumers (e.g. temporal_bipartite_to_unipartite,
+    # which relies on a caller-provided pre-sort) don't have their ordering
+    # silently shuffled by Polars' default hash-based group_by/unique.
     if weight_col is None and auto_weight:
         # Calculate weights from duplicate edge counts
         logger.debug("Calculating automatic weights from duplicate edges")
-        processed_df = processed_df.group_by([source_col, target_col]).agg(
+        processed_df = processed_df.group_by(
+            [source_col, target_col], maintain_order=True,
+        ).agg(
             pl.len().alias("weight")
         ).with_columns(pl.col("weight").cast(pl.Float64))
         weight_col = "weight"
-        
+
     elif weight_col is not None and not remove_duplicates:
         # Sum weights for duplicate edges
         logger.debug("Aggregating weights for duplicate edges")
-        processed_df = processed_df.group_by([source_col, target_col]).agg(
+        processed_df = processed_df.group_by(
+            [source_col, target_col], maintain_order=True,
+        ).agg(
             pl.col(weight_col).sum().alias(weight_col)
         )
-        
+
     elif remove_duplicates:
         # Remove duplicate edges (keep first occurrence)
         initial_count = len(processed_df)
-        processed_df = processed_df.unique(subset=[source_col, target_col], keep="first")
+        processed_df = processed_df.unique(
+            subset=[source_col, target_col], keep="first", maintain_order=True,
+        )
         removed_count = initial_count - len(processed_df)
         if removed_count > 0:
             logger.info("Removed %d duplicate edges", removed_count)
@@ -2517,7 +2591,7 @@ def get_bipartite_info(graph: nk.Graph, id_mapper: IDMapper) -> Dict[str, Any]:
 
 
 def temporal_bipartite_to_unipartite(
-    edgelist: Union[str, pl.DataFrame],
+    edgelist: Union[str, pl.DataFrame, EdgeList],
     source_col: str = "source",
     target_col: str = "target",
     timestamp_col: str = "timestamp",
@@ -2528,6 +2602,7 @@ def temporal_bipartite_to_unipartite(
     add_edge_weights: bool = True,
     verbose: bool = True,
     *,
+    id_mapper: Optional[IDMapper] = None,
     output_format: Optional[str] = None,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[EdgeList, IDMapper], pl.DataFrame]:
     """
@@ -2540,12 +2615,20 @@ def temporal_bipartite_to_unipartite(
     how PageRank, HITS-Authority, and similar centrality metrics surface
     influential sources.
 
-    Accepts a file path (CSV/Parquet) or a Polars DataFrame. The output
+    Accepts a file path (CSV/Parquet), a Polars DataFrame, or a coded
+    :class:`EdgeList` (with its paired :class:`IDMapper`). The output
     format defaults to a NetworkIt :class:`nk.Graph` paired with an
     :class:`IDMapper` (the historical return type) but can be forced to a
     coded :class:`EdgeList` or a plain frame via ``output_format``.
-    :class:`EdgeList` input is not supported because EdgeList does not
-    carry the ``timestamp_col`` needed for temporal ordering.
+
+    For ``EdgeList`` input the timestamp must live on ``edgelist.df``
+    under ``timestamp_col`` — produce one via
+    :func:`build_edgelist_from_frame` with
+    ``passthrough_cols=[timestamp_col], auto_weight=False, remove_duplicates=False``.
+    Because EdgeList's coded columns are named ``src``/``tgt``, the
+    function maps ``intermediate_col``/``projected_col`` from the
+    user-provided ``source_col``/``target_col`` to the appropriate
+    ``src``/``tgt`` column internally.
 
     .. note::
         **Input order is trusted, not validated.** This function does NOT sort
@@ -2573,23 +2656,31 @@ def temporal_bipartite_to_unipartite(
 
     Parameters
     ----------
-    edgelist : Union[str, pl.DataFrame]
+    edgelist : Union[str, pl.DataFrame, EdgeList]
         Edge list data containing temporal bipartite relationships.
-        Can be file path (CSV/Parquet) or Polars DataFrame.
+        Can be a file path (CSV/Parquet), a Polars DataFrame, or a coded
+        :class:`EdgeList` (requires ``id_mapper``, and the EdgeList's
+        ``df`` must include ``timestamp_col``).
     source_col : str, default "source"
-        Name of source node column in edgelist
+        Name of source node column in edgelist. For EdgeList input, the
+        column is conceptually ``src`` (this kwarg only matters for the
+        ``intermediate_col`` / ``projected_col`` cross-check).
     target_col : str, default "target"
-        Name of target node column in edgelist
+        Name of target node column in edgelist. For EdgeList input, the
+        column is conceptually ``tgt``.
     timestamp_col : str, default "timestamp"
-        Name of timestamp column for temporal ordering
+        Name of timestamp column for temporal ordering. For EdgeList
+        input, the same column name must exist on ``edgelist.df``
+        (typically because the EdgeList was built with
+        ``build_edgelist_from_frame(..., passthrough_cols=[timestamp_col])``).
     weight_col : Optional[str], default None
         Name of weight column. If None, edges get unit weight.
     intermediate_col : str, default "target"
         Column representing intermediate nodes (will disappear in projection).
-        These nodes group the temporal relationships.
+        Must equal ``source_col`` or ``target_col``.
     projected_col : str, default "source"
         Column representing nodes to preserve in unipartite projection.
-        These nodes will be connected based on shared intermediates.
+        Must equal ``source_col`` or ``target_col``.
     remove_self_loops : bool, default True
         Whether to remove self-loops in the resulting unipartite graph
     add_edge_weights : bool, default True
@@ -2597,6 +2688,10 @@ def temporal_bipartite_to_unipartite(
         Weight = ``(w_later + w_earlier) / 2 * 1 / (1 + Δdays)``.
     verbose : bool, default True
         Print a one-line summary at the end.
+    id_mapper : IDMapper, optional
+        Required when ``edgelist`` is an :class:`EdgeList`; ignored when
+        it's a path or a DataFrame. Used to translate the EdgeList's
+        ``src``/``tgt`` codes back to original IDs at the I/O boundary.
     output_format : str, optional
         ``"graph"``, ``"edgelist"``, ``"dataframe"``, or ``None`` (default —
         equivalent to ``"graph"``, preserving the legacy return type).
@@ -2676,6 +2771,22 @@ def temporal_bipartite_to_unipartite(
     ...     output_format="edgelist",
     ... )
 
+    EdgeList input — feed a coded, timestamp-carrying EdgeList through
+    the same projection without re-encoding the original IDs:
+
+    >>> from guidedLP.network.construction import build_edgelist_from_frame
+    >>> el, mapper = build_edgelist_from_frame(
+    ...     data, source_col="user", target_col="item", bipartite=True,
+    ...     auto_weight=False, remove_duplicates=False,
+    ...     passthrough_cols=["timestamp"],
+    ... )
+    >>> projected_el, projected_mapper = temporal_bipartite_to_unipartite(
+    ...     el, id_mapper=mapper,
+    ...     source_col="user", target_col="item", timestamp_col="timestamp",
+    ...     intermediate_col="item", projected_col="user",
+    ...     output_format="edgelist",
+    ... )
+
     Notes
     -----
     Use citation convention when:
@@ -2724,34 +2835,89 @@ def temporal_bipartite_to_unipartite(
     )
 
     with LoggingTimer("temporal_bipartite_to_unipartite"):
-        # Step 1: Load input (file path or DataFrame). EdgeList isn't
-        # supported because it carries no timestamp column.
+        # Step 1: Resolve input type → working DataFrame + which columns to use.
+        # For EdgeList input the working frame is the EdgeList's coded df
+        # (src/tgt/timestamp/optional weight); for DataFrame / file inputs the
+        # working frame uses the caller's source_col / target_col directly.
+        input_is_edgelist = isinstance(edgelist, EdgeList)
         if isinstance(edgelist, str):
-            edgelist = _load_edge_list(edgelist)
-        elif not isinstance(edgelist, pl.DataFrame):
+            working_df = _load_edge_list(edgelist)
+            inter_col_actual = intermediate_col
+            proj_col_actual = projected_col
+            ts_col_actual = timestamp_col
+            wt_col_actual = weight_col
+        elif isinstance(edgelist, pl.DataFrame):
+            working_df = edgelist
+            inter_col_actual = intermediate_col
+            proj_col_actual = projected_col
+            ts_col_actual = timestamp_col
+            wt_col_actual = weight_col
+        elif input_is_edgelist:
+            if id_mapper is None:
+                raise ValidationError(
+                    "`id_mapper` is required when `edgelist` is an EdgeList"
+                )
+            # Map intermediate_col / projected_col (which are user-provided
+            # logical column names) to the EdgeList's physical src/tgt columns.
+            # source_col → src, target_col → tgt; mirrors project_bipartite's
+            # `projection_mode='source'/'target' → src/tgt` convention.
+            _side_of = {source_col: "src", target_col: "tgt"}
+            if intermediate_col not in _side_of:
+                raise ConfigurationError(
+                    f"intermediate_col '{intermediate_col}' must be either "
+                    f"'{source_col}' or '{target_col}'"
+                )
+            if projected_col not in _side_of:
+                raise ConfigurationError(
+                    f"projected_col '{projected_col}' must be either "
+                    f"'{source_col}' or '{target_col}'"
+                )
+            working_df = edgelist.df
+            inter_col_actual = _side_of[intermediate_col]
+            proj_col_actual = _side_of[projected_col]
+            ts_col_actual = timestamp_col  # Must be present on el.df.
+            wt_col_actual = (
+                "weight" if weight_col is not None and "weight" in working_df.columns
+                else (weight_col if weight_col in working_df.columns else None)
+            )
+        else:
             raise ValidationError(
-                f"`edgelist` must be a file path (str) or Polars DataFrame; "
-                f"got {type(edgelist).__name__}"
+                f"`edgelist` must be a file path (str), Polars DataFrame, or "
+                f"EdgeList; got {type(edgelist).__name__}"
             )
 
-        input_rows = len(edgelist)
+        input_rows = len(working_df)
 
         # Step 2: Validate required columns and intermediate/projected wiring.
-        required_cols = [source_col, target_col, timestamp_col]
-        missing_cols = [col for col in required_cols if col not in edgelist.columns]
-        if missing_cols:
-            raise DataFormatError(f"Missing required columns: {missing_cols}")
+        if input_is_edgelist:
+            # For EdgeList input the side-mapping check already ran above; here
+            # we just need to confirm the timestamp column lives on el.df.
+            required_cols = [inter_col_actual, proj_col_actual, ts_col_actual]
+            missing_cols = [c for c in required_cols if c not in working_df.columns]
+            if missing_cols:
+                raise DataFormatError(
+                    f"EdgeList is missing required columns: {missing_cols}. "
+                    f"Build it with build_edgelist_from_frame(..., "
+                    f"passthrough_cols=['{timestamp_col}'], "
+                    f"auto_weight=False, remove_duplicates=False) so the "
+                    f"timestamp survives onto el.df."
+                )
+        else:
+            required_cols = [source_col, target_col, timestamp_col]
+            missing_cols = [c for c in required_cols if c not in working_df.columns]
+            if missing_cols:
+                raise DataFormatError(f"Missing required columns: {missing_cols}")
 
-        if intermediate_col not in [source_col, target_col]:
-            raise ConfigurationError(
-                f"intermediate_col '{intermediate_col}' must be either "
-                f"'{source_col}' or '{target_col}'"
-            )
-        if projected_col not in [source_col, target_col]:
-            raise ConfigurationError(
-                f"projected_col '{projected_col}' must be either "
-                f"'{source_col}' or '{target_col}'"
-            )
+            if intermediate_col not in [source_col, target_col]:
+                raise ConfigurationError(
+                    f"intermediate_col '{intermediate_col}' must be either "
+                    f"'{source_col}' or '{target_col}'"
+                )
+            if projected_col not in [source_col, target_col]:
+                raise ConfigurationError(
+                    f"projected_col '{projected_col}' must be either "
+                    f"'{source_col}' or '{target_col}'"
+                )
         if intermediate_col == projected_col:
             raise ConfigurationError(
                 "intermediate_col and projected_col cannot be the same"
@@ -2759,21 +2925,22 @@ def temporal_bipartite_to_unipartite(
 
         logger.info(
             "Processing temporal bipartite conversion: %d edges "
-            "(intermediate=%s, projected=%s)",
+            "(intermediate=%s, projected=%s, input=%s)",
             input_rows, intermediate_col, projected_col,
+            "EdgeList" if input_is_edgelist else "DataFrame",
         )
 
         try:
             # Step 3: Ensure timestamp is Datetime — needed for the
             # temporal weight subtraction below. Does not change row order.
-            if edgelist[timestamp_col].dtype != pl.Datetime:
+            if working_df[ts_col_actual].dtype != pl.Datetime:
                 try:
-                    edgelist = edgelist.with_columns(
-                        pl.col(timestamp_col).str.to_datetime().alias(timestamp_col)
+                    working_df = working_df.with_columns(
+                        pl.col(ts_col_actual).str.to_datetime().alias(ts_col_actual)
                     )
                 except Exception as e:
                     raise ValidationError(
-                        f"Cannot parse timestamp column '{timestamp_col}': {e}"
+                        f"Cannot parse timestamp column '{ts_col_actual}': {e}"
                     )
 
             # NOTE: trusts the caller's row order. Input MUST be pre-sorted
@@ -2784,22 +2951,43 @@ def temporal_bipartite_to_unipartite(
             logger.info(
                 "Assuming pre-sorted input: by %s (grouped), "
                 "then %s DESCENDING within each group",
-                intermediate_col, timestamp_col,
+                inter_col_actual, ts_col_actual,
             )
 
             # Step 4: Vectorized temporal projection (Polars self-join).
             # Replaces the legacy per-group Python loop that built lists of
             # (source, target) tuples and edge_weights — the join runs at
-            # the Rust level and scales to millions of input edges.
+            # the Rust level and scales to millions of input edges. For
+            # EdgeList input proj_col_actual is "src"/"tgt" so node IDs
+            # below are codes; we translate back to originals before any
+            # downstream graph/edgelist build.
             unipartite_df = _compute_temporal_projection_frame(
-                edgelist,
-                intermediate_col=intermediate_col,
-                projected_col=projected_col,
-                timestamp_col=timestamp_col,
-                weight_col=weight_col,
+                working_df,
+                intermediate_col=inter_col_actual,
+                projected_col=proj_col_actual,
+                timestamp_col=ts_col_actual,
+                weight_col=wt_col_actual,
                 add_edge_weights=add_edge_weights,
                 remove_self_loops=remove_self_loops,
             )
+
+            if input_is_edgelist and unipartite_df.height > 0:
+                # Translate the projection's coded src/tgt back to original
+                # IDs so the dataframe output and the downstream
+                # build_*_from_frame paths match the DataFrame-input path's
+                # semantics. Rebuilding the frame from scratch (rather than
+                # using replace_strict on a coded column) sidesteps the
+                # heterogeneous-original-dtype problem that pl.Object would
+                # otherwise create.
+                src_codes = unipartite_df["source"].to_list()
+                tgt_codes = unipartite_df["target"].to_list()
+                src_originals = id_mapper.get_original_batch([int(c) for c in src_codes])
+                tgt_originals = id_mapper.get_original_batch([int(c) for c in tgt_codes])
+                unipartite_df = pl.DataFrame({
+                    "source": src_originals,
+                    "target": tgt_originals,
+                    "weight": unipartite_df["weight"],
+                })
 
             n_proj_edges = unipartite_df.height
             logger.info(

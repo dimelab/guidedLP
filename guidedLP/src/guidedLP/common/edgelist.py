@@ -73,6 +73,27 @@ class EdgeList:
     one with the desired ``df``. ``eq=False`` is set because Polars
     DataFrames don't implement value-equality the way ``dataclass``'s
     generated ``__eq__`` expects.
+
+    **Extra columns are allowed.** Validation enforces ``src``, ``tgt``
+    (and ``weight`` if present) but does not forbid additional columns.
+    This is what lets temporal pipelines carry a ``timestamp`` column
+    alongside the codes — see ``build_edgelist_from_frame``'s
+    ``passthrough_cols`` kwarg and :func:`temporal_bipartite_to_unipartite`.
+
+    **Row-order contract.** Standard EdgeList producers/consumers preserve
+    input row order so callers can pre-sort once and rely on that order
+    surviving across builds/transforms. Specifically:
+
+    - :func:`build_edgelist_from_frame` keeps the input edgelist's row
+      order through every group_by / unique / filter step (achieved via
+      ``maintain_order=True`` on the aggregating operations).
+    - :func:`apply_backbone`'s EdgeList path uses left-joins on the input
+      frame and a kept-mask filter, so the surviving rows are a
+      subsequence of the input — original order preserved.
+
+    Functions that derive a new EdgeList from these (e.g. projections)
+    don't inherit the input's order because the output is a different
+    edge set entirely.
     """
 
     df: pl.DataFrame
