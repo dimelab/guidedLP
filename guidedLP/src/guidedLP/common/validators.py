@@ -102,18 +102,23 @@ def validate_edgelist_dataframe(
                 details={"null_count": null_count, "total_rows": len(df)}
             )
     
-    # Validate source and target columns contain hashable types
+    # Validate source and target columns contain hashable types.
+    # Cheap dtype check instead of materializing every unique value into a
+    # Python set: only nested dtypes (List/Array/Struct) and Object can hold
+    # unhashable values, every other Polars dtype is hashable by construction.
     for col in [source_col, target_col]:
-        # Check if column contains any unhashable types (lists, dicts, etc.)
-        try:
-            # Try to convert to a set to test hashability
-            unique_values = df[col].unique().to_list()
-            test_set = set(unique_values)
-        except TypeError as e:
+        dtype = df[col].dtype
+        is_nested = getattr(dtype, "is_nested", None)
+        unhashable = (
+            (is_nested() if callable(is_nested) else False)
+            or dtype == pl.Object
+        )
+        if unhashable:
             raise ValidationError(
-                f"Column contains unhashable values that cannot be used as node IDs",
+                f"Column has dtype {dtype}, which cannot be used as node IDs "
+                f"(nested or object dtypes may contain unhashable values).",
                 field=col,
-                details={"error": str(e)}
+                details={"dtype": str(dtype)},
             )
     
     # Validate weight column if present

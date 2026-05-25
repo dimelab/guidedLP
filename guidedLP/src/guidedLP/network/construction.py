@@ -588,9 +588,12 @@ def build_edgelist_from_frame(
             )
 
             # Step 7: Record bipartite partitions on the mapper.
+            # source_unique/target_unique are Polars Series — go through
+            # .to_list() once so the resulting set() builds from a typed
+            # list rather than iterating the Series in Python.
             if bipartite:
-                source_set = set(source_unique)
-                target_set = set(target_unique)
+                source_set = set(source_unique.to_list())
+                target_set = set(target_unique.to_list())
                 if bipartite_overlap_used:
                     id_mapper.source_partition_originals = source_set
                     id_mapper.target_partition_originals = target_set
@@ -672,8 +675,13 @@ def _encode_to_codes(
     need a ``timestamp`` column on the coded EdgeList.
     """
     mapping = id_mapper.original_to_internal
-    old = list(mapping.keys())
-    new = list(mapping.values())
+    # Build the (old → new) mapping as Polars Series once. Passing Python
+    # lists straight to replace_strict makes Polars rebuild them as Series
+    # via the slow new_from_any_values path on every call (twice here —
+    # once for src, once for tgt). Constructing the Series ourselves with
+    # an explicit dtype avoids that round-trip entirely.
+    old = pl.Series("_glp_old", list(mapping.keys()))
+    new = pl.Series("_glp_new", list(mapping.values()), dtype=pl.Int64)
 
     select_exprs = [
         pl.col(source_col)
@@ -883,13 +891,16 @@ def _create_id_mapping(
     df: pl.DataFrame,
     source_col: str,
     target_col: str
-) -> Tuple[IDMapper, List[Any], List[Any]]:
+) -> Tuple[IDMapper, pl.Series, pl.Series]:
     """
     Create bidirectional ID mapping between original and NetworkIt IDs.
 
-    Returns the mapper alongside the source/target unique-value lists so
+    Returns the mapper alongside the source/target unique-value Series so
     callers (notably bipartite-partition recording) can avoid running
-    ``.unique()`` a second time on the same large DataFrame.
+    ``.unique()`` a second time on the same large DataFrame. The Series
+    are kept in Polars-land — the caller materializes them into Python
+    only when actually needed (the bipartite partitions need ``set(...)``,
+    everything else does not).
 
     Parameters
     ----------
@@ -903,11 +914,13 @@ def _create_id_mapping(
     Returns
     -------
     id_mapper : IDMapper
-        Configured ID mapper. Internal IDs assigned in sorted-by-str order
-        of original IDs (deterministic across runs).
-    source_unique : List[Any]
+        Configured ID mapper. Internal IDs assigned in natural sort order
+        of original IDs (Polars Series.sort()). For string IDs this is
+        lexicographic; for numeric IDs it is numeric. Deterministic across
+        runs.
+    source_unique : pl.Series
         Unique original IDs from the source column.
-    target_unique : List[Any]
+    target_unique : pl.Series
         Unique original IDs from the target column.
 
     Raises
@@ -920,19 +933,30 @@ def _create_id_mapping(
 
         # Two C-level unique() passes — fast, and we hand the results back
         # to the caller so they don't get repeated for bipartite recording.
-        source_ids = df[source_col].unique().to_list()
-        target_ids = df[target_col].unique().to_list()
+        source_unique = df[source_col].unique()
+        target_unique = df[target_col].unique()
 
-        # Union of source and target IDs, sorted deterministically by str.
-        all_ids = sorted(set(source_ids) | set(target_ids), key=str)
+        # Union + sort in Polars/Rust. The previous implementation built two
+        # Python sets and unioned them, then ran sorted(..., key=str) over
+        # millions of Python objects — both expensive at scale.
+        all_ids_series = (
+            pl.concat([source_unique, target_unique])
+            .unique()
+            .sort()
+        )
+
+        # Single .to_list() — needed because IDMapper's backing store is a
+        # Python dict and that's the only Python-level conversion we pay for.
+        all_ids = all_ids_series.to_list()
 
         # Bulk-build the mapper. Skips the per-element type/uniqueness checks
-        # that add_mapping() performs — they're redundant since `set(...)`
-        # already deduped and only hashable values made it into the set.
+        # that add_mapping() performs — they're redundant since the upstream
+        # .unique() already deduped and only hashable dtypes made it past
+        # validation.
         id_mapper = IDMapper.from_originals(all_ids)
 
         logger.debug("Created ID mapping for %d unique nodes", len(all_ids))
-        return id_mapper, source_ids, target_ids
+        return id_mapper, source_unique, target_unique
 
     except Exception as e:
         raise GraphConstructionError(
@@ -1073,38 +1097,43 @@ def _apply_bipartite_overlap_policy(
             f"Expected one of {valid_policies}."
         )
 
-    source_set = set(df[source_col].unique().to_list())
-    target_set = set(df[target_col].unique().to_list())
-    overlap = source_set & target_set
+    # Compute overlap entirely in Polars: a Rust hash-join between the two
+    # unique columns is far cheaper than materializing both into Python sets
+    # and intersecting them (which costs ~3 conversions of millions of items
+    # plus a Python-level set operation).
+    src_unique = df.select(pl.col(source_col).unique().alias("_glp_id"))
+    tgt_unique = df.select(pl.col(target_col).unique().alias("_glp_id"))
+    overlap_df = src_unique.join(tgt_unique, on="_glp_id", how="inner")
+    n_overlap = overlap_df.height
 
-    if not overlap:
+    if n_overlap == 0:
         return df, False
 
-    sample = list(overlap)[:10]
+    # Only the small sample needs to leave Polars-land; full set never does.
+    sample = overlap_df.head(10)["_glp_id"].to_list()
 
     if policy == "raise":
         raise GraphConstructionError(
-            f"Graph is not bipartite: {len(overlap)} nodes appear in both "
+            f"Graph is not bipartite: {n_overlap} nodes appear in both "
             f"source and target",
             graph_type="bipartite",
             details={
                 "overlapping_nodes": sample,
-                "total_overlap": len(overlap),
-                "source_partition_size": len(source_set),
-                "target_partition_size": len(target_set),
+                "total_overlap": n_overlap,
+                "source_partition_size": src_unique.height,
+                "target_partition_size": tgt_unique.height,
             },
         )
 
     if policy == "drop":
         rows_before = len(df)
-        overlap_list = list(overlap)
-        df = df.filter(
-            ~pl.col(source_col).is_in(overlap_list)
-            & ~pl.col(target_col).is_in(overlap_list)
+        df = (
+            df.join(overlap_df, left_on=source_col, right_on="_glp_id", how="anti")
+              .join(overlap_df, left_on=target_col, right_on="_glp_id", how="anti")
         )
         n_dropped = rows_before - len(df)
         warnings.warn(
-            f"bipartite_overlap='drop': removed {len(overlap)} overlap node(s) "
+            f"bipartite_overlap='drop': removed {n_overlap} overlap node(s) "
             f"and {n_dropped} edge(s) (sample: {sample}). Graph is now "
             f"strictly bipartite."
         )
@@ -1112,7 +1141,7 @@ def _apply_bipartite_overlap_policy(
 
     # policy == "warn"
     warnings.warn(
-        f"bipartite_overlap='warn': {len(overlap)} node(s) appear in both "
+        f"bipartite_overlap='warn': {n_overlap} node(s) appear in both "
         f"source and target columns (sample: {sample}). Graph is not "
         f"strictly bipartite — downstream projection results on these "
         f"nodes may be ambiguous."
