@@ -85,6 +85,28 @@ def _print_projection_summary(
     )
 
 
+def _print_temporal_projection_summary(
+    verbose: bool,
+    t_start: float,
+    input_rows: int,
+    output_edges: int,
+    output_format: str,
+    intermediate_col: str,
+    projected_col: str,
+) -> None:
+    """One-line summary printed at the bottom of temporal_bipartite_to_unipartite."""
+    if not verbose:
+        return
+    import time as _time
+    dt = _time.perf_counter() - t_start
+    print(
+        f"[temporal_bipartite_to_unipartite] {dt:.2f}s | "
+        f"intermediate={intermediate_col}, projected={projected_col}, "
+        f"output={output_format} | "
+        f"{input_rows:,} input rows → {output_edges:,} projection edges"
+    )
+
+
 def _print_backbone_summary(
     verbose: bool,
     t_start: float,
@@ -2497,14 +2519,17 @@ def get_bipartite_info(graph: nk.Graph, id_mapper: IDMapper) -> Dict[str, Any]:
 def temporal_bipartite_to_unipartite(
     edgelist: Union[str, pl.DataFrame],
     source_col: str = "source",
-    target_col: str = "target", 
+    target_col: str = "target",
     timestamp_col: str = "timestamp",
     weight_col: Optional[str] = None,
     intermediate_col: str = "target",
     projected_col: str = "source",
     remove_self_loops: bool = True,
-    add_edge_weights: bool = True
-) -> Tuple[nk.Graph, IDMapper]:
+    add_edge_weights: bool = True,
+    verbose: bool = True,
+    *,
+    output_format: Optional[str] = None,
+) -> Union[Tuple[nk.Graph, IDMapper], Tuple[EdgeList, IDMapper], pl.DataFrame]:
     """
     Convert temporal bipartite edgelist to unipartite graph using citation-convention edges.
 
@@ -2514,6 +2539,13 @@ def temporal_bipartite_to_unipartite(
     item accumulates incoming edges from everyone who shared it later, which is
     how PageRank, HITS-Authority, and similar centrality metrics surface
     influential sources.
+
+    Accepts a file path (CSV/Parquet) or a Polars DataFrame. The output
+    format defaults to a NetworkIt :class:`nk.Graph` paired with an
+    :class:`IDMapper` (the historical return type) but can be forced to a
+    coded :class:`EdgeList` or a plain frame via ``output_format``.
+    :class:`EdgeList` input is not supported because EdgeList does not
+    carry the ``timestamp_col`` needed for temporal ordering.
 
     .. note::
         **Input order is trusted, not validated.** This function does NOT sort
@@ -2529,11 +2561,15 @@ def temporal_bipartite_to_unipartite(
 
     The algorithm:
 
-    1. Groups edges by intermediate node (the disappearing column).
-    2. Within each group, takes nodes in the order they appear (caller's
-       descending-timestamp order).
-    3. For every pair where ``i < j`` (later, earlier), emits a directed edge
-       ``unique_nodes[i] → unique_nodes[j]``.
+    1. Dedupes each ``intermediate_col`` group on ``projected_col`` while
+       preserving the caller's descending-timestamp row order (keeps the
+       latest occurrence of each projected node within the group).
+    2. Self-joins the deduped frame on ``intermediate_col`` and keeps the
+       upper-triangular pairs ``(i, j)`` with ``i < j`` — i.e. the later
+       sharer paired with each earlier sharer.
+    3. Emits a directed edge ``source = later sharer → target = earlier
+       sharer`` for each pair, with the temporal-decay weight described
+       under ``add_edge_weights``.
 
     Parameters
     ----------
@@ -2557,22 +2593,40 @@ def temporal_bipartite_to_unipartite(
     remove_self_loops : bool, default True
         Whether to remove self-loops in the resulting unipartite graph
     add_edge_weights : bool, default True
-        Whether to calculate edge weights based on temporal relationships
-        
+        Whether to calculate edge weights based on temporal relationships.
+        Weight = ``(w_later + w_earlier) / 2 * 1 / (1 + Δdays)``.
+    verbose : bool, default True
+        Print a one-line summary at the end.
+    output_format : str, optional
+        ``"graph"``, ``"edgelist"``, ``"dataframe"``, or ``None`` (default —
+        equivalent to ``"graph"``, preserving the legacy return type).
+
     Returns
     -------
     Tuple[nk.Graph, IDMapper]
-        NetworkIt directed graph and ID mapper for the projected unipartite network
-        
+        Graph-output path (default): NetworkIt directed graph and ID
+        mapper for the projected unipartite network.
+    Tuple[EdgeList, IDMapper]
+        EdgeList-output path: the projected edges as a coded
+        :class:`EdgeList` (directed, weighted) and a new ID mapper whose
+        internal IDs match the EdgeList's codes.
+    pl.DataFrame
+        DataFrame-output path: the projected edges with columns
+        ``source_id``, ``target_id``, ``weight``.
+
     Raises
     ------
     DataFormatError
         If required columns are missing or data format is invalid
     ValidationError
-        If timestamp column contains invalid data or insufficient temporal variation
+        If timestamp column contains invalid data, ``edgelist`` is neither
+        a path nor a DataFrame, or ``output_format`` is invalid.
+    ConfigurationError
+        If ``intermediate_col`` / ``projected_col`` don't match the
+        configured source/target columns.
     GraphConstructionError
         If projection fails due to data structure issues
-        
+
     Examples
     --------
     Convert user-item temporal interactions to a user-user attribution network:
@@ -2604,6 +2658,24 @@ def temporal_bipartite_to_unipartite(
     >>> #   Bob     → Alice                                         (from item2)
     >>> # Alice (earliest sharer of both items) has the most incoming edges.
 
+    Frame output — skip the NetworkIt build entirely:
+
+    >>> edge_df = temporal_bipartite_to_unipartite(
+    ...     data,
+    ...     source_col="user", target_col="item", timestamp_col="timestamp",
+    ...     intermediate_col="item", projected_col="user",
+    ...     output_format="dataframe",
+    ... )
+
+    EdgeList output — coded edges, lowest peak memory:
+
+    >>> projected_el, projected_mapper = temporal_bipartite_to_unipartite(
+    ...     data,
+    ...     source_col="user", target_col="item", timestamp_col="timestamp",
+    ...     intermediate_col="item", projected_col="user",
+    ...     output_format="edgelist",
+    ... )
+
     Notes
     -----
     Use citation convention when:
@@ -2619,162 +2691,354 @@ def temporal_bipartite_to_unipartite(
     - User-item interactions → user-user attribution networks
     - Author-paper records → author-author citation-like graphs
     - Social-media share logs → information-source attribution
+
+    Time Complexity: O(E + Σ_g |g|²) — one Polars dedup over the input
+    plus a per-intermediate-group quadratic for the upper-triangular
+    pair enumeration. The pair enumeration is executed as a Polars
+    self-join at the Rust level (no Python per-row loop).
+
+    Space Complexity: O(E + E_proj). The intermediate self-join
+    materializes all projection-edge candidates before the ``i < j``
+    filter; for hub-heavy inputs this can be the peak.
     """
-    
+    # Validate output_format up front (consistent with project_bipartite).
+    if output_format not in (None, "graph", "edgelist", "dataframe"):
+        raise ValidationError(
+            f"output_format must be 'graph', 'edgelist', 'dataframe', or None; "
+            f"got {output_format!r}"
+        )
+    if output_format is None:
+        # Default mirrors the historical return type of this function so
+        # existing callers (test_installation.py, README examples) keep
+        # working without code changes.
+        output_format = "graph"
+
+    import time as _time
+    _t_start = _time.perf_counter()
+
+    log_function_entry(
+        "temporal_bipartite_to_unipartite",
+        intermediate_col=intermediate_col,
+        projected_col=projected_col,
+        output_format=output_format,
+    )
+
     with LoggingTimer("temporal_bipartite_to_unipartite"):
-        log_function_entry("temporal_bipartite_to_unipartite", 
-                          intermediate_col=intermediate_col, projected_col=projected_col)
-        
-        # Load and validate input data
+        # Step 1: Load input (file path or DataFrame). EdgeList isn't
+        # supported because it carries no timestamp column.
         if isinstance(edgelist, str):
-            edgelist = _load_edgelist_file(edgelist)
-        
-        # Validate required columns
+            edgelist = _load_edge_list(edgelist)
+        elif not isinstance(edgelist, pl.DataFrame):
+            raise ValidationError(
+                f"`edgelist` must be a file path (str) or Polars DataFrame; "
+                f"got {type(edgelist).__name__}"
+            )
+
+        input_rows = len(edgelist)
+
+        # Step 2: Validate required columns and intermediate/projected wiring.
         required_cols = [source_col, target_col, timestamp_col]
         missing_cols = [col for col in required_cols if col not in edgelist.columns]
         if missing_cols:
             raise DataFormatError(f"Missing required columns: {missing_cols}")
-        
+
         if intermediate_col not in [source_col, target_col]:
             raise ConfigurationError(
-                f"intermediate_col '{intermediate_col}' must be either '{source_col}' or '{target_col}'"
+                f"intermediate_col '{intermediate_col}' must be either "
+                f"'{source_col}' or '{target_col}'"
             )
         if projected_col not in [source_col, target_col]:
             raise ConfigurationError(
-                f"projected_col '{projected_col}' must be either '{source_col}' or '{target_col}'"
+                f"projected_col '{projected_col}' must be either "
+                f"'{source_col}' or '{target_col}'"
             )
         if intermediate_col == projected_col:
-            raise ConfigurationError("intermediate_col and projected_col cannot be the same")
-            
-        logger.info(f"Processing temporal bipartite conversion: {len(edgelist)} edges")
-        logger.info(f"Intermediate column: {intermediate_col}, Projected column: {projected_col}")
-        
+            raise ConfigurationError(
+                "intermediate_col and projected_col cannot be the same"
+            )
+
+        logger.info(
+            "Processing temporal bipartite conversion: %d edges "
+            "(intermediate=%s, projected=%s)",
+            input_rows, intermediate_col, projected_col,
+        )
+
         try:
-            # Convert timestamp to datetime if needed (still needed for the
-            # temporal weight calculation below — does not change row order).
+            # Step 3: Ensure timestamp is Datetime — needed for the
+            # temporal weight subtraction below. Does not change row order.
             if edgelist[timestamp_col].dtype != pl.Datetime:
                 try:
                     edgelist = edgelist.with_columns(
                         pl.col(timestamp_col).str.to_datetime().alias(timestamp_col)
                     )
                 except Exception as e:
-                    raise ValidationError(f"Cannot parse timestamp column '{timestamp_col}': {e}")
+                    raise ValidationError(
+                        f"Cannot parse timestamp column '{timestamp_col}': {e}"
+                    )
 
-            # NOTE: this function trusts the caller's row order. The input
-            # edgelist MUST be pre-sorted by intermediate_col (any order), then
-            # by timestamp_col DESCENDING (latest first) within each
-            # intermediate-node group. We do not re-sort because callers
-            # working with very large datasets often pre-sort once and reuse.
+            # NOTE: trusts the caller's row order. Input MUST be pre-sorted
+            # by intermediate_col (any order), then timestamp_col DESCENDING
+            # (latest first) within each intermediate-node group. We do not
+            # re-sort because callers working with very large datasets often
+            # pre-sort once and reuse.
             logger.info(
-                f"Assuming pre-sorted input: by {intermediate_col} (grouped), "
-                f"then {timestamp_col} DESCENDING within each group"
+                "Assuming pre-sorted input: by %s (grouped), "
+                "then %s DESCENDING within each group",
+                intermediate_col, timestamp_col,
             )
 
-            # Group by intermediate node and create temporal edges. preserve order
-            # so the user's descending-timestamp ordering inside each group is kept.
-            projection_edges = []
-            edge_weights = []
+            # Step 4: Vectorized temporal projection (Polars self-join).
+            # Replaces the legacy per-group Python loop that built lists of
+            # (source, target) tuples and edge_weights — the join runs at
+            # the Rust level and scales to millions of input edges.
+            unipartite_df = _compute_temporal_projection_frame(
+                edgelist,
+                intermediate_col=intermediate_col,
+                projected_col=projected_col,
+                timestamp_col=timestamp_col,
+                weight_col=weight_col,
+                add_edge_weights=add_edge_weights,
+                remove_self_loops=remove_self_loops,
+            )
 
-            for intermediate_node, group in edgelist.group_by(intermediate_col, maintain_order=True):
-                # Projected nodes in the order the user provided — descending by
-                # timestamp within this group (latest sharer first, earliest last).
-                projected_nodes = group[projected_col].to_list()
-                timestamps = group[timestamp_col].to_list()
-                weights = group[weight_col].to_list() if weight_col else [1.0] * len(projected_nodes)
-                
-                # Skip groups with only one node (no edges possible)
-                if len(projected_nodes) <= 1:
-                    continue
-                
-                # Remove duplicates while preserving order
-                unique_nodes = []
-                unique_timestamps = []
-                unique_weights = []
-                seen = set()
-                for i, node in enumerate(projected_nodes):
-                    if node not in seen:
-                        unique_nodes.append(node)
-                        unique_timestamps.append(timestamps[i])
-                        unique_weights.append(weights[i])
-                        seen.add(node)
-                
-                # Skip if only one unique node after deduplication
-                if len(unique_nodes) <= 1:
-                    continue
-                    
-                # Create temporal edges using upper triangular indices.
-                # With input sorted DESCENDING by timestamp within this group:
-                #   unique_nodes[0]   = latest sharer
-                #   unique_nodes[n-1] = earliest sharer
-                # np.triu_indices(n, k=1) gives pairs (i, j) with i < j, so:
-                #   unique_nodes[i] = later sharer  → source
-                #   unique_nodes[j] = earlier sharer → target
-                # This yields citation-convention edges (later → earlier): the
-                # original sharer accumulates incoming edges from everyone who
-                # shared the same item later, which is what PageRank / HITS
-                # Authority expect to read as "influential source".
-                n_nodes = len(unique_nodes)
-                upper_tri_indices = np.triu_indices(n_nodes, k=1)
+            n_proj_edges = unipartite_df.height
+            logger.info(
+                "Created temporal unipartite projection: %d edges",
+                n_proj_edges,
+            )
 
-                for i, j in zip(upper_tri_indices[0], upper_tri_indices[1]):
-                    source_node = unique_nodes[i]  # Later sharer
-                    target_node = unique_nodes[j]  # Earlier sharer (the cited source)
-                    
-                    # Calculate edge weight based on temporal relationship
-                    if add_edge_weights:
-                        # Weight inversely related to temporal distance
-                        time_diff = (unique_timestamps[i] - unique_timestamps[j]).total_seconds()
-                        temporal_weight = 1.0 / (1.0 + abs(time_diff) / 86400.0)  # Decay by days
-                        edge_weight = (unique_weights[i] + unique_weights[j]) / 2.0 * temporal_weight
-                    else:
-                        edge_weight = 1.0
-                    
-                    projection_edges.append((source_node, target_node))
-                    edge_weights.append(edge_weight)
-                    
-                logger.debug(f"Created {len(upper_tri_indices[0])} temporal edges for intermediate '{intermediate_node}'")
-            
-            if not projection_edges:
-                logger.warning("No temporal edges created - all intermediate nodes had ≤1 unique projected node")
-                # Create empty graph
+            # Step 5: Dispatch by output_format.
+            if output_format == "dataframe":
+                # Sum weights across intermediate-groups so the frame has
+                # one row per projected edge — matches the "1 row per
+                # projection edge" semantics of project_bipartite's
+                # dataframe output. Building a graph/edgelist below would
+                # apply the same aggregation, so we do it explicitly here
+                # for the frame branch.
+                edge_df = (
+                    unipartite_df
+                    .group_by(["source", "target"])
+                    .agg(pl.col("weight").sum())
+                    .rename({"source": "source_id", "target": "target_id"})
+                )
+                _print_temporal_projection_summary(
+                    verbose, _t_start, input_rows, edge_df.height,
+                    output_format, intermediate_col, projected_col,
+                )
+                return edge_df
+
+            if output_format == "edgelist":
+                if n_proj_edges == 0:
+                    logger.warning(
+                        "No temporal edges created - all intermediate nodes had "
+                        "≤1 unique projected node"
+                    )
+                    empty_el = _empty_edgelist(
+                        directed=True, bipartite=False, weighted=True,
+                        code_dtype=pl.UInt32,
+                    )
+                    empty_mapper = IDMapper()
+                    _print_temporal_projection_summary(
+                        verbose, _t_start, input_rows, 0,
+                        output_format, intermediate_col, projected_col,
+                    )
+                    return empty_el, empty_mapper
+                edge_list, id_mapper = build_edgelist_from_frame(
+                    unipartite_df,
+                    source_col="source",
+                    target_col="target",
+                    weight_col="weight",
+                    directed=True,
+                    allow_self_loops=not remove_self_loops,
+                    auto_weight=False,
+                    remove_duplicates=False,
+                    verbose=False,
+                )
+                _print_temporal_projection_summary(
+                    verbose, _t_start, input_rows, edge_list.number_of_edges(),
+                    output_format, intermediate_col, projected_col,
+                )
+                return edge_list, id_mapper
+
+            # Default: output_format == "graph".
+            if n_proj_edges == 0:
+                logger.warning(
+                    "No temporal edges created - all intermediate nodes had "
+                    "≤1 unique projected node"
+                )
                 empty_graph = nk.Graph(0, weighted=True, directed=True)
                 empty_mapper = IDMapper()
+                _print_temporal_projection_summary(
+                    verbose, _t_start, input_rows, 0,
+                    output_format, intermediate_col, projected_col,
+                )
                 return empty_graph, empty_mapper
-            
-            # Create unipartite edgelist DataFrame
-            unipartite_df = pl.DataFrame({
-                "source": [edge[0] for edge in projection_edges],
-                "target": [edge[1] for edge in projection_edges], 
-                "weight": edge_weights
-            })
-            
-            # Remove self-loops if requested
-            if remove_self_loops:
-                original_count = len(unipartite_df)
-                unipartite_df = unipartite_df.filter(pl.col("source") != pl.col("target"))
-                removed_count = original_count - len(unipartite_df)
-                if removed_count > 0:
-                    logger.info(f"Removed {removed_count} self-loops")
-            
-            logger.info(f"Created temporal unipartite projection: {len(unipartite_df)} edges")
-            
-            # Build final directed graph
+
             graph, id_mapper = build_graph_from_edgelist(
                 unipartite_df,
                 source_col="source",
-                target_col="target", 
+                target_col="target",
                 weight_col="weight",
                 directed=True,
-                allow_self_loops=not remove_self_loops
+                allow_self_loops=not remove_self_loops,
+                auto_weight=False,
+                remove_duplicates=False,
+                verbose=False,
             )
-            
-            logger.info(f"Final temporal unipartite graph: {graph.numberOfNodes()} nodes, {graph.numberOfEdges()} edges")
-            
+
+            logger.info(
+                "Final temporal unipartite graph: %d nodes, %d edges",
+                graph.numberOfNodes(), graph.numberOfEdges(),
+            )
+            _print_temporal_projection_summary(
+                verbose, _t_start, input_rows, graph.numberOfEdges(),
+                output_format, intermediate_col, projected_col,
+            )
             return graph, id_mapper
-            
+
         except Exception as e:
+            if isinstance(e, (
+                GraphConstructionError, ValidationError,
+                ConfigurationError, DataFormatError,
+            )):
+                raise
             raise GraphConstructionError(
                 f"Temporal bipartite-to-unipartite conversion failed: {str(e)}",
                 operation="temporal_bipartite_to_unipartite",
-                cause=e
+                cause=e,
             )
+
+
+def _compute_temporal_projection_frame(
+    df: pl.DataFrame,
+    intermediate_col: str,
+    projected_col: str,
+    timestamp_col: str,
+    weight_col: Optional[str],
+    add_edge_weights: bool,
+    remove_self_loops: bool,
+) -> pl.DataFrame:
+    """Vectorized temporal-projection kernel used by :func:`temporal_bipartite_to_unipartite`.
+
+    Replaces the legacy per-group Python loop (``for intermediate_node,
+    group in edgelist.group_by(...)`` + ``np.triu_indices`` + appending to
+    Python lists) with a single Polars self-join. Same citation-convention
+    semantics: within each intermediate-node group, the caller's descending
+    timestamp order is preserved by :func:`pl.DataFrame.unique` with
+    ``keep="first"``, then a self-join on ``intermediate_col`` paired with
+    an ``i < j`` filter enumerates the upper-triangular pairs. Index ``i``
+    is the later sharer (source), ``j`` is the earlier sharer (target).
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        Input edge frame, pre-sorted by ``intermediate_col`` (any order)
+        then ``timestamp_col`` DESCENDING within each group. Must contain
+        ``intermediate_col``, ``projected_col``, ``timestamp_col`` (already
+        cast to ``pl.Datetime`` by the caller), and ``weight_col`` when
+        non-None.
+    add_edge_weights : bool
+        If True, edge weight is ``(w_i + w_j) / 2 * 1 / (1 + Δdays)``.
+        If False, every edge gets weight ``1.0``.
+    remove_self_loops : bool
+        If True, drop edges where ``source == target`` (can happen when
+        the same projected node co-occurs under different intermediate
+        codes — rare but possible).
+
+    Returns
+    -------
+    pl.DataFrame
+        Columns: ``source``, ``target``, ``weight`` (Float64). Node IDs
+        are the ORIGINAL ``projected_col`` values — no coding step yet,
+        so the frame is ready to be handed to
+        :func:`build_graph_from_edgelist` or :func:`build_edgelist_from_frame`.
+    """
+    # 1. Dedupe within each intermediate group: matches the legacy
+    #    per-group `seen` set semantics. The pre-sorted descending-timestamp
+    #    order means `keep="first"` keeps the latest occurrence of each
+    #    projected node, identical to the legacy loop.
+    deduped = df.unique(
+        subset=[intermediate_col, projected_col],
+        keep="first",
+        maintain_order=True,
+    )
+
+    # 2. Normalize to (intermediate, node, ts, w, rank). The per-intermediate
+    #    rank starts at 0 for the latest sharer (input row 0 in the group)
+    #    and increases for earlier sharers — same ordering as `unique_nodes`
+    #    in the legacy loop, but now derivable from a Polars window function
+    #    rather than a Python list.
+    if weight_col is None:
+        weight_expr = pl.lit(1.0).cast(pl.Float64).alias("__w")
+    else:
+        weight_expr = pl.col(weight_col).cast(pl.Float64).alias("__w")
+
+    normalized = deduped.select([
+        pl.col(intermediate_col).alias("__inter"),
+        pl.col(projected_col).alias("__node"),
+        pl.col(timestamp_col).alias("__ts"),
+        weight_expr,
+    ]).with_columns(
+        pl.int_range(pl.len()).over("__inter").alias("__rank")
+    )
+
+    # 3. Self-join on the intermediate column. The `i < j` filter keeps
+    #    only the strict-upper-triangular pairs — same as np.triu_indices(n, k=1)
+    #    in the legacy kernel, but executed at the Rust level over all
+    #    intermediate groups at once.
+    left = normalized.select([
+        pl.col("__inter"),
+        pl.col("__node").alias("source"),
+        pl.col("__ts").alias("__ts_i"),
+        pl.col("__w").alias("__w_i"),
+        pl.col("__rank").alias("__i"),
+    ])
+    right = normalized.select([
+        pl.col("__inter"),
+        pl.col("__node").alias("target"),
+        pl.col("__ts").alias("__ts_j"),
+        pl.col("__w").alias("__w_j"),
+        pl.col("__rank").alias("__j"),
+    ])
+    pairs = left.join(right, on="__inter").filter(pl.col("__i") < pl.col("__j"))
+
+    if pairs.is_empty():
+        return pl.DataFrame({
+            "source": pl.Series([], dtype=df[projected_col].dtype),
+            "target": pl.Series([], dtype=df[projected_col].dtype),
+            "weight": pl.Series([], dtype=pl.Float64),
+        })
+
+    # 4. Temporal-decay edge weight (same formula as the legacy kernel:
+    #    average of the two endpoint weights scaled by 1/(1 + Δdays)).
+    if add_edge_weights:
+        time_diff_days = (
+            (pl.col("__ts_i") - pl.col("__ts_j"))
+            .dt.total_seconds()
+            .abs()
+            .cast(pl.Float64)
+            / 86400.0
+        )
+        weight_value = (
+            ((pl.col("__w_i") + pl.col("__w_j")) / 2.0)
+            * (1.0 / (1.0 + time_diff_days))
+        ).alias("weight")
+    else:
+        weight_value = pl.lit(1.0).cast(pl.Float64).alias("weight")
+
+    edges = pairs.select([
+        pl.col("source"),
+        pl.col("target"),
+        weight_value,
+    ])
+
+    # 5. Optionally drop self-loops (matches the legacy
+    #    `unipartite_df.filter(source != target)` step).
+    if remove_self_loops:
+        rows_before = edges.height
+        edges = edges.filter(pl.col("source") != pl.col("target"))
+        removed = rows_before - edges.height
+        if removed > 0:
+            logger.info("Removed %d self-loops", removed)
+
+    return edges
