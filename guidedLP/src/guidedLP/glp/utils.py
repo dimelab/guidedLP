@@ -7,7 +7,7 @@ creating balanced seed sets and suggesting optimal alpha values based on
 network properties.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import warnings
 import random
 import numpy as np
@@ -791,3 +791,268 @@ def _coverage_report(
         "by_label": by_label,
         "missing_sample": missing_nodes[:cap],
     }
+
+
+def make_stat_user_edges(
+    bipartite_engagement: Union[pl.DataFrame, "_pd.DataFrame"],
+    seed_nodes: SeedInput,
+    user_col: str = "user",
+    content_col: str = "content",
+    weight_col: Optional[str] = "weight",
+    stat_prefix: str = "__stat__",
+    seed_node_col: str = "node_id",
+    seed_label_col: str = "label",
+) -> Tuple[pl.DataFrame, Dict[str, str], Set[str]]:
+    """
+    Generate stat-user (label-as-node) edges from a labeled bipartite engagement.
+
+    For each labeled node ``c`` in ``seed_nodes`` (typically a piece of
+    content), creates a synthetic "stat user" ``__stat__{c}`` with one edge
+    per real user that engaged with ``c``. The edge weight is the user's
+    aggregated engagement weight with that content. These synthetic edges are
+    intended to be concatenated with a user-user edgelist (e.g. the output
+    of :func:`guidedLP.network.project_bipartite`), the resulting graph
+    constructed, and then passed to :func:`guided_label_propagation` together
+    with the returned ``stat_seeds`` and ``stat_node_ids``
+    (via ``exclude_from_output``) to drop the synthetic nodes from the final
+    result.
+
+    This implements the label-as-node augmentation pattern: instead of
+    propagating on the bipartite graph directly, the labeled partition is
+    collapsed into synthetic nodes that live in the user partition. The
+    seeds stay anchored throughout propagation (via the GLP ``(1-α)Y``
+    term), and GLP operates cleanly on the user-user projection without
+    period-2 random-walk artifacts.
+
+    Place this call **after** any filtering or backboning of the user-user
+    graph — the synthetic nodes have an artificial degree profile that those
+    methods aren't calibrated for. See ``bipartite_glp_notes.md`` at the
+    repo root for the broader rationale and references.
+
+    Parameters
+    ----------
+    bipartite_engagement : pl.DataFrame or pd.DataFrame
+        Raw bipartite engagement data. Must contain at least the columns
+        named by ``user_col`` and ``content_col``. May contain duplicate
+        ``(user, content)`` rows; these are aggregated by summing the
+        ``weight_col`` values before stat-user edges are emitted.
+    seed_nodes : SeedInput
+        Labeled nodes (currently living in ``content_col``). Any of the
+        supported seed shapes — see
+        :func:`guidedLP.common.normalize_seed_input`.
+    user_col : str, default "user"
+        Column in ``bipartite_engagement`` containing the nodes that will
+        become neighbors of the synthetic stat users (typically the user
+        partition).
+    content_col : str, default "content"
+        Column in ``bipartite_engagement`` containing the labeled nodes
+        (typically the content partition).
+    weight_col : Optional[str], default "weight"
+        Column with engagement weights. Pass ``None`` for unweighted
+        engagement (every row contributes weight 1.0).
+    stat_prefix : str, default "__stat__"
+        Prefix prepended to each content ID to form its stat-user ID.
+        Choose a prefix that cannot occur in real user IDs — a
+        ``ValidationError`` is raised if any generated stat ID collides with
+        an existing user ID.
+    seed_node_col, seed_label_col : str, default "node_id" / "label"
+        Column names consulted when ``seed_nodes`` is a DataFrame.
+
+    Returns
+    -------
+    stat_edges : pl.DataFrame
+        Columns ``source_id`` (str, the stat-user ID), ``target_id``
+        (matching the dtype of ``user_col``, the real user ID), and
+        ``weight`` (Float64, the aggregated engagement weight). Schema
+        matches :func:`guidedLP.network.project_bipartite` output so the
+        frame can be concatenated directly with a user-user edgelist.
+    stat_seeds : Dict[str, str]
+        Mapping from stat-user ID to label. Pass to
+        :func:`guided_label_propagation` as ``seed_labels``. Excludes any
+        seed content that had no engagements (those are warned about and
+        silently dropped — they cannot anchor any user without edges).
+    stat_node_ids : Set[str]
+        The set of stat-user IDs that appear in ``stat_edges``. Pass to
+        :func:`guided_label_propagation` as ``exclude_from_output`` to drop
+        stat-user rows from the final result.
+
+    Raises
+    ------
+    ValidationError
+        If ``bipartite_engagement`` is missing required columns; if
+        ``seed_nodes`` is empty; if none of the seed nodes have any
+        engagements; if any generated stat ID collides with a real user ID.
+
+    Warns
+    -----
+    UserWarning
+        If any seed content has no engagements in ``bipartite_engagement``.
+        Those seeds contribute no edges and are silently dropped from the
+        returned ``stat_seeds`` and ``stat_node_ids``.
+
+    Examples
+    --------
+    >>> import polars as pl
+    >>> engagement = pl.DataFrame({
+    ...     "user": ["u1", "u1", "u2", "u3"],
+    ...     "content": ["c1", "c2", "c1", "c2"],
+    ...     "weight": [1.0, 2.0, 1.0, 3.0],
+    ... })
+    >>> content_seeds = {"c1": "left", "c2": "right"}
+    >>> stat_edges, stat_seeds, stat_ids = make_stat_user_edges(
+    ...     engagement, content_seeds
+    ... )
+    >>> # stat_edges has 4 rows: (__stat__c1, u1, 1.0), (__stat__c1, u2, 1.0),
+    >>> #                        (__stat__c2, u1, 2.0), (__stat__c2, u3, 3.0)
+    >>> # stat_seeds: {"__stat__c1": "left", "__stat__c2": "right"}
+    >>> # stat_ids:   {"__stat__c1", "__stat__c2"}
+
+    Full pipeline (project bipartite → augment → propagate → drop synthetic
+    nodes from output):
+
+    >>> from guidedLP.network import project_bipartite, build_graph_from_edgelist
+    >>> from guidedLP.glp import guided_label_propagation
+    >>> projected = project_bipartite(
+    ...     # project_bipartite expects source_id / target_id on frame input
+    ...     engagement.rename({"user": "source_id", "content": "target_id"}),
+    ...     projection_mode="source",
+    ...     weight_method="count",
+    ...     output_format="dataframe",
+    ... )
+    >>> stat_edges, stat_seeds, stat_ids = make_stat_user_edges(
+    ...     engagement, content_seeds,
+    ... )
+    >>> augmented = pl.concat([projected, stat_edges])
+    >>> graph, mapper = build_graph_from_edgelist(
+    ...     augmented,
+    ...     source_col="source_id", target_col="target_id", weight_col="weight",
+    ... )
+    >>> result = guided_label_propagation(
+    ...     graph, mapper, stat_seeds, ["left", "right"],
+    ...     exclude_from_output=stat_ids,
+    ... )
+
+    Notes
+    -----
+    - Stat-user IDs are always built as ``f"{stat_prefix}{content_id}"`` and
+      thus always strings. If real user IDs are non-string, cast them to
+      string before assembling the user-user edgelist so the columns can be
+      concatenated cleanly.
+    - The function aggregates duplicate ``(user, content)`` rows by
+      **summing** weights. If you want a different aggregation (max,
+      average, etc.), pre-aggregate before passing the DataFrame in.
+    """
+    # Normalize the seed input shape to the canonical dict.
+    content_seeds = normalize_seed_input(seed_nodes, seed_node_col, seed_label_col)
+    if not content_seeds:
+        raise ValidationError("seed_nodes cannot be empty")
+
+    # Accept polars or pandas; everything below operates on polars.
+    if isinstance(bipartite_engagement, pl.DataFrame):
+        engagement = bipartite_engagement
+    elif _HAS_PANDAS and isinstance(bipartite_engagement, _pd.DataFrame):
+        engagement = pl.from_pandas(bipartite_engagement)
+    else:
+        raise ValidationError(
+            f"bipartite_engagement must be a polars.DataFrame or pandas.DataFrame, "
+            f"got {type(bipartite_engagement).__name__}"
+        )
+
+    # Validate columns up front.
+    available = list(engagement.columns)
+    missing = [c for c in (user_col, content_col) if c not in available]
+    if missing:
+        raise ValidationError(
+            f"bipartite_engagement is missing required column(s): {missing}. "
+            f"Available columns: {available}"
+        )
+    if weight_col is not None and weight_col not in available:
+        raise ValidationError(
+            f"weight_col '{weight_col}' not in bipartite_engagement "
+            f"(available: {available}). Pass weight_col=None for unweighted "
+            f"engagement (every row contributes weight 1.0)."
+        )
+
+    with LoggingTimer("Building stat-user edges"):
+        # Use a temporary unit-weight column when weight_col is None so the
+        # group_by + sum path below is uniform.
+        if weight_col is None:
+            engagement = engagement.with_columns(
+                pl.lit(1.0).alias("__stat_weight__")
+            )
+            weight_source = "__stat_weight__"
+        else:
+            weight_source = weight_col
+
+        # Restrict to engagements involving seed content only.
+        seed_content_ids = list(content_seeds.keys())
+        filtered = engagement.filter(pl.col(content_col).is_in(seed_content_ids))
+
+        # Aggregate duplicate (user, content) rows by summing weights.
+        aggregated = (
+            filtered
+            .group_by([user_col, content_col])
+            .agg(pl.col(weight_source).sum().cast(pl.Float64).alias("weight"))
+        )
+
+        # Warn for seeds with no engagements — they can't anchor any user.
+        engaged_content = set(aggregated[content_col].to_list())
+        unmatched = set(seed_content_ids) - engaged_content
+        if unmatched:
+            sample = list(unmatched)[:5]
+            warnings.warn(
+                f"{len(unmatched)} of {len(seed_content_ids)} seed content "
+                f"node(s) have no engagements in bipartite_engagement and "
+                f"will not contribute stat-user edges (sample: {sample}"
+                f"{'...' if len(unmatched) > 5 else ''})",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if not engaged_content:
+            raise ValidationError(
+                "None of the seed nodes have any engagements in "
+                "bipartite_engagement — no stat-user edges to generate."
+            )
+
+        # Generate stat IDs and check for collisions with real users. Use the
+        # full engagement frame's user column (not the filtered one) so we
+        # catch collisions involving any real user, not only users connected
+        # to seed content.
+        real_users = set(engagement[user_col].to_list())
+        stat_ids: Set[str] = {f"{stat_prefix}{c}" for c in engaged_content}
+        collisions = stat_ids & real_users
+        if collisions:
+            sample = list(collisions)[:5]
+            raise ValidationError(
+                f"{len(collisions)} stat-user ID(s) collide with existing "
+                f"user ID(s) (sample: {sample}). Choose a different "
+                f"stat_prefix.",
+                details={"collision_count": len(collisions), "sample": sample},
+            )
+
+        # Build the stat-user edgelist with project_bipartite output schema.
+        stat_edges = (
+            aggregated
+            .with_columns(
+                pl.concat_str([
+                    pl.lit(stat_prefix),
+                    pl.col(content_col).cast(pl.Utf8),
+                ]).alias("source_id"),
+                pl.col(user_col).alias("target_id"),
+            )
+            .select(["source_id", "target_id", "weight"])
+        )
+
+        # Only emit seeds for content that actually generated edges.
+        stat_seeds: Dict[str, str] = {
+            f"{stat_prefix}{c}": content_seeds[c] for c in engaged_content
+        }
+
+        logger.info(
+            f"Generated {len(stat_edges)} stat-user edges for "
+            f"{len(stat_seeds)} seed content (skipped {len(unmatched)} "
+            f"unengaged)"
+        )
+
+        return stat_edges, stat_seeds, stat_ids

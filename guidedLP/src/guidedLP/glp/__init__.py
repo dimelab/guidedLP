@@ -38,6 +38,7 @@ from .utils import (
     suggest_alpha_value,
     get_seed_statistics,
     check_seed_coverage,
+    make_stat_user_edges,
 )
 
 # Evaluation functions

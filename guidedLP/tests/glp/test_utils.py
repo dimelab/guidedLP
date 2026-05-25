@@ -19,6 +19,7 @@ from guidedLP.glp.utils import (
     suggest_alpha_value,
     get_seed_statistics,
     check_seed_coverage,
+    make_stat_user_edges,
     _validate_balance_inputs,
     _validate_alpha_inputs,
     _group_seeds_by_label,
@@ -783,3 +784,347 @@ class TestSuggestAlphaValueInputValidation:
         graph = nk.Graph(5)
         with pytest.raises(ConfigurationError):
             suggest_alpha_value(graph, 2, method="invalid")
+
+
+class TestMakeStatUserEdges:
+    """Tests for the label-as-node augmentation function."""
+
+    def _engagement(self):
+        return pl.DataFrame({
+            "user": ["u1", "u1", "u2", "u3"],
+            "content": ["c1", "c2", "c1", "c2"],
+            "weight": [1.0, 2.0, 1.0, 3.0],
+        })
+
+    def test_basic_happy_path(self):
+        """Generates one edge per (user, seed_content) pair with engagement weights."""
+        engagement = self._engagement()
+        edges, seeds, ids = make_stat_user_edges(
+            engagement, {"c1": "left", "c2": "right"}
+        )
+
+        # Schema matches project_bipartite output
+        assert edges.columns == ["source_id", "target_id", "weight"]
+        assert len(edges) == 4
+
+        # Stat IDs returned
+        assert ids == {"__stat__c1", "__stat__c2"}
+
+        # Seed dict has labels for both stat users
+        assert seeds == {"__stat__c1": "left", "__stat__c2": "right"}
+
+        # Edge weights match input engagement (no dedup needed here)
+        rows = {
+            (r["source_id"], r["target_id"]): r["weight"]
+            for r in edges.iter_rows(named=True)
+        }
+        assert rows[("__stat__c1", "u1")] == 1.0
+        assert rows[("__stat__c1", "u2")] == 1.0
+        assert rows[("__stat__c2", "u1")] == 2.0
+        assert rows[("__stat__c2", "u3")] == 3.0
+
+    def test_duplicates_are_summed(self):
+        """Duplicate (user, content) rows aggregate by summing weights."""
+        engagement = pl.DataFrame({
+            "user": ["u1", "u1", "u1", "u2"],
+            "content": ["c1", "c1", "c1", "c1"],
+            "weight": [1.0, 2.0, 3.0, 5.0],
+        })
+        edges, _, _ = make_stat_user_edges(engagement, {"c1": "A"})
+
+        rows = {r["target_id"]: r["weight"] for r in edges.iter_rows(named=True)}
+        assert rows["u1"] == 6.0  # 1 + 2 + 3
+        assert rows["u2"] == 5.0
+
+    def test_unweighted_input(self):
+        """weight_col=None falls back to unit weights, still aggregates."""
+        engagement = pl.DataFrame({
+            "user": ["u1", "u1", "u2"],
+            "content": ["c1", "c1", "c1"],
+        })
+        edges, _, _ = make_stat_user_edges(
+            engagement, {"c1": "A"}, weight_col=None
+        )
+
+        rows = {r["target_id"]: r["weight"] for r in edges.iter_rows(named=True)}
+        assert rows["u1"] == 2.0  # 1 + 1 (the two dup rows)
+        assert rows["u2"] == 1.0
+
+    def test_unmatched_seed_warns_and_is_dropped(self):
+        """Seeds with no engagements warn but don't break the call."""
+        engagement = pl.DataFrame({
+            "user": ["u1", "u2"],
+            "content": ["c1", "c1"],
+            "weight": [1.0, 1.0],
+        })
+        with pytest.warns(UserWarning, match="have no engagements"):
+            edges, seeds, ids = make_stat_user_edges(
+                engagement, {"c1": "A", "c_missing": "B"}
+            )
+
+        # Only c1 contributes
+        assert seeds == {"__stat__c1": "A"}
+        assert ids == {"__stat__c1"}
+        assert len(edges) == 2
+
+    def test_all_seeds_unmatched_raises(self):
+        """If no seed has any engagement, that's a hard error, not a warning."""
+        engagement = pl.DataFrame({
+            "user": ["u1"],
+            "content": ["c_real"],
+            "weight": [1.0],
+        })
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            with pytest.raises(ValidationError, match="None of the seed nodes"):
+                make_stat_user_edges(engagement, {"c_missing": "A"})
+
+    def test_id_collision_detected(self):
+        """Stat IDs colliding with real user IDs raise immediately."""
+        engagement = pl.DataFrame({
+            "user": ["u1", "__stat__c1"],  # second user collides
+            "content": ["c1", "c1"],
+            "weight": [1.0, 1.0],
+        })
+        with pytest.raises(ValidationError, match="collide"):
+            make_stat_user_edges(engagement, {"c1": "A"})
+
+    def test_custom_prefix(self):
+        """stat_prefix is configurable."""
+        engagement = self._engagement()
+        edges, seeds, ids = make_stat_user_edges(
+            engagement,
+            {"c1": "A"},
+            stat_prefix="LBL_",
+        )
+        assert ids == {"LBL_c1"}
+        assert seeds == {"LBL_c1": "A"}
+        sources = set(edges["source_id"].to_list())
+        assert sources == {"LBL_c1"}
+
+    def test_custom_column_names(self):
+        """user_col / content_col / weight_col can all be overridden."""
+        engagement = pl.DataFrame({
+            "uid": ["u1", "u2"],
+            "post": ["p1", "p1"],
+            "score": [4.0, 5.0],
+        })
+        edges, seeds, _ = make_stat_user_edges(
+            engagement,
+            {"p1": "A"},
+            user_col="uid",
+            content_col="post",
+            weight_col="score",
+        )
+        rows = {r["target_id"]: r["weight"] for r in edges.iter_rows(named=True)}
+        assert rows == {"u1": 4.0, "u2": 5.0}
+        assert seeds == {"__stat__p1": "A"}
+
+    def test_empty_seeds_raises(self):
+        """Empty seed input is a configuration error."""
+        engagement = self._engagement()
+        with pytest.raises(ValidationError, match="empty"):
+            make_stat_user_edges(engagement, {})
+
+    def test_missing_column_raises(self):
+        """Misnamed user_col / content_col raise with a helpful message."""
+        engagement = self._engagement()
+        with pytest.raises(ValidationError, match="missing required"):
+            make_stat_user_edges(
+                engagement, {"c1": "A"}, user_col="nonexistent"
+            )
+
+    def test_missing_weight_column_raises(self):
+        """Misnamed weight_col raises (vs. silently treating as unweighted)."""
+        engagement = self._engagement()
+        with pytest.raises(ValidationError, match="weight_col"):
+            make_stat_user_edges(
+                engagement, {"c1": "A"}, weight_col="not_there"
+            )
+
+    def test_label_keyed_seed_input(self):
+        """Seed input shape {label: [nodes]} works (via normalize_seed_input)."""
+        engagement = self._engagement()
+        edges, seeds, _ = make_stat_user_edges(
+            engagement, {"left": ["c1"], "right": ["c2"]}
+        )
+        assert seeds == {"__stat__c1": "left", "__stat__c2": "right"}
+        assert len(edges) == 4
+
+    def test_dataframe_seed_input(self):
+        """Seed input as a polars DataFrame works."""
+        engagement = self._engagement()
+        seed_df = pl.DataFrame({
+            "node_id": ["c1", "c2"],
+            "label": ["A", "B"],
+        })
+        edges, seeds, _ = make_stat_user_edges(engagement, seed_df)
+        assert seeds == {"__stat__c1": "A", "__stat__c2": "B"}
+        assert len(edges) == 4
+
+    def test_invalid_engagement_type_raises(self):
+        """Non-DataFrame engagement input raises a clear error."""
+        with pytest.raises(ValidationError, match="DataFrame"):
+            make_stat_user_edges([("u1", "c1", 1.0)], {"c1": "A"})
+
+    def test_integer_content_ids(self):
+        """Integer content IDs are cast to string in the resulting stat IDs."""
+        engagement = pl.DataFrame({
+            "user": ["u1", "u2"],
+            "content": [42, 42],
+            "weight": [1.0, 1.0],
+        })
+        edges, seeds, ids = make_stat_user_edges(engagement, {42: "A"})
+        assert ids == {"__stat__42"}
+        assert seeds == {"__stat__42": "A"}
+        # The synthesized source_id column is Utf8.
+        assert edges["source_id"].dtype == pl.Utf8
+
+
+class TestExcludeFromOutput:
+    """Tests for the exclude_from_output parameter on GLP and ensemble."""
+
+    def _augmented_path_graph(self):
+        """
+        Build a 5-node graph: u1 - u2 - u3 - u4 plus a stat-user attached to
+        {u1, u2}. Returns (graph, mapper).
+        """
+        g = nk.Graph(5, weighted=True, directed=False)
+        g.addEdge(0, 1, 1.0)
+        g.addEdge(1, 2, 1.0)
+        g.addEdge(2, 3, 1.0)
+        g.addEdge(4, 0, 1.0)
+        g.addEdge(4, 1, 1.0)
+        mapper = IDMapper.from_originals(
+            ["u1", "u2", "u3", "u4", "__stat__c1"]
+        )
+        return g, mapper
+
+    def test_glp_drops_excluded_nodes(self):
+        """guided_label_propagation hides excluded nodes from output."""
+        from guidedLP.glp import guided_label_propagation
+
+        graph, mapper = self._augmented_path_graph()
+        result = guided_label_propagation(
+            graph, mapper,
+            {"__stat__c1": "A"},
+            ["A"],
+            enable_noise_category=True,
+            exclude_from_output={"__stat__c1"},
+        )
+        assert "__stat__c1" not in result["node_id"].to_list()
+        assert set(result["node_id"].to_list()) == {"u1", "u2", "u3", "u4"}
+
+    def test_glp_no_exclude_is_no_op(self):
+        """None / empty set leaves output unchanged."""
+        from guidedLP.glp import guided_label_propagation
+
+        graph, mapper = self._augmented_path_graph()
+        r_none = guided_label_propagation(
+            graph, mapper, {"__stat__c1": "A"}, ["A"],
+            enable_noise_category=True, exclude_from_output=None,
+        )
+        r_empty = guided_label_propagation(
+            graph, mapper, {"__stat__c1": "A"}, ["A"],
+            enable_noise_category=True, exclude_from_output=set(),
+        )
+        assert len(r_none) == 5
+        assert len(r_empty) == 5
+
+    def test_glp_propagation_unaffected_by_exclude(self):
+        """
+        Excluded nodes still participate in propagation; non-excluded rows
+        have identical probabilities with vs. without the filter.
+        """
+        from guidedLP.glp import guided_label_propagation
+
+        graph, mapper = self._augmented_path_graph()
+        # Disable noise (which uses RNG) for a strict equality comparison.
+        r_full = guided_label_propagation(
+            graph, mapper, {"__stat__c1": "A"}, ["A"], enable_noise_category=False,
+        )
+        r_filtered = guided_label_propagation(
+            graph, mapper, {"__stat__c1": "A"}, ["A"], enable_noise_category=False,
+            exclude_from_output={"__stat__c1"},
+        )
+
+        full_users = r_full.filter(pl.col("node_id") != "__stat__c1").sort("node_id")
+        filtered_users = r_filtered.sort("node_id")
+        assert full_users["A_prob"].to_list() == filtered_users["A_prob"].to_list()
+
+    def test_glp_unknown_id_silently_ignored(self):
+        """exclude_from_output containing unknown IDs is fine — just no-op for them."""
+        from guidedLP.glp import guided_label_propagation
+
+        graph, mapper = self._augmented_path_graph()
+        result = guided_label_propagation(
+            graph, mapper, {"__stat__c1": "A"}, ["A"],
+            enable_noise_category=False,
+            exclude_from_output={"__stat__c1", "never_existed"},
+        )
+        # Only the real stat user is dropped; missing id is silently ignored.
+        assert len(result) == 4
+
+    def test_glp_directional_filters_both_passes(self):
+        """For directed graphs, exclude_from_output applies to both DFs."""
+        from guidedLP.glp import guided_label_propagation
+
+        g = nk.Graph(5, weighted=True, directed=True)
+        g.addEdge(0, 1, 1.0); g.addEdge(1, 2, 1.0); g.addEdge(2, 3, 1.0)
+        g.addEdge(4, 0, 1.0); g.addEdge(4, 1, 1.0)
+        mapper = IDMapper.from_originals(
+            ["u1", "u2", "u3", "u4", "__stat__c1"]
+        )
+
+        out_df, in_df = guided_label_propagation(
+            g, mapper, {"__stat__c1": "A"}, ["A"],
+            directional=True, enable_noise_category=False,
+            exclude_from_output={"__stat__c1"},
+        )
+        assert "__stat__c1" not in out_df["node_id"].to_list()
+        assert "__stat__c1" not in in_df["node_id"].to_list()
+
+    def test_glp_combined_with_confidence_threshold(self):
+        """exclude_from_output is applied AFTER confidence threshold."""
+        from guidedLP.glp import guided_label_propagation
+
+        graph, mapper = self._augmented_path_graph()
+        result = guided_label_propagation(
+            graph, mapper, {"__stat__c1": "A"}, ["A"],
+            enable_noise_category=True, noise_ratio=0.5,
+            confidence_threshold=0.9,
+            exclude_from_output={"__stat__c1"},
+        )
+        # Stat user filtered; remaining rows may include "uncertain" labels.
+        assert "__stat__c1" not in result["node_id"].to_list()
+        assert len(result) == 4
+
+    def test_ensemble_drops_excluded_nodes(self):
+        """ensemble_label_propagation honors exclude_from_output via glp_kwargs."""
+        from guidedLP.glp import ensemble_label_propagation
+
+        graph, mapper = self._augmented_path_graph()
+        result = ensemble_label_propagation(
+            graph, mapper, {"__stat__c1": "A"}, ["A"],
+            n_epochs=3, enable_noise_category=True, noise_ratio=0.5,
+            exclude_from_output={"__stat__c1"},
+        )
+        assert "__stat__c1" not in result["node_id"].to_list()
+        assert len(result) == 4
+
+    def test_ensemble_with_variance_and_exclude(self):
+        """exclude_from_output works alongside return_variance=True."""
+        from guidedLP.glp import ensemble_label_propagation
+
+        graph, mapper = self._augmented_path_graph()
+        result = ensemble_label_propagation(
+            graph, mapper, {"__stat__c1": "A"}, ["A"],
+            n_epochs=3, enable_noise_category=True, noise_ratio=0.5,
+            return_variance=True,
+            exclude_from_output={"__stat__c1"},
+        )
+        assert "__stat__c1" not in result["node_id"].to_list()
+        # std columns present and aligned (4 surviving rows)
+        assert "A_prob_std" in result.columns
+        assert len(result) == 4

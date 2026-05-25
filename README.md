@@ -355,7 +355,67 @@ edges = graph_to_edges(graph, id_mapper)   # source_id, target_id, weight (origi
 edges = apply_backbone(edges, method="noise_corrected", threshold=1.0, directed=False)
 ```
 
-### 5. Political Affiliation Analysis
+### 5. Labels on the Other Partition: Stat-User Augmentation
+
+Examples 3 and 4 covered the standard bipartite case — seeds live on the same partition you want to propagate over (seeds are users, project to users, run GLP). But labels often live on the *other* partition. A curated list of left/right-leaning news outlets (content side), and you want to score *users* by what they engage with. Two options:
+
+- **Run GLP on the bipartite directly with content seeds**, then keep the user rows. Simple, but pays the period-2 random-walk cost (user-to-user "distance" takes two iterations per hop).
+- **Stat-user augmentation** (this example). Collapse each labeled content node into a synthetic "stat user" that lives in the user partition and stays anchored to that label throughout propagation via the `(1−α)Y` term. GLP then operates cleanly on the user-user projection.
+
+`make_stat_user_edges` builds the synthetic edges; `exclude_from_output` on GLP drops the synthetic nodes from the result. **Important:** augment *after* any backboning of the user-user graph — stat users have an artificial degree profile (degree 1 on the bipartite, audience-size on the projection) that backboning methods aren't calibrated for.
+
+```python
+import polars as pl
+from guidedLP.network.construction import build_graph_from_edgelist, project_bipartite
+from guidedLP.network.backboning import apply_backbone
+from guidedLP.glp import make_stat_user_edges, guided_label_propagation
+
+# Bipartite engagement: columns user / outlet / weight
+engagement = pl.read_csv("user_outlet_engagement.csv")
+
+# Labels live on the *outlet* (content) side
+outlet_seeds = {
+    "nytimes.com": "left", "theguardian.com": "left",
+    "wsj.com": "right", "foxnews.com": "right",
+}
+
+# ── Step 1: project to user-user ─────────────────────────────────────────
+# project_bipartite expects source_id / target_id on frame input.
+user_edges = project_bipartite(
+    engagement.rename({"user": "source_id", "outlet": "target_id"}),
+    projection_mode="source", weight_method="jaccard",
+    output_format="dataframe",
+)
+
+# ── Step 2: backbone the user-user graph (BEFORE augmenting) ─────────────
+# Filtering / backboning runs on real edges only; augmentation comes after.
+user_edges = apply_backbone(
+    user_edges, method="disparity", alpha=0.05, directed=False,
+)
+
+# ── Step 3: generate stat-user edges from the bipartite + seeds ──────────
+# Each labeled outlet becomes a synthetic node `__stat__{outlet}` with one
+# edge per user who engaged with it, weighted by their engagement strength.
+stat_edges, stat_seeds, stat_ids = make_stat_user_edges(
+    engagement, outlet_seeds,
+    user_col="user", content_col="outlet", weight_col="weight",
+)
+
+# ── Step 4: concat, build graph, propagate, drop stat users from output ──
+augmented = pl.concat([user_edges, stat_edges])
+graph, mapper = build_graph_from_edgelist(
+    augmented, source_col="source_id", target_col="target_id", weight_col="weight",
+)
+result = guided_label_propagation(
+    graph, mapper, stat_seeds, labels=["left", "right"],
+    exclude_from_output=stat_ids,   # drops __stat__... rows from result
+)
+# `result` has one row per real user with left_prob / right_prob.
+```
+
+See `docs/architecture/glp.md` ("Bipartite Graphs & Stat-User Augmentation") for the design rationale (why ordering matters, what the synthetic edges actually compute) and `bipartite_glp_notes.md` at the repo root for related literature (Co-HITS, BiRank, personalized PageRank with concentrated teleportation).
+
+### 6. Political Affiliation Analysis
 
 ```python
 # Analyze political leaning in social networks
@@ -385,7 +445,7 @@ accuracy, metrics = train_test_split_validation(
 print(f"Political classification accuracy: {accuracy:.3f}")
 ```
 
-### 6. Temporal Network Analysis
+### 7. Temporal Network Analysis
 
 ```python
 # Track community evolution over time

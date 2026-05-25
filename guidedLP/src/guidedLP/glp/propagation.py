@@ -21,7 +21,7 @@ The semantic interpretation ("influence" vs. "audience" etc.) depends on
 what edges mean in your graph — see docs/architecture/glp.md.
 """
 
-from typing import Callable, Dict, List, Tuple, Union, Optional, Any
+from typing import Callable, Dict, List, Set, Tuple, Union, Optional, Any
 from concurrent.futures import ThreadPoolExecutor
 import math
 import os
@@ -127,6 +127,7 @@ def guided_label_propagation(
     seed_label_col: str = "label",
     weight_transform: Optional[WeightTransform] = None,
     random_seed: Optional[int] = 42,
+    exclude_from_output: Optional[Set[Any]] = None,
 ) -> Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]:
     """
     Propagate labels from seed nodes through network using guided label propagation.
@@ -211,6 +212,16 @@ def guided_label_propagation(
         independent noise samples — :func:`ensemble_label_propagation`
         relies on this. Pass ``None`` to use the global :mod:`random`
         state. No effect when ``enable_noise_category=False``.
+    exclude_from_output : Optional[Set[Any]], default None
+        Original node IDs whose rows should be dropped from the returned
+        DataFrame(s) after propagation completes. Useful for synthetic
+        nodes injected into the graph for propagation purposes (e.g. the
+        stat-user / label-as-node augmentation produced by
+        :func:`guidedLP.glp.make_stat_user_edges`) that should not appear
+        in user-facing results. Propagation itself is unaffected — the
+        excluded nodes still participate fully and can influence their
+        neighbors; only the output is filtered. IDs not present in the
+        graph are silently ignored.
 
     Returns
     -------
@@ -300,11 +311,17 @@ def guided_label_propagation(
             direction="undirected" if not is_directed else "out_degree",
             weight_transform=weight_transform,
         )
-        
+
         # Apply confidence thresholding if enabled
         if confidence_threshold > 0.0:
             result = _apply_confidence_threshold(result, confidence_threshold)
-        
+
+        # Drop rows for any nodes the caller asked us to hide (e.g. stat-user
+        # augmentation nodes). Done after confidence thresholding so the
+        # threshold sees the full graph context, not a filtered subset.
+        if exclude_from_output:
+            result = _apply_exclude_from_output(result, exclude_from_output)
+
         logger.info("Completed single propagation")
         return result
     
@@ -345,6 +362,12 @@ def guided_label_propagation(
         if confidence_threshold > 0.0:
             out_result = _apply_confidence_threshold(out_result, confidence_threshold)
             in_result = _apply_confidence_threshold(in_result, confidence_threshold)
+
+        # Drop excluded nodes from both passes (see single-propagation branch
+        # above for rationale).
+        if exclude_from_output:
+            out_result = _apply_exclude_from_output(out_result, exclude_from_output)
+            in_result = _apply_exclude_from_output(in_result, exclude_from_output)
 
         logger.info("Completed directional propagation")
         return out_result, in_result
@@ -589,7 +612,11 @@ def ensemble_label_propagation(
         ``n_epochs`` are clamped down.
     **glp_kwargs
         Any other :func:`guided_label_propagation` keyword arguments. Any
-        ``random_seed`` value is overridden per epoch.
+        ``random_seed`` value is overridden per epoch. If
+        ``exclude_from_output`` is passed, it is applied to the averaged
+        result (and to each direction's DataFrame for directional runs),
+        not per epoch — the excluded nodes still participate fully in
+        every epoch's propagation, only the final output is filtered.
 
     Returns
     -------
@@ -668,6 +695,7 @@ def ensemble_label_propagation(
     weight_transform = glp_kwargs.get("weight_transform", None)
     seed_node_col = glp_kwargs.get("seed_node_col", "node_id")
     seed_label_col = glp_kwargs.get("seed_label_col", "label")
+    exclude_from_output = glp_kwargs.get("exclude_from_output", None)
 
     # Normalize seed input once; is_seed in the output reflects only these
     # user-supplied seeds (per-epoch noise seeds would otherwise leak
@@ -818,6 +846,9 @@ def ensemble_label_propagation(
 
         if confidence_threshold > 0.0:
             df = _apply_confidence_threshold(df, confidence_threshold)
+
+        if exclude_from_output:
+            df = _apply_exclude_from_output(df, exclude_from_output)
 
         return df
 
@@ -1784,7 +1815,35 @@ def _apply_confidence_threshold(
             .otherwise(pl.col("dominant_label"))
             .alias("dominant_label")
         ])
-        
+
         logger.info(f"Classified {n_uncertain} nodes as 'uncertain' due to low confidence")
-    
+
     return result_df
+
+
+def _apply_exclude_from_output(
+    result_df: pl.DataFrame,
+    exclude_ids: Set[Any],
+) -> pl.DataFrame:
+    """
+    Drop rows whose ``node_id`` appears in ``exclude_ids``.
+
+    Used to hide synthetic propagation nodes (e.g. stat-user augmentation)
+    from the final result without affecting the propagation itself. IDs in
+    ``exclude_ids`` that aren't present in ``result_df`` are silently
+    ignored — the caller can safely pass a superset.
+    """
+    if not exclude_ids:
+        return result_df
+
+    n_before = len(result_df)
+    filtered = result_df.filter(~pl.col("node_id").is_in(list(exclude_ids)))
+    n_dropped = n_before - len(filtered)
+
+    if n_dropped > 0:
+        logger.info(
+            f"Excluded {n_dropped} node(s) from output "
+            f"(requested {len(exclude_ids)})"
+        )
+
+    return filtered
