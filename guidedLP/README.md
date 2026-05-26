@@ -901,10 +901,10 @@ print(f"total: {result.total_duration_s:.1f}s | "
 
 **Memory modes** in practice — the three modes produce **byte-identical output**; they only differ in peak memory and wall-clock:
 
-| Mode | Inter-stage cleanup | Within-call `streaming` in backbones | Disk I/O | When to use |
+| Mode | Inter-stage cleanup | Within-call `streaming` (build + backbones) | Disk I/O | When to use |
 | --- | --- | --- | --- | --- |
 | `"fast"` | none | off | none | plenty of RAM, want max speed |
-| `"balanced"` (default) | `del` + `gc.collect()` between stages | on | none | the 80% case — moderately lower peak, ~30% slower backbones |
+| `"balanced"` (default) | `del` + `gc.collect()` between stages; raw input released after build | on | none | the 80% case — moderately lower peak, ~30% slower stages |
 | `"low"` | additionally checkpoint EdgeList to parquet between stages | on | a few seconds of parquet write+read | memory-constrained; targets the case where pipeline peak would otherwise be the sum of two overlapping stages |
 
 **When to use this vs. direct calls**:

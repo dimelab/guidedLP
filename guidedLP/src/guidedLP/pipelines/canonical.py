@@ -16,14 +16,16 @@ Composes the four canonical stages most attribution-style analyses use:
 
 Three memory modes control inter-stage release AND within-call streaming:
 
-- ``"fast"`` — no inter-stage cleanup; both ``apply_backbone`` calls
-  use the in-memory engine. Same memory profile as making the calls
-  by hand, max throughput.
+- ``"fast"`` — no inter-stage cleanup; ``build_edgelist_from_frame``
+  and both ``apply_backbone`` calls use the in-memory engine. Same
+  memory profile as making the calls by hand, max throughput.
 - ``"balanced"`` (default) — explicitly ``del`` previous stages and
-  ``gc.collect()`` between steps, AND pass ``streaming=True`` to the
-  two ``apply_backbone`` calls so they batch their wide-column /
-  ``poisson.sf`` work. Saves the size of the previous stage's
-  intermediates AND lowers within-call peak; ~30% slower than ``"fast"``.
+  ``gc.collect()`` between steps; drops the raw input frame as soon
+  as it's encoded; AND passes ``streaming=True`` to
+  ``build_edgelist_from_frame`` (streams the Utf8→UInt32 encode) and
+  the two ``apply_backbone`` calls (streams their wide-column /
+  ``poisson.sf`` work). ~30% slower than ``"fast"`` with substantially
+  lower peak across all four stages.
 - ``"low"`` — additionally checkpoint each stage's EdgeList to parquet
   on disk and release the in-memory frame. Peak memory becomes the max
   *single* stage's working set rather than the sum across overlapping
@@ -323,6 +325,7 @@ def run_canonical_pipeline(
             auto_weight=auto_weight,
             remove_duplicates=False,
             passthrough_cols=passthrough,
+            streaming=stream_backbones,
             verbose=verbose,
         )
         stats.append(StageStats(
