@@ -1,0 +1,369 @@
+"""Canonical attribution pipeline: raw → bipartite → backbone → temporal → backbone.
+
+Composes the four canonical stages most attribution-style analyses use:
+
+1. :func:`build_edgelist_from_frame` — turn the raw input into a bipartite
+   coded EdgeList. The ``timestamp`` column (if any) is carried as a
+   passthrough so it survives downstream.
+2. :func:`apply_backbone(method="bipartite_svn")` — filter the bipartite
+   edges to the statistically significant subset.
+3. :func:`temporal_bipartite_to_unipartite` — citation-direction
+   projection onto one partition (default: the source-side).
+4. :func:`apply_backbone(method="noise_corrected")` — backbone the
+   projection. ``target_fraction`` is the recommended knob here on
+   directed graphs (see ``docs/architecture/chunked_projection_design.md``
+   for why the threshold path tends to keep ~100% on directed inputs).
+
+Three memory modes control inter-stage release behaviour:
+
+- ``"fast"`` — no inter-stage cleanup. Same memory profile as making the
+  calls by hand.
+- ``"balanced"`` (default) — explicitly ``del`` previous stages and
+  ``gc.collect()`` between steps. Saves the size of the previous
+  stage's intermediates from co-existing with the next stage's working
+  set; typically a 1.5–2× reduction in peak with negligible time
+  overhead.
+- ``"low"`` — additionally checkpoint each stage's EdgeList to parquet
+  on disk and release the in-memory frame. Peak memory becomes the max
+  *single* stage's working set rather than the sum across overlapping
+  stages. Adds disk I/O time (~few seconds on typical hardware).
+"""
+
+from __future__ import annotations
+
+import gc
+import shutil
+import tempfile
+import time as _time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+import polars as pl
+
+from guidedLP.common.edgelist import EdgeList
+from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.exceptions import ValidationError
+from guidedLP.network.backboning import apply_backbone
+from guidedLP.network.construction import (
+    build_edgelist_from_frame,
+    temporal_bipartite_to_unipartite,
+)
+from guidedLP.pipelines._runtime import (
+    MemoryMode,
+    StageStats,
+    maybe_free,
+    read_edgelist_parquet,
+    write_edgelist_parquet,
+)
+
+
+@dataclass
+class CanonicalPipelineResult:
+    """Return value of :func:`run_canonical_pipeline`.
+
+    Attributes
+    ----------
+    edgelist : EdgeList
+        Final backboned projection.
+    id_mapper : IDMapper
+        Mapper for ``edgelist``'s codes. Only covers nodes surviving the
+        projection backbone — much smaller than the bipartite input's
+        mapper.
+    stage_stats : list[StageStats]
+        Per-stage telemetry in execution order.
+    intermediates : dict[str, Any], optional
+        Only populated when ``keep_intermediates=True``. Keys:
+        ``"bipartite"``, ``"bipartite_filtered"``, ``"projection"``,
+        each mapped to an ``(EdgeList, IDMapper)`` tuple.
+    """
+
+    edgelist: EdgeList
+    id_mapper: IDMapper
+    stage_stats: List[StageStats]
+    intermediates: Optional[Dict[str, Any]] = None
+
+    @property
+    def total_duration_s(self) -> float:
+        return sum(s.duration_s for s in self.stage_stats)
+
+
+def run_canonical_pipeline(
+    source: Union[str, Path, pl.DataFrame],
+    *,
+    source_col: str,
+    target_col: str,
+    timestamp_col: str,
+    weight_col: Optional[str] = None,
+    # Projection orientation.
+    intermediate_col: Optional[str] = None,
+    projected_col: Optional[str] = None,
+    # Stage 1: build_edgelist.
+    min_source_degree: Optional[int] = None,
+    min_target_degree: Optional[int] = None,
+    auto_weight: bool = False,
+    bipartite_overlap: str = "drop",
+    # Stage 2: bipartite backbone.
+    bipartite_alpha: float = 0.01,
+    bipartite_correction: str = "fdr_bh",
+    bipartite_target_fraction: Optional[float] = None,
+    # Stage 3: temporal projection.
+    add_edge_weights: bool = True,
+    remove_self_loops: bool = True,
+    presort_temporal: bool = True,
+    # Stage 4: projection backbone.
+    projection_threshold: float = 1.0,
+    projection_target_fraction: Optional[float] = None,
+    # Memory & I/O.
+    memory_mode: MemoryMode = "balanced",
+    checkpoint_dir: Optional[Union[str, Path]] = None,
+    keep_intermediates: bool = False,
+    verbose: bool = True,
+) -> CanonicalPipelineResult:
+    """Run the canonical raw → backboned-projection pipeline in one call.
+
+    Parameters
+    ----------
+    source : str | Path | pl.DataFrame
+        Raw input. File paths (``.csv``, ``.parquet``) are read via
+        Polars; a DataFrame is consumed directly.
+    source_col, target_col : str
+        Column names for the bipartite endpoints.
+    timestamp_col : str
+        Column carrying the per-edge timestamp; required for the
+        temporal projection step.
+    weight_col : str, optional
+        Per-edge weight column. If omitted, edges get unit weight.
+    intermediate_col, projected_col : str, optional
+        Which side of the bipartite to collapse vs preserve in the
+        projection. Default: ``intermediate_col=target_col`` and
+        ``projected_col=source_col`` (i.e. project onto the source
+        partition — the user-side in typical user-content data).
+    min_source_degree, min_target_degree : int, optional
+        Degree filters applied during the build step.
+    auto_weight : bool
+        If True, count duplicate edges to set ``weight``.
+    bipartite_overlap : str
+        Overlap-resolution policy when nodes appear on both sides of
+        the bipartite. ``"drop"`` removes the offending nodes; see
+        :func:`build_edgelist_from_frame` for other options.
+    bipartite_alpha, bipartite_correction : float, str
+        ``apply_backbone(method="bipartite_svn")`` parameters.
+    bipartite_target_fraction : float, optional
+        If set, overrides ``bipartite_alpha`` and keeps the top fraction
+        of bipartite edges by p-value.
+    add_edge_weights, remove_self_loops : bool
+        Forwarded to :func:`temporal_bipartite_to_unipartite`.
+    presort_temporal : bool, default True
+        If True (default), sort the bipartite by
+        ``[intermediate_col, timestamp_col DESC]`` before the temporal
+        step — needed for the citation-direction edges to be correct.
+        Set False only if you know the input EdgeList is already in
+        this order (e.g. because you pre-sorted the raw frame and the
+        intervening steps preserved row order).
+    projection_threshold, projection_target_fraction : float, optional
+        ``apply_backbone(method="noise_corrected")`` parameters.
+        ``projection_target_fraction`` is the recommended way to size
+        the final backbone on directed projections.
+    memory_mode : {"fast", "balanced", "low"}, default "balanced"
+        See module docstring.
+    checkpoint_dir : str | Path, optional
+        Where to write parquet checkpoints in ``memory_mode="low"``.
+        If unset and ``memory_mode="low"``, a temporary directory is
+        created and cleaned up on return.
+    keep_intermediates : bool, default False
+        Retain references to each stage's ``(EdgeList, IDMapper)`` on
+        the returned result. Disables all inter-stage release, so this
+        is incompatible with ``memory_mode="low"``.
+    verbose : bool, default True
+        Per-stage one-line summaries via the underlying functions'
+        own verbose output.
+
+    Returns
+    -------
+    CanonicalPipelineResult
+        See dataclass docstring.
+
+    Raises
+    ------
+    ValidationError
+        On invalid argument combinations (e.g. ``memory_mode="low"``
+        with ``keep_intermediates=True``).
+    """
+    # Argument resolution.
+    if intermediate_col is None:
+        intermediate_col = target_col
+    if projected_col is None:
+        projected_col = source_col
+
+    if memory_mode == "low" and keep_intermediates:
+        raise ValidationError(
+            "memory_mode='low' is incompatible with keep_intermediates=True; "
+            "the checkpoint cycle frees the in-memory frame between stages."
+        )
+    if memory_mode not in ("fast", "balanced", "low"):
+        raise ValidationError(
+            f"memory_mode must be 'fast', 'balanced', or 'low'; got {memory_mode!r}"
+        )
+
+    created_tempdir = False
+    if memory_mode == "low":
+        if checkpoint_dir is None:
+            checkpoint_dir = Path(tempfile.mkdtemp(prefix="glp_pipeline_"))
+            created_tempdir = True
+        else:
+            checkpoint_dir = Path(checkpoint_dir)
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    elif checkpoint_dir is not None:
+        # Caller passed a dir without low-memory mode — silently ignore;
+        # they may be reusing a config block.
+        checkpoint_dir = Path(checkpoint_dir)
+
+    stats: List[StageStats] = []
+    intermediates: Optional[Dict[str, Any]] = {} if keep_intermediates else None
+
+    try:
+        # Stage 1: build the bipartite EdgeList with timestamp passthrough.
+        t0 = _time.perf_counter()
+        passthrough = [timestamp_col]
+        el_bp, mapper_bp = build_edgelist_from_frame(
+            source,
+            source_col=source_col,
+            target_col=target_col,
+            weight_col=weight_col,
+            bipartite=True,
+            bipartite_overlap=bipartite_overlap,
+            min_source_degree=min_source_degree,
+            min_target_degree=min_target_degree,
+            auto_weight=auto_weight,
+            remove_duplicates=False,
+            passthrough_cols=passthrough,
+            verbose=verbose,
+        )
+        stats.append(StageStats(
+            name="build_edgelist_from_frame",
+            duration_s=_time.perf_counter() - t0,
+            output_edges=el_bp.number_of_edges(),
+            output_nodes=el_bp.n_nodes,
+        ))
+        if intermediates is not None:
+            intermediates["bipartite"] = (el_bp, mapper_bp)
+
+        # Stage 2: bipartite-side backbone.
+        t0 = _time.perf_counter()
+        n_in_2 = el_bp.number_of_edges()
+        el_bp_kept, mapper_bp_kept = apply_backbone(
+            el_bp,
+            id_mapper=mapper_bp,
+            method="bipartite_svn",
+            alpha=bipartite_alpha,
+            correction=bipartite_correction,
+            target_fraction=bipartite_target_fraction,
+            verbose=verbose,
+        )
+        stats.append(StageStats(
+            name="apply_backbone(bipartite_svn)",
+            duration_s=_time.perf_counter() - t0,
+            input_edges=n_in_2,
+            output_edges=el_bp_kept.number_of_edges(),
+            output_nodes=el_bp_kept.n_nodes,
+        ))
+        if intermediates is not None:
+            intermediates["bipartite_filtered"] = (el_bp_kept, mapper_bp_kept)
+        else:
+            del el_bp, mapper_bp
+            maybe_free(memory_mode)
+
+        # Optional re-sort for the temporal step's row-order contract:
+        # within each intermediate group, latest-first.
+        if presort_temporal:
+            # Map projected/intermediate user-facing names to el's coded
+            # column names (src/tgt). Mirrors the convention in
+            # temporal_bipartite_to_unipartite.
+            inter_coded = "src" if intermediate_col == source_col else "tgt"
+            sorted_df = el_bp_kept.df.sort(
+                [inter_coded, timestamp_col],
+                descending=[False, True],
+            )
+            el_bp_kept = EdgeList(
+                df=sorted_df,
+                directed=el_bp_kept.directed,
+                bipartite=el_bp_kept.bipartite,
+                n_nodes=el_bp_kept.n_nodes,
+                code_dtype=el_bp_kept.code_dtype,
+            )
+
+        # Optional disk checkpoint between stages 2 and 3.
+        bp_ckpt_path: Optional[Path] = None
+        bp_meta: Optional[dict] = None
+        if memory_mode == "low" and intermediates is None:
+            bp_ckpt_path = checkpoint_dir / "01_bipartite_kept.parquet"
+            bp_meta = write_edgelist_parquet(el_bp_kept, bp_ckpt_path)
+            del el_bp_kept
+            maybe_free(memory_mode)
+            el_bp_kept = read_edgelist_parquet(bp_ckpt_path, bp_meta)
+
+        # Stage 3: temporal projection.
+        t0 = _time.perf_counter()
+        n_in_3 = el_bp_kept.number_of_edges()
+        el_proj, mapper_proj = temporal_bipartite_to_unipartite(
+            el_bp_kept,
+            id_mapper=mapper_bp_kept,
+            source_col=source_col,
+            target_col=target_col,
+            timestamp_col=timestamp_col,
+            intermediate_col=intermediate_col,
+            projected_col=projected_col,
+            add_edge_weights=add_edge_weights,
+            remove_self_loops=remove_self_loops,
+            output_format="edgelist",
+            verbose=verbose,
+        )
+        stats.append(StageStats(
+            name="temporal_bipartite_to_unipartite",
+            duration_s=_time.perf_counter() - t0,
+            input_edges=n_in_3,
+            output_edges=el_proj.number_of_edges(),
+            output_nodes=el_proj.n_nodes,
+        ))
+        if intermediates is not None:
+            intermediates["projection"] = (el_proj, mapper_proj)
+        else:
+            del el_bp_kept, mapper_bp_kept
+            maybe_free(memory_mode)
+            if bp_ckpt_path is not None:
+                bp_ckpt_path.unlink(missing_ok=True)
+
+        # Stage 4: projection-side backbone.
+        t0 = _time.perf_counter()
+        n_in_4 = el_proj.number_of_edges()
+        el_final, mapper_final = apply_backbone(
+            el_proj,
+            id_mapper=mapper_proj,
+            method="noise_corrected",
+            threshold=projection_threshold,
+            target_fraction=projection_target_fraction,
+            verbose=verbose,
+        )
+        stats.append(StageStats(
+            name="apply_backbone(noise_corrected)",
+            duration_s=_time.perf_counter() - t0,
+            input_edges=n_in_4,
+            output_edges=el_final.number_of_edges(),
+            output_nodes=el_final.n_nodes,
+        ))
+        if intermediates is None:
+            del el_proj, mapper_proj
+            maybe_free(memory_mode)
+
+        return CanonicalPipelineResult(
+            edgelist=el_final,
+            id_mapper=mapper_final,
+            stage_stats=stats,
+            intermediates=intermediates,
+        )
+
+    finally:
+        # Clean up the auto-created tempdir even on failure paths.
+        if created_tempdir and checkpoint_dir is not None and checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)

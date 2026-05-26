@@ -694,19 +694,25 @@ def _apply_backbone_edgelist_path(
             if want_df_only:
                 return result_df if include_scores else _slim_edges_df(result_df)
 
-            # Default: re-wrap surviving edges as an EdgeList in the original
-            # code dtype, paired with the unchanged mapper.
-            kept_df = (
+            # Default: re-wrap surviving edges as an EdgeList. Use a semi-join
+            # against the input EdgeList's frame so passthrough columns
+            # (e.g. timestamp carried via build_edgelist_from_frame's
+            # ``passthrough_cols``) and the original code dtype are
+            # preserved through the backbone step. Every method's
+            # ``result_df`` carries the input weight unmodified, so the
+            # semi-join recovers all original per-row data.
+            surviving_keys = (
                 result_df.filter(pl.col("kept"))
-                .select(["source_id", "target_id", "weight"])
-                .rename({"source_id": "src", "target_id": "tgt"})
-                .with_columns([
-                    pl.col("src").cast(edge_list.code_dtype),
-                    pl.col("tgt").cast(edge_list.code_dtype),
+                .select([
+                    pl.col("source_id").alias("src").cast(edge_list.code_dtype),
+                    pl.col("target_id").alias("tgt").cast(edge_list.code_dtype),
                 ])
             )
-            if not edge_list.is_weighted():
-                kept_df = kept_df.drop("weight")
+            kept_df = (
+                edge_list.df.lazy()
+                .join(surviving_keys.lazy(), on=["src", "tgt"], how="semi")
+                .collect()
+            )
 
             new_edge_list = EdgeList(
                 df=kept_df,

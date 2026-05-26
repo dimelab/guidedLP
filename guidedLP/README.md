@@ -735,6 +735,131 @@ audience = audience_composition_pass(
 )
 ```
 
+### 9. End-to-end pipeline wrapper
+
+For the canonical attribution workflow — raw input → bipartite EdgeList → bipartite-side backbone → temporal projection → projection-side backbone — `guidedLP.pipelines.run_canonical_pipeline` composes all four stages in a single call with explicit memory management between steps. Compared to calling the four functions by hand, the wrapper releases intermediates between stages so they don't co-exist in RAM, and optionally checkpoints to disk for memory-constrained runs.
+
+The block below shows **every** parameter the wrapper accepts, grouped by stage. Defaults are inlined so this doubles as the reference for what each knob does — copy, delete what you don't need, tune the rest.
+
+```python
+from guidedLP.pipelines import run_canonical_pipeline
+
+result = run_canonical_pipeline(
+    # ---- Input ---------------------------------------------------------
+    # Raw input: a file path (CSV / Parquet) OR a Polars DataFrame.
+    source="shares.parquet",
+
+    # Required column names on the input frame.
+    source_col="user",                        # one side of the bipartite
+    target_col="item",                        # other side of the bipartite
+    timestamp_col="timestamp",                # required for the temporal step
+    weight_col="weight",                      # optional; None → unit weights
+
+    # ---- Projection orientation ----------------------------------------
+    # Which side becomes the intermediate (collapses) vs the projected
+    # side (preserved as nodes in the output). Default: collapse the
+    # target side, project onto the source side.
+    intermediate_col="item",                  # default: target_col
+    projected_col="user",                     # default: source_col
+
+    # ---- Stage 1: build_edgelist_from_frame ----------------------------
+    # Degree filters applied at build time (None = no filter).
+    min_source_degree=25,                     # default: None
+    min_target_degree=None,                   # default: None
+    # Polars-only convenience: aggregate duplicate (src, tgt) rows into
+    # a count weight. Leave False if your input already has explicit weights.
+    auto_weight=False,                        # default: False
+    # Bipartite overlap policy when a node appears on BOTH sides:
+    #   "drop"  : remove the offending node entirely (default)
+    #   "side_<source|target>" : keep it on the named side only
+    #   "error" : raise on overlap
+    bipartite_overlap="drop",                 # default: "drop"
+
+    # ---- Stage 2: apply_backbone(method="bipartite_svn") --------------
+    # Per-edge significance level (Poisson configuration null).
+    bipartite_alpha=0.01,                     # default: 0.01
+    # Multiple-testing correction:
+    #   "fdr_bh"     : Benjamini-Hochberg FDR (default; scales to millions of edges)
+    #   "bonferroni" : per-edge cutoff alpha / |E| (very conservative)
+    #   "none"       : use alpha directly (most permissive)
+    bipartite_correction="fdr_bh",            # default: "fdr_bh"
+    # Override alpha/correction with a top-K-by-p-value filter. Set this
+    # if you want a specific kept-edge count regardless of significance.
+    bipartite_target_fraction=None,           # default: None
+
+    # ---- Stage 3: temporal_bipartite_to_unipartite --------------------
+    # Edge-weight formula on the projected graph:
+    #   True  : (w_later + w_earlier) / 2 * 1 / (1 + Δdays)
+    #   False : unit weights
+    add_edge_weights=True,                    # default: True
+    # Drop self-loops in the projection (rare in practice — only fires
+    # when the same projected node co-occurs under different intermediates).
+    remove_self_loops=True,                   # default: True
+    # Re-sort the bipartite by [intermediate, timestamp DESC] before the
+    # temporal kernel. Required for correct citation-direction edges
+    # unless you've pre-sorted upstream.
+    presort_temporal=True,                    # default: True
+
+    # ---- Stage 4: apply_backbone(method="noise_corrected") ------------
+    # Standard-deviation multiplier for the significance margin
+    # (kept iff score - threshold * sdev_cij > 0). Ignored when
+    # projection_target_fraction is set.
+    projection_threshold=1.0,                 # default: 1.0
+    # Override threshold and keep the top fraction by significance margin.
+    # Recommended on directed projections (where the threshold filter
+    # tends to keep ~100% of edges).
+    projection_target_fraction=0.2,           # default: None
+
+    # ---- Memory & I/O --------------------------------------------------
+    # "fast"     : no inter-stage cleanup (same as calling by hand)
+    # "balanced" : del previous + gc.collect() between stages (default)
+    # "low"      : additionally checkpoint each EdgeList to parquet and
+    #              release the in-memory frame between stages
+    memory_mode="balanced",                   # default: "balanced"
+    # Where to write parquet checkpoints in "low" mode. None → create
+    # a tempdir that's cleaned up on return.
+    checkpoint_dir=None,                      # default: None
+    # Retain references to each stage's (EdgeList, IDMapper) on the
+    # returned result. Incompatible with memory_mode="low".
+    keep_intermediates=False,                 # default: False
+    # Per-stage one-line summaries from the underlying functions.
+    verbose=True,                             # default: True
+)
+
+# ---- Outputs -----------------------------------------------------------
+backbone = result.edgelist                    # final backboned projection
+mapper   = result.id_mapper                   # paired IDMapper
+
+# Per-stage telemetry (StageStats: name, duration_s, input_edges,
+# output_edges, output_nodes).
+for stage in result.stage_stats:
+    print(stage)
+# build_edgelist_from_frame                      15.29s |             0 →    23,280,338 edges,  1,877,850 nodes
+# apply_backbone(bipartite_svn)                   1.92s |    23,280,338 →    12,634,460 edges,  1,877,828 nodes
+# temporal_bipartite_to_unipartite              169.45s |    12,634,460 →   191,864,084 edges,    104,680 nodes
+# apply_backbone(noise_corrected)               148.67s |   191,864,084 →    38,372,817 edges,    104,680 nodes
+
+print(f"total: {result.total_duration_s:.1f}s | "
+      f"final: {backbone.number_of_edges():,} edges, {backbone.n_nodes:,} nodes")
+
+# With keep_intermediates=True, result.intermediates holds:
+#   "bipartite"          : (EdgeList, IDMapper) after build
+#   "bipartite_filtered" : (EdgeList, IDMapper) after bipartite_svn
+#   "projection"         : (EdgeList, IDMapper) after temporal projection
+```
+
+**Memory modes** in practice — the three modes produce **byte-identical output**; they only differ in peak memory and wall-clock:
+
+| Mode | Inter-stage cleanup | Disk I/O | When to use |
+| --- | --- | --- | --- |
+| `"fast"` | none | none | plenty of RAM, want max speed |
+| `"balanced"` (default) | `del` + `gc.collect()` between stages | none | the 80% case — small wins, no I/O cost |
+| `"low"` | additionally checkpoint EdgeList to parquet between stages | a few seconds of parquet write+read | memory-constrained; targets the case where pipeline peak would otherwise be the sum of two overlapping stages |
+
+**When to use this vs. direct calls**:
+- *Use the wrapper* when you're running the canonical four-stage pipeline as-is and don't need to inspect intermediates between every step.
+- *Skip the wrapper* when your workflow deviates (extra steps in between, different projection method, additional joins/filters between stages) — the lower-level functions remain the public API and compose freely.
+
 ## Use Cases
 
 - **Political Affiliation Analysis**: Identify political leaning of unknown users based on known partisan seed accounts
