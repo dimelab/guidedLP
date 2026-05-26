@@ -45,6 +45,7 @@ def train_test_split_validation(
     seed_label_col: str = "label",
     test_seeds: Optional[SeedInput] = None,
     propagator: Callable = guided_label_propagation,
+    directional_pass: Optional[str] = None,
     **glp_kwargs
 ) -> Dict[str, Any]:
     """
@@ -104,9 +105,18 @@ def train_test_split_validation(
         :func:`ensemble_label_propagation` for bagging-style noise-resampled
         scoring. Any callable with the same first four positional arguments
         (``graph, id_mapper, seed_labels, labels``) returning a polars
-        DataFrame works. **Must return a single DataFrame** — pass
-        ``directional=False`` via ``**glp_kwargs`` if you'd otherwise get a
-        tuple.
+        DataFrame works. When the propagator returns a directional
+        ``(out_df, in_df)`` tuple, see ``directional_pass`` below; otherwise
+        pass ``directional=False`` via ``**glp_kwargs``.
+    directional_pass : Optional[str], default None
+        Which directional pass to score when the propagator returns a
+        ``(out_df, in_df)`` tuple. ``"out"`` uses the out-degree pass (each
+        node labelled by what it points to), ``"in"`` uses the in-degree
+        pass (each node labelled by who points to it). ``None`` (default)
+        requires a single-DataFrame return and raises on a tuple — pass
+        ``directional=False`` via ``**glp_kwargs`` for that. See
+        ``docs/architecture/glp.md`` for what each pass means under
+        different edge conventions.
     **glp_kwargs
         Additional arguments forwarded to the chosen ``propagator``. For
         :func:`guided_label_propagation`: ``alpha``, ``max_iterations``,
@@ -210,12 +220,10 @@ def train_test_split_validation(
                 error_type="propagation_failure",
                 cause=e
             )
-        if isinstance(predictions, tuple):
-            raise ValidationError(
-                f"{propagator.__name__} returned a (out_df, in_df) tuple — "
-                "train_test_split_validation expects a single DataFrame. "
-                "Pass directional=False via glp_kwargs."
-            )
+        predictions = _select_directional_pass(
+            predictions, directional_pass, propagator,
+            context="train_test_split_validation",
+        )
 
         # Step 3: Extract predictions for test nodes
         test_predictions = _extract_test_predictions(predictions, test_seeds)
@@ -445,8 +453,53 @@ def _split_seed_data(
     return train_seeds, test_seeds, train_labels_list, test_labels_list
 
 
+_DIRECTIONAL_PASS_VALUES = {"out", "in"}
+
+
+def _select_directional_pass(
+    predictions: Any,
+    directional_pass: Optional[str],
+    propagator: Callable,
+    *,
+    context: str,
+) -> pl.DataFrame:
+    """Pick a single DataFrame from a propagator's possibly-directional output.
+
+    - Single DataFrame in + ``directional_pass=None`` → returned as-is.
+    - Tuple ``(out_df, in_df)`` in + ``directional_pass="out"|"in"`` → matching
+      element returned.
+    - Tuple in + ``directional_pass=None`` → raise (forces explicit choice).
+    - Single DataFrame in + ``directional_pass`` set → raise (the propagator
+      isn't directional, so the kwarg is meaningless and the user has likely
+      misconfigured).
+    """
+    if directional_pass is not None and directional_pass not in _DIRECTIONAL_PASS_VALUES:
+        raise ValidationError(
+            f"directional_pass must be 'out', 'in', or None; got {directional_pass!r}"
+        )
+
+    if isinstance(predictions, tuple):
+        if directional_pass is None:
+            raise ValidationError(
+                f"{propagator.__name__} returned a (out_df, in_df) tuple — "
+                f"{context} expects a single DataFrame. Either pass "
+                "directional=False via glp_kwargs, or pick a pass with "
+                "directional_pass='out' / 'in'."
+            )
+        return predictions[0] if directional_pass == "out" else predictions[1]
+
+    if directional_pass is not None:
+        raise ValidationError(
+            f"directional_pass={directional_pass!r} was set but "
+            f"{propagator.__name__} returned a single DataFrame (no "
+            "directional output to choose from). Drop directional_pass or "
+            "set directional=True via glp_kwargs."
+        )
+    return predictions
+
+
 def _extract_test_predictions(
-    predictions: pl.DataFrame, 
+    predictions: pl.DataFrame,
     test_seeds: Dict[Any, str]
 ) -> pl.DataFrame:
     """Extract predictions for test seed nodes."""
@@ -666,6 +719,7 @@ def cross_validate(
     seed_node_col: str = "node_id",
     seed_label_col: str = "label",
     propagator: Callable = guided_label_propagation,
+    directional_pass: Optional[str] = None,
     **glp_kwargs
 ) -> Dict[str, Any]:
     """
@@ -710,8 +764,12 @@ def cross_validate(
         Propagation function used per fold. Defaults to
         :func:`guided_label_propagation`; pass
         :func:`ensemble_label_propagation` for bagging-style noise-resampled
-        scoring. Must return a single DataFrame — pass ``directional=False``
-        via ``**glp_kwargs`` if you'd otherwise get a tuple.
+        scoring. When the propagator returns a directional ``(out_df, in_df)``
+        tuple, see ``directional_pass`` below.
+    directional_pass : Optional[str], default None
+        Which directional pass to score per fold when the propagator
+        returns a tuple. ``"out"`` / ``"in"`` to pick a pass; ``None``
+        (default) requires a single-DataFrame return.
     **glp_kwargs
         Additional arguments forwarded to the chosen ``propagator`` (e.g.
         ``alpha``, ``max_iterations``, ``directional`` for GLP;
@@ -792,11 +850,13 @@ def cross_validate(
         # Process folds (sequentially or in parallel)
         if n_jobs == 1:
             fold_results = _process_folds_sequential(
-                fold_splits, graph, id_mapper, labels, glp_kwargs, propagator
+                fold_splits, graph, id_mapper, labels, glp_kwargs,
+                propagator, directional_pass,
             )
         else:
             fold_results = _process_folds_parallel(
-                fold_splits, graph, id_mapper, labels, glp_kwargs, n_jobs, propagator
+                fold_splits, graph, id_mapper, labels, glp_kwargs, n_jobs,
+                propagator, directional_pass,
             )
         
         # Aggregate results across folds
@@ -923,6 +983,7 @@ def _process_folds_sequential(
     labels: List[str],
     glp_kwargs: Dict[str, Any],
     propagator: Callable = guided_label_propagation,
+    directional_pass: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Process folds sequentially."""
 
@@ -934,7 +995,7 @@ def _process_folds_sequential(
         try:
             fold_result = _process_single_fold(
                 train_seeds, test_seeds, graph, id_mapper, labels, glp_kwargs,
-                propagator,
+                propagator, directional_pass,
             )
             fold_result["fold_index"] = fold_idx
             fold_results.append(fold_result)
@@ -959,6 +1020,7 @@ def _process_folds_parallel(
     glp_kwargs: Dict[str, Any],
     n_jobs: int,
     propagator: Callable = guided_label_propagation,
+    directional_pass: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Process folds in parallel."""
 
@@ -969,7 +1031,7 @@ def _process_folds_parallel(
         try:
             result = _process_single_fold(
                 train_seeds, test_seeds, graph, id_mapper, labels, glp_kwargs,
-                propagator,
+                propagator, directional_pass,
             )
             result["fold_index"] = fold_idx
             return result
@@ -1005,6 +1067,7 @@ def _process_single_fold(
     labels: List[str],
     glp_kwargs: Dict[str, Any],
     propagator: Callable = guided_label_propagation,
+    directional_pass: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Process a single fold of cross-validation."""
 
@@ -1014,12 +1077,9 @@ def _process_single_fold(
     predictions = propagator(
         graph, id_mapper, train_seeds, labels, **glp_kwargs
     )
-    if isinstance(predictions, tuple):
-        raise ValidationError(
-            f"{propagator.__name__} returned a (out_df, in_df) tuple — "
-            "cross_validate expects a single DataFrame per fold. "
-            "Pass directional=False via glp_kwargs."
-        )
+    predictions = _select_directional_pass(
+        predictions, directional_pass, propagator, context="cross_validate",
+    )
     
     # Extract predictions for test nodes
     test_predictions = _extract_test_predictions(predictions, test_seeds)

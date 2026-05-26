@@ -551,7 +551,7 @@ print(f"5-fold CV: accuracy={cv['mean_accuracy']:.3f} ± {cv['std_accuracy']:.3f
       f"macro-F1={cv['mean_macro_f1']:.3f} ± {cv['std_macro_f1']:.3f}")
 ```
 
-**Validate with ensembling instead of single-run GLP.** Both `train_test_split_validation` and `cross_validate` accept a `propagator` kwarg. Default is `guided_label_propagation`; pass `ensemble_label_propagation` to score each fold with a bagged, noise-resampled ensemble. Any propagator-specific kwargs (`n_epochs`, `base_seed`, `enable_noise_category`, …) ride along through `**glp_kwargs`. The propagator must return a single DataFrame, so pass `directional=False` if you'd otherwise get a tuple.
+**Validate with ensembling instead of single-run GLP.** Both `train_test_split_validation` and `cross_validate` accept a `propagator` kwarg. Default is `guided_label_propagation`; pass `ensemble_label_propagation` to score each fold with a bagged, noise-resampled ensemble. Any propagator-specific kwargs (`n_epochs`, `base_seed`, `enable_noise_category`, …) ride along through `**glp_kwargs`.
 
 ```python
 from guidedLP.glp.propagation import ensemble_label_propagation
@@ -579,6 +579,31 @@ cv = cross_validate(
     n_epochs=20, enable_noise_category=True, directional=False,
 )
 ```
+
+**Scoring a specific directional pass.** With `directional=True` the propagator returns `(out_df, in_df)`. Pick which one to validate with `directional_pass="out"` or `directional_pass="in"`. Without it the validator raises (no implicit choice — pick deliberately):
+
+```python
+# Score only the out-pass (each node labelled by what it points to)
+out_results = train_test_split_validation(
+    graph=graph, id_mapper=id_mapper,
+    seed_labels=political_seeds, labels=["progressive", "conservative"],
+    test_size=0.2, random_seed=42,
+    propagator=ensemble_label_propagation,
+    n_epochs=20, enable_noise_category=True,
+    directional=True,                # propagator returns (out_df, in_df)
+    directional_pass="out",          # validate against out_df
+)
+
+# Score only the in-pass instead (each node labelled by who points to it)
+in_results = train_test_split_validation(
+    graph=graph, id_mapper=id_mapper,
+    seed_labels=political_seeds, labels=["progressive", "conservative"],
+    test_size=0.2, random_seed=42,
+    directional=True, directional_pass="in",
+)
+```
+
+See `docs/architecture/glp.md` for what the two passes mean under different edge conventions.
 
 When to prefer ensemble validation: you're planning to deploy with `ensemble_label_propagation` and want fold-level metrics that reflect the same model. When to skip: validation is just a sanity check before a final run — single-run GLP is cheaper and gives comparable rankings of hyperparameter choices.
 
