@@ -58,6 +58,33 @@ from guidedLP.pipelines._runtime import (
 )
 
 
+# Internal column name used to carry the user's weight through
+# build_edgelist_from_frame as a passthrough. Cannot collide with the
+# reserved names {"src", "tgt", "weight"} that EdgeList uses for its
+# coded columns.
+_INTERNAL_WEIGHT_COL = "__glp_pipeline_weight"
+
+
+def _load_source_for_rename(source: Union[str, Path, pl.DataFrame]) -> pl.DataFrame:
+    """Materialize file paths to a Polars DataFrame so the weight rename
+    can run. Pass-through for DataFrames.
+    """
+    if isinstance(source, pl.DataFrame):
+        return source
+    path = Path(source)
+    suffix = path.suffix.lower()
+    if suffix == ".parquet":
+        return pl.read_parquet(path)
+    if suffix in (".csv", ".tsv", ".txt"):
+        sep = "\t" if suffix == ".tsv" else ","
+        return pl.read_csv(path, separator=sep)
+    raise ValidationError(
+        f"Unsupported source file extension: {suffix!r}. "
+        f"Expected one of .parquet, .csv, .tsv, .txt — or pass a "
+        f"pre-loaded Polars DataFrame."
+    )
+
+
 @dataclass
 class CanonicalPipelineResult:
     """Return value of :func:`run_canonical_pipeline`.
@@ -133,7 +160,13 @@ def run_canonical_pipeline(
         Column carrying the per-edge timestamp; required for the
         temporal projection step.
     weight_col : str, optional
-        Per-edge weight column. If omitted, edges get unit weight.
+        Per-edge weight column on the raw input. When provided it is
+        carried through to the temporal-projection stage (used in the
+        ``(w_i + w_j) / 2 * 1 / (1 + Δdays)`` formula) but the
+        bipartite-side backbone (Stage 2) still runs on raw row counts —
+        see Stage 1's implementation comment for why. Pre-aggregate the
+        input to one row per ``(source, target)`` pair if you need
+        weighted bipartite_svn.
     intermediate_col, projected_col : str, optional
         Which side of the bipartite to collapse vs preserve in the
         projection. Default: ``intermediate_col=target_col`` and
@@ -224,14 +257,46 @@ def run_canonical_pipeline(
     pipeline_start = _time.perf_counter()
 
     try:
-        # Stage 1: build the bipartite EdgeList with timestamp passthrough.
+        # Stage 1: build the bipartite EdgeList with timestamp (and optional
+        # user weight) carried as passthrough columns.
+        #
+        # build_edgelist_from_frame rejects the combination
+        # ``weight_col != None + passthrough_cols`` because its weight-sum
+        # branch would group_by (src, tgt) and drop per-row passthrough
+        # values. Routing the user's weight through ``passthrough_cols``
+        # instead preserves both per-row timestamp AND per-row weight on
+        # the EdgeList, so the temporal projection downstream can still
+        # use the original weight values via its own ``weight_col``
+        # parameter. The user's weight column is renamed to a reserved-
+        # safe internal name first, since passthrough_cols cannot include
+        # the literal name "weight" (which is reserved for the EdgeList's
+        # own weight column).
+        #
+        # Side effect: the bipartite-side backbone (Stage 2) runs on the
+        # raw row count (effective weight = 1.0 per row), not the user's
+        # weight. If you need a weighted bipartite_svn, pre-aggregate the
+        # input to one row per (source, target) pair before calling this
+        # pipeline.
         t0 = _time.perf_counter()
         passthrough = [timestamp_col]
+        internal_weight: Optional[str] = None
+        if weight_col is not None:
+            source_df = _load_source_for_rename(source)
+            if weight_col not in source_df.columns:
+                raise ValidationError(
+                    f"weight_col={weight_col!r} not found in source columns: "
+                    f"{source_df.columns}"
+                )
+            if weight_col != _INTERNAL_WEIGHT_COL:
+                source_df = source_df.rename({weight_col: _INTERNAL_WEIGHT_COL})
+            source = source_df
+            internal_weight = _INTERNAL_WEIGHT_COL
+            passthrough.append(internal_weight)
         el_bp, mapper_bp = build_edgelist_from_frame(
             source,
             source_col=source_col,
             target_col=target_col,
-            weight_col=weight_col,
+            weight_col=None,
             bipartite=True,
             bipartite_overlap=bipartite_overlap,
             min_source_degree=min_source_degree,
@@ -313,6 +378,7 @@ def run_canonical_pipeline(
             source_col=source_col,
             target_col=target_col,
             timestamp_col=timestamp_col,
+            weight_col=internal_weight,
             intermediate_col=intermediate_col,
             projected_col=projected_col,
             add_edge_weights=add_edge_weights,
