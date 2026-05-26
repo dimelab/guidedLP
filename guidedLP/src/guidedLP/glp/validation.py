@@ -6,7 +6,7 @@ train/test splits, external validation sets, and cross-validation approaches.
 It implements comprehensive evaluation metrics and diagnostic tools.
 """
 
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Callable, Dict, List, Any, Optional, Tuple
 import warnings
 import numpy as np
 import polars as pl
@@ -44,6 +44,7 @@ def train_test_split_validation(
     seed_node_col: str = "node_id",
     seed_label_col: str = "label",
     test_seeds: Optional[SeedInput] = None,
+    propagator: Callable = guided_label_propagation,
     **glp_kwargs
 ) -> Dict[str, Any]:
     """
@@ -97,8 +98,22 @@ def train_test_split_validation(
         that overlap between ``seed_labels`` and ``test_seeds`` are removed
         from training; if labels conflict on overlapping nodes, the test set's
         label is kept and a ``UserWarning`` is emitted.
+    propagator : Callable, default guided_label_propagation
+        Propagation function used to score the held-out seeds. Defaults to
+        :func:`guided_label_propagation`; pass
+        :func:`ensemble_label_propagation` for bagging-style noise-resampled
+        scoring. Any callable with the same first four positional arguments
+        (``graph, id_mapper, seed_labels, labels``) returning a polars
+        DataFrame works. **Must return a single DataFrame** — pass
+        ``directional=False`` via ``**glp_kwargs`` if you'd otherwise get a
+        tuple.
     **glp_kwargs
-        Additional arguments passed to guided_label_propagation()
+        Additional arguments forwarded to the chosen ``propagator``. For
+        :func:`guided_label_propagation`: ``alpha``, ``max_iterations``,
+        ``directional``, ``weight_transform``, etc. For
+        :func:`ensemble_label_propagation`: additionally ``n_epochs``,
+        ``base_seed``, ``enable_noise_category``, ``noise_ratio``,
+        ``return_variance``, ``n_workers``.
         
     Returns
     -------
@@ -180,17 +195,26 @@ def train_test_split_validation(
 
         logger.info(f"Split: {len(train_seeds)} training seeds, {len(test_seeds)} test seeds")
 
-        # Step 2: Run GLP on training seeds only
+        # Step 2: Run propagation on training seeds only. `propagator` is
+        # `guided_label_propagation` by default; pass
+        # `ensemble_label_propagation` (or any compatible callable returning a
+        # single DataFrame) to switch.
         try:
-            predictions = guided_label_propagation(
+            predictions = propagator(
                 graph, id_mapper, train_seeds, labels, **glp_kwargs
             )
         except Exception as e:
             raise ComputationError(
-                "Failed to run guided label propagation during validation",
+                f"Failed to run propagator {propagator.__name__} during validation",
                 operation="train_test_split_validation",
                 error_type="propagation_failure",
                 cause=e
+            )
+        if isinstance(predictions, tuple):
+            raise ValidationError(
+                f"{propagator.__name__} returned a (out_df, in_df) tuple — "
+                "train_test_split_validation expects a single DataFrame. "
+                "Pass directional=False via glp_kwargs."
             )
 
         # Step 3: Extract predictions for test nodes
@@ -641,6 +665,7 @@ def cross_validate(
     n_jobs: int = 1,
     seed_node_col: str = "node_id",
     seed_label_col: str = "label",
+    propagator: Callable = guided_label_propagation,
     **glp_kwargs
 ) -> Dict[str, Any]:
     """
@@ -681,9 +706,17 @@ def cross_validate(
         Column name for node IDs when ``seed_labels`` is a DataFrame.
     seed_label_col : str, default "label"
         Column name for labels when ``seed_labels`` is a DataFrame.
+    propagator : Callable, default guided_label_propagation
+        Propagation function used per fold. Defaults to
+        :func:`guided_label_propagation`; pass
+        :func:`ensemble_label_propagation` for bagging-style noise-resampled
+        scoring. Must return a single DataFrame — pass ``directional=False``
+        via ``**glp_kwargs`` if you'd otherwise get a tuple.
     **glp_kwargs
-        Additional arguments passed to guided_label_propagation()
-        
+        Additional arguments forwarded to the chosen ``propagator`` (e.g.
+        ``alpha``, ``max_iterations``, ``directional`` for GLP;
+        ``n_epochs``, ``enable_noise_category`` for the ensemble).
+
     Returns
     -------
     Dict[str, Any]
@@ -759,11 +792,11 @@ def cross_validate(
         # Process folds (sequentially or in parallel)
         if n_jobs == 1:
             fold_results = _process_folds_sequential(
-                fold_splits, graph, id_mapper, labels, glp_kwargs
+                fold_splits, graph, id_mapper, labels, glp_kwargs, propagator
             )
         else:
             fold_results = _process_folds_parallel(
-                fold_splits, graph, id_mapper, labels, glp_kwargs, n_jobs
+                fold_splits, graph, id_mapper, labels, glp_kwargs, n_jobs, propagator
             )
         
         # Aggregate results across folds
@@ -888,18 +921,20 @@ def _process_folds_sequential(
     graph: nk.Graph,
     id_mapper: IDMapper,
     labels: List[str],
-    glp_kwargs: Dict[str, Any]
+    glp_kwargs: Dict[str, Any],
+    propagator: Callable = guided_label_propagation,
 ) -> List[Dict[str, Any]]:
     """Process folds sequentially."""
-    
+
     fold_results = []
-    
+
     for fold_idx, (train_seeds, test_seeds) in enumerate(fold_splits):
         logger.debug(f"Processing fold {fold_idx + 1}/{len(fold_splits)}")
-        
+
         try:
             fold_result = _process_single_fold(
-                train_seeds, test_seeds, graph, id_mapper, labels, glp_kwargs
+                train_seeds, test_seeds, graph, id_mapper, labels, glp_kwargs,
+                propagator,
             )
             fold_result["fold_index"] = fold_idx
             fold_results.append(fold_result)
@@ -922,17 +957,19 @@ def _process_folds_parallel(
     id_mapper: IDMapper,
     labels: List[str],
     glp_kwargs: Dict[str, Any],
-    n_jobs: int
+    n_jobs: int,
+    propagator: Callable = guided_label_propagation,
 ) -> List[Dict[str, Any]]:
     """Process folds in parallel."""
-    
+
     logger.info(f"Processing {len(fold_splits)} folds with {n_jobs} parallel jobs")
-    
+
     def process_fold_wrapper(fold_data):
         fold_idx, (train_seeds, test_seeds) = fold_data
         try:
             result = _process_single_fold(
-                train_seeds, test_seeds, graph, id_mapper, labels, glp_kwargs
+                train_seeds, test_seeds, graph, id_mapper, labels, glp_kwargs,
+                propagator,
             )
             result["fold_index"] = fold_idx
             return result
@@ -966,14 +1003,23 @@ def _process_single_fold(
     graph: nk.Graph,
     id_mapper: IDMapper,
     labels: List[str],
-    glp_kwargs: Dict[str, Any]
+    glp_kwargs: Dict[str, Any],
+    propagator: Callable = guided_label_propagation,
 ) -> Dict[str, Any]:
     """Process a single fold of cross-validation."""
-    
-    # Run GLP on training seeds
-    predictions = guided_label_propagation(
+
+    # Run the chosen propagator on training seeds. Default is GLP; the caller
+    # can pass ensemble_label_propagation (or any compatible callable
+    # returning a single DataFrame) via cross_validate's `propagator` kwarg.
+    predictions = propagator(
         graph, id_mapper, train_seeds, labels, **glp_kwargs
     )
+    if isinstance(predictions, tuple):
+        raise ValidationError(
+            f"{propagator.__name__} returned a (out_df, in_df) tuple — "
+            "cross_validate expects a single DataFrame per fold. "
+            "Pass directional=False via glp_kwargs."
+        )
     
     # Extract predictions for test nodes
     test_predictions = _extract_test_predictions(predictions, test_seeds)
