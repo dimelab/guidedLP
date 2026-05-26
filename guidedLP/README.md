@@ -739,7 +739,58 @@ audience = audience_composition_pass(
 
 For the canonical attribution workflow — raw input → bipartite EdgeList → bipartite-side backbone → temporal projection → projection-side backbone — `guidedLP.pipelines.run_canonical_pipeline` composes all four stages in a single call with explicit memory management between steps. Compared to calling the four functions by hand, the wrapper releases intermediates between stages so they don't co-exist in RAM, and optionally checkpoints to disk for memory-constrained runs.
 
-The block below shows **every** parameter the wrapper accepts, grouped by stage. Defaults are inlined so this doubles as the reference for what each knob does — copy, delete what you don't need, tune the rest.
+**Minimal copy-paste version** — the typical call without the explanatory comments:
+
+```python
+from guidedLP.pipelines import run_canonical_pipeline
+
+result = run_canonical_pipeline(
+    source="shares.parquet",
+    source_col="user",
+    target_col="item",
+    timestamp_col="timestamp",
+    weight_col="weight",
+    intermediate_col="item",
+    projected_col="user",
+    min_source_degree=25,
+    min_target_degree=None,
+    auto_weight=False,
+    bipartite_overlap="drop",
+    bipartite_alpha=0.01,
+    bipartite_correction="fdr_bh",
+    bipartite_target_fraction=None,
+    add_edge_weights=True,
+    remove_self_loops=True,
+    presort_temporal=True,
+    projection_threshold=1.0,
+    projection_target_fraction=0.2,
+    memory_mode="balanced",
+    checkpoint_dir=None,
+    keep_intermediates=False,
+    verbose=True,
+)
+
+backbone = result.edgelist
+mapper = result.id_mapper
+print(f"total: {result.total_duration_s:.1f}s | "
+      f"{backbone.number_of_edges():,} edges, {backbone.n_nodes:,} nodes")
+```
+
+When `verbose=True`, the pipeline prints a per-stage summary plus a final TOTAL line including memory mode and final edge/node counts:
+
+```
+[build_edgelist_from_frame] 15.29s | 27,893,278 input rows → 1,877,850 nodes, 23,280,338 edges (UInt32)
+[apply_backbone] 1.92s | method=bipartite_svn | EdgeList: 23,280,338 → 12,634,460 edges kept (54.3%)
+[temporal_bipartite_to_unipartite] 169.45s | intermediate=item, projected=user, output=edgelist | 12,634,460 input rows → 191,864,084 projection edges
+[apply_backbone] 148.67s | method=noise_corrected | EdgeList: 191,864,084 → 38,372,817 edges kept (20.0%)
+[run_canonical_pipeline] TOTAL 335.50s | mode=balanced | final: 38,372,817 edges, 104,680 nodes
+```
+
+`result.total_duration_s` programmatically returns the sum of per-stage durations; the printed TOTAL also captures inter-stage cleanup (`gc.collect`, sorting) so the two numbers differ slightly.
+
+---
+
+**Reference version** — the same call with **every** parameter shown explicitly, grouped by stage. Defaults are inlined; this is the reference for what each knob does.
 
 ```python
 from guidedLP.pipelines import run_canonical_pipeline

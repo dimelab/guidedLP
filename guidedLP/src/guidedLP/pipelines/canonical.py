@@ -221,6 +221,7 @@ def run_canonical_pipeline(
 
     stats: List[StageStats] = []
     intermediates: Optional[Dict[str, Any]] = {} if keep_intermediates else None
+    pipeline_start = _time.perf_counter()
 
     try:
         # Stage 1: build the bipartite EdgeList with timestamp passthrough.
@@ -355,6 +356,15 @@ def run_canonical_pipeline(
         if intermediates is None:
             del el_proj, mapper_proj
             maybe_free(memory_mode)
+
+        if verbose:
+            total = _time.perf_counter() - pipeline_start
+            print(
+                f"[run_canonical_pipeline] TOTAL {total:.2f}s | "
+                f"mode={memory_mode} | "
+                f"final: {el_final.number_of_edges():,} edges, "
+                f"{el_final.n_nodes:,} nodes"
+            )
 
         return CanonicalPipelineResult(
             edgelist=el_final,
