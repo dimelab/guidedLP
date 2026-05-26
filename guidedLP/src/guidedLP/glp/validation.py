@@ -182,6 +182,10 @@ def train_test_split_validation(
     - For very small seed sets, consider using cross_validate() instead
     """
     seed_labels = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
+    # Drop seeds not in the graph before splitting — otherwise missing test
+    # seeds explode later in _extract_test_predictions. Matches the codebase's
+    # warn-and-skip convention for unknown IDs.
+    seed_labels = _filter_seeds_to_graph(seed_labels, id_mapper, label="seed_labels")
 
     mode = "custom_test_set" if test_seeds is not None else "random_split"
     logger.info(
@@ -199,6 +203,9 @@ def train_test_split_validation(
             )
         else:
             test_seeds = normalize_seed_input(test_seeds, seed_node_col, seed_label_col)
+            test_seeds = _filter_seeds_to_graph(
+                test_seeds, id_mapper, label="test_seeds"
+            )
             train_seeds, test_seeds = _resolve_custom_test_set(
                 seed_labels, test_seeds, labels
             )
@@ -451,6 +458,39 @@ def _split_seed_data(
     logger.debug(f"Test labels distribution: {_count_labels(test_labels_list)}")
     
     return train_seeds, test_seeds, train_labels_list, test_labels_list
+
+
+def _filter_seeds_to_graph(
+    seed_labels: Dict[Any, str],
+    id_mapper: IDMapper,
+    *,
+    label: str,
+) -> Dict[Any, str]:
+    """Drop seed IDs not present in the graph, with a warning.
+
+    Mirrors the convention used inside :func:`guided_label_propagation`'s
+    validator and elsewhere (filter_graph, protected_nodes, filter_by_seed_proximity):
+    unknown IDs are skipped with a logged warning; only raise if zero seeds
+    remain. ``label`` is used in the warning message to disambiguate
+    train vs. test vs. combined seed sets.
+    """
+    if not seed_labels:
+        return seed_labels
+    missing = [s for s in seed_labels.keys() if not id_mapper.has_original(s)]
+    if not missing:
+        return seed_labels
+    kept = {s: lbl for s, lbl in seed_labels.items() if s not in set(missing)}
+    logger.warning(
+        f"{len(missing)} of {len(seed_labels)} {label} not found in graph and "
+        f"were skipped (first few: {missing[:5]})"
+    )
+    if not kept:
+        raise ValidationError(
+            f"None of the supplied {label} are present in the graph.",
+            details={"missing_count": len(missing),
+                     "missing_sample": missing[:10]},
+        )
+    return kept
 
 
 _DIRECTIONAL_PASS_VALUES = {"out", "in"}
@@ -831,6 +871,8 @@ def cross_validate(
     - Parallel processing (n_jobs > 1) can speed up computation for large k_folds
     """
     seed_labels = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
+    # Drop seeds not in the graph before folding (warn-and-skip convention).
+    seed_labels = _filter_seeds_to_graph(seed_labels, id_mapper, label="seed_labels")
 
     logger.info(f"Starting {k_folds}-fold cross-validation with {len(seed_labels)} seeds, "
                f"stratify={stratify}, n_jobs={n_jobs}")
