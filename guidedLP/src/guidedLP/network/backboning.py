@@ -1453,13 +1453,6 @@ def _bipartite_svn_on_edges(
           retention filter is not used). The graph shim uses this to drop
           those specific nodes even when ``keep_disconnected=True``.
     """
-    # Strengths: each edge contributes to both endpoints (bipartite ⇒ undirected).
-    incident = pl.concat([
-        df.select(pl.col("source_id").alias("node"), pl.col("weight")),
-        df.select(pl.col("target_id").alias("node"), pl.col("weight")),
-    ])
-    strengths = incident.group_by("node").agg(pl.col("weight").sum().alias("strength"))
-
     n_edges = df.height
     W_total = float(df["weight"].sum())
     if W_total <= 0:
@@ -1469,6 +1462,46 @@ def _bipartite_svn_on_edges(
             pl.lit(False).alias("kept"),
         ]).select(["source_id", "target_id", "weight", "p_value", "kept"])
         return empty, set()
+
+    # Per-node strength + degree via two side-aggregates joined on the
+    # union of nodes — a V-row plan, not a 2|E|-row one. The previous
+    # ``pl.concat([df.select(src), df.select(tgt)])`` approach
+    # materialized 2|E| rows × 2 cols eagerly alongside ``df`` and the
+    # ``original_degree`` recomputation later did the same thing again;
+    # the V-row form below keeps peak memory proportional to |V|, which
+    # is dramatically smaller than 2|E| on the projection-scale inputs
+    # this filter sometimes sees.
+    src_stats = (
+        df.lazy()
+        .group_by("source_id")
+        .agg(
+            pl.col("weight").sum().alias("strength"),
+            pl.len().alias("degree"),
+        )
+        .rename({"source_id": "node"})
+    )
+    tgt_stats = (
+        df.lazy()
+        .group_by("target_id")
+        .agg(
+            pl.col("weight").sum().alias("strength"),
+            pl.len().alias("degree"),
+        )
+        .rename({"target_id": "node"})
+    )
+    node_stats_plan = (
+        pl.concat([src_stats, tgt_stats])
+        .group_by("node")
+        .agg(
+            pl.col("strength").sum().alias("strength"),
+            pl.col("degree").sum().alias("original_degree"),
+        )
+    )
+    node_stats = (
+        node_stats_plan.collect(engine="streaming")
+        if streaming else node_stats_plan.collect()
+    )
+    strengths = node_stats.select(["node", "strength"])
 
     # Build the strength-join + mu plan. Drop s_u / s_v after mu so the
     # collected frame is no wider than necessary downstream.
@@ -1542,15 +1575,25 @@ def _bipartite_svn_on_edges(
 
     dropped_nodes: Set[Any] = set()
     if min_node_retention is not None:
-        original_degree = incident.group_by("node").agg(
-            pl.len().alias("original_degree")
+        # original_degree was computed alongside the strengths above
+        # (V-row pass) — reuse it instead of re-materializing the 2|E|
+        # incident frame.
+        original_degree = node_stats.select(["node", "original_degree"])
+        kept_only = work.filter(pl.col("kept"))
+        src_surv = (
+            kept_only.lazy()
+            .group_by("source_id").agg(pl.len().alias("d"))
+            .rename({"source_id": "node"})
         )
-        surviving_incident = pl.concat([
-            work.filter(pl.col("kept")).select(pl.col("source_id").alias("node")),
-            work.filter(pl.col("kept")).select(pl.col("target_id").alias("node")),
-        ])
-        surviving_degree = surviving_incident.group_by("node").agg(
-            pl.len().alias("surviving_degree")
+        tgt_surv = (
+            kept_only.lazy()
+            .group_by("target_id").agg(pl.len().alias("d"))
+            .rename({"target_id": "node"})
+        )
+        surviving_degree = (
+            pl.concat([src_surv, tgt_surv])
+            .group_by("node").agg(pl.col("d").sum().alias("surviving_degree"))
+            .collect(engine="streaming" if streaming else "in-memory")
         )
         retention = (
             original_degree
