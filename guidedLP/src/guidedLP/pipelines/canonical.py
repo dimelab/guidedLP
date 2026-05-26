@@ -138,6 +138,7 @@ def run_canonical_pipeline(
     bipartite_alpha: float = 0.01,
     bipartite_correction: str = "fdr_bh",
     bipartite_target_fraction: Optional[float] = None,
+    bipartite_min_node_retention: Optional[float] = None,
     # Stage 3: temporal projection.
     add_edge_weights: bool = True,
     remove_self_loops: bool = True,
@@ -191,6 +192,14 @@ def run_canonical_pipeline(
     bipartite_target_fraction : float, optional
         If set, overrides ``bipartite_alpha`` and keeps the top fraction
         of bipartite edges by p-value.
+    bipartite_min_node_retention : float, optional
+        Post-filter for stage 2: drop any bipartite node whose surviving
+        edges fall below this fraction of its original incident-edge
+        count (e.g. ``0.1`` removes nodes that lost more than 90% of
+        their edges to the SVN cut). Useful for eliminating generic
+        high-degree nodes whose edges are mostly noise. ``None`` (default)
+        keeps every node the per-edge SVN selected. Protected nodes
+        (see ``protected_nodes``) are exempt.
     add_edge_weights, remove_self_loops : bool
         Forwarded to :func:`temporal_bipartite_to_unipartite`.
     presort_temporal : bool, default True
@@ -371,6 +380,7 @@ def run_canonical_pipeline(
             alpha=bipartite_alpha,
             correction=bipartite_correction,
             target_fraction=bipartite_target_fraction,
+            min_node_retention=bipartite_min_node_retention,
             streaming=stream_backbones,
             verbose=verbose,
             protected_nodes=protected_nodes,
