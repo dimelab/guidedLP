@@ -59,6 +59,7 @@ def apply_backbone(
     threshold: float = 1.0,
     target_nodes: Optional[int] = None,
     target_edges: Optional[int] = None,
+    target_fraction: Optional[float] = None,
     weight_threshold: Optional[float] = None,
     keep_disconnected: bool = False,
     correction: str = "fdr_bh",
@@ -133,7 +134,23 @@ def apply_backbone(
     target_edges : int, optional
         For ``method="weight"``: keep approximately this many highest-weight
         edges. For ``method="disparity"``: cap the kept set to this many
-        edges (lowest α first). Conflicts with ``target_nodes``.
+        edges (lowest α first). Conflicts with ``target_nodes``. See
+        ``target_fraction`` for a method-agnostic way to request a specific
+        kept-edge count.
+    target_fraction : float, optional
+        When set (in ``(0, 1]``), **overrides** ``alpha`` / ``threshold``
+        for the three statistical methods (``disparity``,
+        ``noise_corrected``, ``bipartite_svn``) and returns approximately
+        ``ceil(target_fraction · |E_in|)`` edges, ranked by the method's
+        per-edge significance margin (lowest α for disparity, highest
+        ``score − threshold · sdev`` for noise_corrected, lowest p-value
+        for bipartite_svn). Conflicts with ``target_edges`` /
+        ``target_nodes``. Useful when you want a graph of a specific size
+        rather than a statistically significant set — e.g. to feed a
+        fixed-size backbone into downstream community detection or
+        visualization. **Note**: the kept set is no longer "statistically
+        significant" in any rigorous sense; you are asking for the
+        method's top-K edges by score, nothing more.
     weight_threshold : float, optional
         For ``method="weight"``: explicit weight cutoff. Takes precedence over
         ``target_edges`` if both are set.
@@ -267,6 +284,7 @@ def apply_backbone(
             threshold=threshold,
             target_edges=target_edges,
             target_nodes=target_nodes,
+            target_fraction=target_fraction,
             weight_threshold=weight_threshold,
             correction=correction,
             min_node_retention=min_node_retention,
@@ -291,6 +309,7 @@ def apply_backbone(
             threshold=threshold,
             target_edges=target_edges,
             target_nodes=target_nodes,
+            target_fraction=target_fraction,
             weight_threshold=weight_threshold,
             correction=correction,
             min_node_retention=min_node_retention,
@@ -336,11 +355,19 @@ def apply_backbone(
         threshold=threshold,
         target_nodes=target_nodes,
         target_edges=target_edges,
+        target_fraction=target_fraction,
         weight_threshold=weight_threshold,
         correction=correction,
         min_node_retention=min_node_retention,
         graph=graph,
     )
+
+    # Resolve target_fraction → top_k_override based on the input edge count.
+    # The override path ignores alpha/threshold and ranks edges by the
+    # method's per-edge significance margin (see each _*_on_edges helper).
+    top_k_override: Optional[int] = None
+    if target_fraction is not None:
+        top_k_override = max(1, int(np.ceil(target_fraction * graph.numberOfEdges())))
 
     # Empty-graph short-circuit.
     if graph.numberOfNodes() == 0 or graph.numberOfEdges() == 0:
@@ -369,18 +396,21 @@ def apply_backbone(
                 result = _apply_disparity_filter(
                     graph, id_mapper, alpha, target_edges,
                     keep_disconnected, return_edges_for_path,
+                    top_k_override=top_k_override,
                 )
             elif method == "noise_corrected":
                 result = _apply_noise_corrected_filter(
                     graph, id_mapper, threshold,
                     keep_disconnected, return_edges_for_path,
                     streaming=streaming,
+                    top_k_override=top_k_override,
                 )
             elif method == "bipartite_svn":
                 result = _apply_bipartite_svn_filter(
                     graph, id_mapper, alpha, correction,
                     keep_disconnected, min_node_retention,
                     return_edges_for_path,
+                    top_k_override=top_k_override,
                 )
             elif method == "weight":
                 result = _apply_weight_threshold(
@@ -435,6 +465,7 @@ def _apply_backbone_frame_path(
     threshold: float,
     target_edges: Optional[int],
     target_nodes: Optional[int],
+    target_fraction: Optional[float] = None,
     weight_threshold: Optional[float],
     correction: str,
     min_node_retention: Optional[float],
@@ -458,6 +489,7 @@ def _apply_backbone_frame_path(
         threshold=threshold,
         target_nodes=target_nodes,
         target_edges=target_edges,
+        target_fraction=target_fraction,
         weight_threshold=weight_threshold,
         correction=correction,
         min_node_retention=min_node_retention,
@@ -471,20 +503,29 @@ def _apply_backbone_frame_path(
         _print_backbone_frame_summary(verbose, t_start, n_in, 0, method)
         return result_df if include_scores else _slim_edges_df(result_df)
 
+    top_k_override: Optional[int] = None
+    if target_fraction is not None:
+        top_k_override = max(1, int(np.ceil(target_fraction * n_in)))
+
     with LoggingTimer("apply_backbone", {"method": method, "edges": n_in, "input": "frame"}):
         try:
             if method == "disparity":
-                result_df = _disparity_on_edges(edges_df, directed, alpha, target_edges)
+                result_df = _disparity_on_edges(
+                    edges_df, directed, alpha, target_edges,
+                    top_k_override=top_k_override,
+                )
             elif method == "noise_corrected":
                 result_df = _noise_corrected_on_edges(
-                    edges_df, directed, threshold, streaming=streaming
+                    edges_df, directed, threshold, streaming=streaming,
+                    top_k_override=top_k_override,
                 )
             elif method == "bipartite_svn":
                 # Treat as weighted if the column actually carries variation.
                 w = edges_df["weight"].to_numpy()
                 is_weighted_effective = w.size > 0 and not np.allclose(w, 1.0)
                 result_df, _ = _bipartite_svn_on_edges(
-                    edges_df, alpha, correction, min_node_retention, is_weighted_effective
+                    edges_df, alpha, correction, min_node_retention, is_weighted_effective,
+                    top_k_override=top_k_override,
                 )
             elif method == "weight":
                 result_df = _weight_threshold_on_edges(edges_df, target_edges, weight_threshold)
@@ -548,6 +589,7 @@ def _apply_backbone_edgelist_path(
     threshold: float,
     target_edges: Optional[int],
     target_nodes: Optional[int],
+    target_fraction: Optional[float] = None,
     weight_threshold: Optional[float],
     correction: str,
     min_node_retention: Optional[float],
@@ -585,6 +627,7 @@ def _apply_backbone_edgelist_path(
         threshold=threshold,
         target_nodes=target_nodes,
         target_edges=target_edges,
+        target_fraction=target_fraction,
         weight_threshold=weight_threshold,
         correction=correction,
         min_node_retention=min_node_retention,
@@ -593,6 +636,10 @@ def _apply_backbone_edgelist_path(
 
     want_df_only = output_format == "dataframe"
     n_in = edge_list.number_of_edges()
+
+    top_k_override: Optional[int] = None
+    if target_fraction is not None:
+        top_k_override = max(1, int(np.ceil(target_fraction * n_in)))
 
     # Build a frame in the column shape the per-method helpers expect.
     # Codes pass through unchanged — Polars group_by/joins don't care about
@@ -614,16 +661,19 @@ def _apply_backbone_edgelist_path(
             if method == "disparity":
                 result_df = _disparity_on_edges(
                     edges_df, edge_list.directed, alpha, target_edges,
+                    top_k_override=top_k_override,
                 )
             elif method == "noise_corrected":
                 result_df = _noise_corrected_on_edges(
                     edges_df, edge_list.directed, threshold, streaming=streaming,
+                    top_k_override=top_k_override,
                 )
             elif method == "bipartite_svn":
                 w = edges_df["weight"].to_numpy()
                 is_weighted_effective = w.size > 0 and not np.allclose(w, 1.0)
                 result_df, _ = _bipartite_svn_on_edges(
                     edges_df, alpha, correction, min_node_retention, is_weighted_effective,
+                    top_k_override=top_k_override,
                 )
             elif method == "weight":
                 result_df = _weight_threshold_on_edges(
@@ -705,6 +755,7 @@ def _validate_backbone_parameters(
     threshold: float,
     target_nodes: Optional[int],
     target_edges: Optional[int],
+    target_fraction: Optional[float] = None,
     weight_threshold: Optional[float],
     correction: str,
     min_node_retention: Optional[float],
@@ -721,13 +772,29 @@ def _validate_backbone_parameters(
             f"Available methods: {AVAILABLE_BACKBONE_METHODS}"
         )
 
-    if target_nodes is not None and target_edges is not None:
-        raise ValidationError("Cannot specify both target_nodes and target_edges")
+    n_size_caps = sum(
+        x is not None for x in (target_nodes, target_edges, target_fraction)
+    )
+    if n_size_caps > 1:
+        raise ValidationError(
+            "Specify at most one of target_nodes / target_edges / target_fraction"
+        )
 
     if target_nodes is not None and target_nodes <= 0:
         raise ValidationError(f"target_nodes must be positive, got {target_nodes}")
     if target_edges is not None and target_edges <= 0:
         raise ValidationError(f"target_edges must be positive, got {target_edges}")
+    if target_fraction is not None and not (0.0 < target_fraction <= 1.0):
+        raise ValidationError(
+            f"target_fraction must be in (0, 1], got {target_fraction}"
+        )
+    if target_fraction is not None and method not in (
+        "disparity", "noise_corrected", "bipartite_svn",
+    ):
+        raise ValidationError(
+            f"target_fraction is only supported by method='disparity', "
+            f"'noise_corrected', or 'bipartite_svn'; got method={method!r}"
+        )
     if weight_threshold is not None and weight_threshold <= 0:
         raise ValidationError(
             f"weight_threshold must be positive, got {weight_threshold}"
@@ -773,6 +840,8 @@ def _disparity_on_edges(
     directed: bool,
     alpha: float,
     target_edges: Optional[int] = None,
+    *,
+    top_k_override: Optional[int] = None,
 ) -> pl.DataFrame:
     """Serrano et al. (2009) disparity filter on an edge frame.
 
@@ -785,9 +854,17 @@ def _disparity_on_edges(
         graphs combine source- and target-side scores via element-wise min.
     alpha : float
         Significance level. An edge is kept iff its disparity score is below
-        ``alpha`` (or exactly 1.0, the leaf-node sentinel).
+        ``alpha`` (or exactly 1.0, the leaf-node sentinel). Ignored when
+        ``top_k_override`` is set.
     target_edges : int, optional
-        Cap the kept-edge count to this many lowest-α edges.
+        Cap the kept-edge count to this many lowest-α edges. Only takes
+        effect *after* the α-filter, so callers wanting a fixed count
+        regardless of α should use ``top_k_override`` instead.
+    top_k_override : int, optional
+        When set, ignore ``alpha`` / ``target_edges`` and keep exactly the
+        ``top_k_override`` edges with the lowest ``alpha_score`` (most
+        significant). Invalid edges (zero strength on either endpoint) are
+        excluded.
 
     Returns
     -------
@@ -905,30 +982,44 @@ def _disparity_on_edges(
         pl.when(pl.col("_invalid")).then(1.0).otherwise(pl.col("alpha_score")).alias("alpha_score"),
         pl.when(pl.col("_invalid")).then(1.0).otherwise(pl.col("p_value")).alias("p_value"),
     ])
-    work = work.with_columns(
-        (
-            ((pl.col("alpha_score") < alpha) | (pl.col("alpha_score") >= 1.0))
-            & ~pl.col("_invalid")
-        ).alias("kept")
-    )
+    if top_k_override is not None:
+        # Override path: ignore alpha / target_edges entirely. Rank valid
+        # edges by ascending alpha_score (lowest = most significant) and
+        # keep exactly top_k_override. Stable row_index disambiguates ties.
+        work = work.with_row_index(name="_idx")
+        kept_idx = (
+            work.filter(~pl.col("_invalid"))
+            .sort(["alpha_score", "_idx"])
+            .head(top_k_override)
+            .select("_idx")
+        )
+        work = work.with_columns(
+            pl.col("_idx").is_in(kept_idx["_idx"]).alias("kept")
+        ).drop("_idx")
+    else:
+        work = work.with_columns(
+            (
+                ((pl.col("alpha_score") < alpha) | (pl.col("alpha_score") >= 1.0))
+                & ~pl.col("_invalid")
+            ).alias("kept")
+        )
 
-    if target_edges is not None:
-        n_kept = int(work.filter(pl.col("kept")).height)
-        if n_kept > target_edges:
-            # Rank by ascending alpha_score among valid edges; only the
-            # target_edges lowest survive. row_index gives a stable ordering
-            # that matches numpy's argsort behavior for ties.
-            work = work.with_row_index(name="_idx")
-            sorted_valid = (
-                work.filter(~pl.col("_invalid"))
-                .sort(["alpha_score", "_idx"])
-                .head(target_edges)
-                .select("_idx")
-            )
-            kept_idx = set(sorted_valid["_idx"].to_list())
-            work = work.with_columns(
-                pl.col("_idx").is_in(list(kept_idx)).alias("kept")
-            ).drop("_idx")
+        if target_edges is not None:
+            n_kept = int(work.filter(pl.col("kept")).height)
+            if n_kept > target_edges:
+                # Rank by ascending alpha_score among valid edges; only the
+                # target_edges lowest survive. row_index gives a stable ordering
+                # that matches numpy's argsort behavior for ties.
+                work = work.with_row_index(name="_idx")
+                sorted_valid = (
+                    work.filter(~pl.col("_invalid"))
+                    .sort(["alpha_score", "_idx"])
+                    .head(target_edges)
+                    .select("_idx")
+                )
+                work = work.with_columns(
+                    pl.col("_idx").is_in(sorted_valid["_idx"]).alias("kept")
+                ).drop("_idx")
 
     return work.select([
         "source_id", "target_id", "weight",
@@ -956,6 +1047,8 @@ def _apply_disparity_filter(
     target_edges: Optional[int],
     keep_disconnected: bool,
     return_filtered_edges: bool,
+    *,
+    top_k_override: Optional[int] = None,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
     """Graph-shim around :func:`_disparity_on_edges`."""
     logger.debug("Applying disparity filter with alpha=%.3f", alpha)
@@ -976,7 +1069,10 @@ def _apply_disparity_filter(
         "target_id": targets,
         "weight": weights,
     })
-    scored = _disparity_on_edges(edge_df, directed, alpha, target_edges)
+    scored = _disparity_on_edges(
+        edge_df, directed, alpha, target_edges,
+        top_k_override=top_k_override,
+    )
 
     kept_df = scored.filter(pl.col("kept"))
     backbone_graph, updated_mapper = _assemble_backbone(
@@ -1046,6 +1142,7 @@ def _noise_corrected_on_edges(
     threshold: float,
     *,
     streaming: bool = False,
+    top_k_override: Optional[int] = None,
 ) -> pl.DataFrame:
     """Coscia & Neffke (2017) noise-corrected backbone on an edge frame.
 
@@ -1062,12 +1159,20 @@ def _noise_corrected_on_edges(
         stays proportional to E (not 2E).
     threshold : float
         Posterior-standard-deviation multiplier. Edges are kept iff
-        ``score − threshold · sdev_cij > 0``.
+        ``score − threshold · sdev_cij > 0``. Ignored when
+        ``top_k_override`` is set.
     streaming : bool, default False
         Collect the lazy pipeline with Polars's streaming engine. Slower than
         the in-memory engine on small inputs (per-batch overhead) but bounds
         peak memory by processing in chunks — flip this on for graphs large
         enough that the in-memory engine would OOM.
+    top_k_override : int, optional
+        When set, ignore ``threshold`` and keep exactly the
+        ``top_k_override`` edges with the highest significance margin
+        ``score − threshold · sdev_cij`` (i.e. the edges most strongly
+        favored by the noise-corrected lift). ``threshold`` is still used
+        as the scaling factor on ``sdev_cij`` when computing the margin
+        — pass the same value you'd use for a significance-based call.
 
     Returns
     -------
@@ -1209,7 +1314,29 @@ def _noise_corrected_on_edges(
         ])
     )
 
-    return plan.collect(engine="streaming") if streaming else plan.collect()
+    scored = plan.collect(engine="streaming") if streaming else plan.collect()
+
+    if top_k_override is not None:
+        # Override path: rank by (score − threshold · sdev_cij) descending —
+        # the same margin the default threshold filter uses, just sliced
+        # at rank K instead of zero. Stable row_index breaks ties so the
+        # output ordering is deterministic.
+        margin = pl.col("score") - threshold * pl.col("sdev_cij")
+        scored = scored.with_row_index(name="_idx")
+        kept_idx = (
+            scored
+            .sort([margin.alias("__margin"), pl.col("_idx")],
+                  descending=[True, False], nulls_last=True)
+            .head(top_k_override)
+            .select("_idx")
+        )
+        scored = (
+            scored
+            .with_columns(pl.col("_idx").is_in(kept_idx["_idx"]).alias("kept"))
+            .drop("_idx")
+        )
+
+    return scored
 
 
 def _apply_noise_corrected_filter(
@@ -1220,6 +1347,7 @@ def _apply_noise_corrected_filter(
     return_filtered_edges: bool,
     *,
     streaming: bool = False,
+    top_k_override: Optional[int] = None,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
     """Graph-shim around :func:`_noise_corrected_on_edges`."""
     logger.debug("Applying noise-corrected backbone with threshold=%.3f", threshold)
@@ -1240,7 +1368,10 @@ def _apply_noise_corrected_filter(
         "target_id": targets,
         "weight": weights,
     })
-    scored = _noise_corrected_on_edges(edge_df, directed, threshold, streaming=streaming)
+    scored = _noise_corrected_on_edges(
+        edge_df, directed, threshold, streaming=streaming,
+        top_k_override=top_k_override,
+    )
 
     kept_df = scored.filter(pl.col("kept"))
     backbone_graph, updated_mapper = _assemble_backbone(
@@ -1269,6 +1400,8 @@ def _bipartite_svn_on_edges(
     correction: str,
     min_node_retention: Optional[float] = None,
     is_weighted_effective: bool = True,
+    *,
+    top_k_override: Optional[int] = None,
 ) -> Tuple[pl.DataFrame, Set[Any]]:
     """Tumminello et al. (2011) SVN filter on a bipartite edge frame.
 
@@ -1277,16 +1410,23 @@ def _bipartite_svn_on_edges(
     df : pl.DataFrame
         Edge frame with columns ``source_id``, ``target_id``, ``weight``.
     alpha : float
-        Per-edge significance level (subject to ``correction``).
+        Per-edge significance level (subject to ``correction``). Ignored
+        when ``top_k_override`` is set.
     correction : str
-        One of ``"fdr_bh"``, ``"bonferroni"``, ``"none"``.
+        One of ``"fdr_bh"``, ``"bonferroni"``, ``"none"``. Ignored when
+        ``top_k_override`` is set (the override ranks by raw p-value).
     min_node_retention : float, optional
         Post-filter node-retention threshold in ``(0, 1]``. Nodes whose
         retention ratio falls below this are dropped; the corresponding
         ``kept`` entries are cleared, and the dropped-node IDs are returned
         as the second tuple element so the graph shim can remove them.
+        Applied AFTER ``top_k_override`` when both are set.
     is_weighted_effective : bool, default True
         If False, treat all weights as 1 (unweighted Poisson tail).
+    top_k_override : int, optional
+        When set, ignore ``alpha`` and ``correction`` and keep exactly the
+        ``top_k_override`` edges with the lowest raw p-value (most
+        significant under the Poisson configuration null).
 
     Returns
     -------
@@ -1334,7 +1474,15 @@ def _bipartite_svn_on_edges(
     else:
         p_values = -np.expm1(-mu_arr)
 
-    if correction == "bonferroni":
+    if top_k_override is not None:
+        # Override path: rank by ascending p-value, keep top K. argpartition
+        # avoids a full sort of the whole array — O(n) instead of O(n log n).
+        k = min(top_k_override, n_edges)
+        keep_mask = np.zeros(n_edges, dtype=bool)
+        if k > 0:
+            kept_idx = np.argpartition(p_values, k - 1)[:k]
+            keep_mask[kept_idx] = True
+    elif correction == "bonferroni":
         keep_mask = p_values <= (alpha / n_edges)
     elif correction == "fdr_bh":
         keep_mask = _benjamini_hochberg_mask(p_values, alpha)
@@ -1416,6 +1564,8 @@ def _apply_bipartite_svn_filter(
     keep_disconnected: bool,
     min_node_retention: Optional[float],
     return_filtered_edges: bool,
+    *,
+    top_k_override: Optional[int] = None,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
     """Graph-shim around :func:`_bipartite_svn_on_edges`.
 
@@ -1443,7 +1593,8 @@ def _apply_bipartite_svn_filter(
         "weight": w_arr,
     })
     scored, dropped_internal_nodes = _bipartite_svn_on_edges(
-        edge_df, alpha, correction, min_node_retention, is_weighted_effective
+        edge_df, alpha, correction, min_node_retention, is_weighted_effective,
+        top_k_override=top_k_override,
     )
 
     kept_df = scored.filter(pl.col("kept"))

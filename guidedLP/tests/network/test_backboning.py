@@ -494,10 +494,10 @@ class TestBackboneValidation:
         
         graph, mapper = build_graph_from_edgelist(edges, weight_col='weight')
         
-        # Cannot specify both target_nodes and target_edges
-        with pytest.raises(ValidationError, match="Cannot specify both"):
+        # Cannot specify more than one of target_nodes / target_edges / target_fraction
+        with pytest.raises(ValidationError, match="Specify at most one"):
             apply_backbone(
-                graph, mapper, method="disparity", 
+                graph, mapper, method="disparity",
                 target_nodes=10, target_edges=20
             )
     
