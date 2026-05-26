@@ -14,19 +14,21 @@ Composes the four canonical stages most attribution-style analyses use:
    directed graphs (see ``docs/architecture/chunked_projection_design.md``
    for why the threshold path tends to keep ~100% on directed inputs).
 
-Three memory modes control inter-stage release behaviour:
+Three memory modes control inter-stage release AND within-call streaming:
 
-- ``"fast"`` — no inter-stage cleanup. Same memory profile as making the
-  calls by hand.
+- ``"fast"`` — no inter-stage cleanup; both ``apply_backbone`` calls
+  use the in-memory engine. Same memory profile as making the calls
+  by hand, max throughput.
 - ``"balanced"`` (default) — explicitly ``del`` previous stages and
-  ``gc.collect()`` between steps. Saves the size of the previous
-  stage's intermediates from co-existing with the next stage's working
-  set; typically a 1.5–2× reduction in peak with negligible time
-  overhead.
+  ``gc.collect()`` between steps, AND pass ``streaming=True`` to the
+  two ``apply_backbone`` calls so they batch their wide-column /
+  ``poisson.sf`` work. Saves the size of the previous stage's
+  intermediates AND lowers within-call peak; ~30% slower than ``"fast"``.
 - ``"low"`` — additionally checkpoint each stage's EdgeList to parquet
   on disk and release the in-memory frame. Peak memory becomes the max
   *single* stage's working set rather than the sum across overlapping
-  stages. Adds disk I/O time (~few seconds on typical hardware).
+  stages. Inherits ``streaming=True`` from ``"balanced"``. Adds disk I/O
+  time (~few seconds on typical hardware).
 """
 
 from __future__ import annotations
@@ -199,7 +201,10 @@ def run_canonical_pipeline(
         ``projection_target_fraction`` is the recommended way to size
         the final backbone on directed projections.
     memory_mode : {"fast", "balanced", "low"}, default "balanced"
-        See module docstring.
+        See module docstring. In short: ``"fast"`` runs the backbones
+        in-memory for max throughput; ``"balanced"`` and ``"low"``
+        additionally pass ``streaming=True`` to both ``apply_backbone``
+        calls for ~2× lower within-call peak at ~30% wall-clock cost.
     checkpoint_dir : str | Path, optional
         Where to write parquet checkpoints in ``memory_mode="low"``.
         If unset and ``memory_mode="low"``, a temporary directory is
@@ -255,6 +260,11 @@ def run_canonical_pipeline(
     stats: List[StageStats] = []
     intermediates: Optional[Dict[str, Any]] = {} if keep_intermediates else None
     pipeline_start = _time.perf_counter()
+    # Enable per-call streaming in the two apply_backbone steps when the
+    # caller has opted into any memory-conscious mode. "fast" stays
+    # in-memory for maximum throughput; "balanced" and "low" trade ~30%
+    # wall-clock for ~2× lower peak memory inside the backbone calls.
+    stream_backbones = memory_mode != "fast"
 
     try:
         # Stage 1: build the bipartite EdgeList with timestamp (and optional
@@ -325,6 +335,7 @@ def run_canonical_pipeline(
             alpha=bipartite_alpha,
             correction=bipartite_correction,
             target_fraction=bipartite_target_fraction,
+            streaming=stream_backbones,
             verbose=verbose,
         )
         stats.append(StageStats(
@@ -410,6 +421,7 @@ def run_canonical_pipeline(
             method="noise_corrected",
             threshold=projection_threshold,
             target_fraction=projection_target_fraction,
+            streaming=stream_backbones,
             verbose=verbose,
         )
         stats.append(StageStats(
