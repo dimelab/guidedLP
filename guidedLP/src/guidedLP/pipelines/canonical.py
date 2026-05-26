@@ -290,6 +290,12 @@ def run_canonical_pipeline(
         t0 = _time.perf_counter()
         passthrough = [timestamp_col]
         internal_weight: Optional[str] = None
+        # Track whether WE materialized the source frame (so we know it's
+        # safe to release after build_edgelist). True iff we loaded a file
+        # path OR did a rename — both produce a frame WE own. False when
+        # the caller passed a DataFrame and we didn't need to rename it
+        # (in which case the caller still expects to use it after the call).
+        source_owned_by_us = False
         if weight_col is not None:
             source_df = _load_source_for_rename(source)
             if weight_col not in source_df.columns:
@@ -299,6 +305,9 @@ def run_canonical_pipeline(
                 )
             if weight_col != _INTERNAL_WEIGHT_COL:
                 source_df = source_df.rename({weight_col: _INTERNAL_WEIGHT_COL})
+                source_owned_by_us = True
+            elif isinstance(source, (str, Path)):
+                source_owned_by_us = True
             source = source_df
             internal_weight = _INTERNAL_WEIGHT_COL
             passthrough.append(internal_weight)
@@ -322,6 +331,17 @@ def run_canonical_pipeline(
             output_edges=el_bp.number_of_edges(),
             output_nodes=el_bp.n_nodes,
         ))
+        # Drop the raw input frame ASAP — it can be 5-10x larger than
+        # el_bp (Utf8 IDs vs UInt32 codes). The EdgeList shares no
+        # buffers with the source frame (codes are freshly encoded), so
+        # dropping the source releases real memory. Skipped in
+        # memory_mode="fast" to match its general no-cleanup semantics.
+        if memory_mode != "fast" and source_owned_by_us:
+            # Both refs point at the same underlying DataFrame; break both
+            # so refcount drops to zero and the buffers can be reclaimed.
+            source = None
+            source_df = None
+            gc.collect()
         if intermediates is not None:
             intermediates["bipartite"] = (el_bp, mapper_bp)
 
