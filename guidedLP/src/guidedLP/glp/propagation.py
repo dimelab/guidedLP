@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 import math
 import os
 import random
+import time as _time
 import warnings
 import numpy as np
 import scipy.sparse as sp
@@ -109,6 +110,33 @@ def winsorize_transform(cap: float) -> WeightTransform:
     return lambda w: min(w, cap)
 
 
+def _print_glp_summary(
+    label: str,
+    verbose: bool,
+    t_start: float,
+    *,
+    n_nodes: int,
+    n_edges: int,
+    n_seeds: int,
+    n_labels: int,
+    alpha: float,
+    directional: bool,
+    n_epochs: Optional[int] = None,
+) -> None:
+    """One-line summary printed at the bottom of GLP / ensemble GLP."""
+    if not verbose:
+        return
+    dt = _time.perf_counter() - t_start
+    epoch_str = f" epochs={n_epochs}" if n_epochs is not None else ""
+    shape = "directional (tuple)" if directional else "single frame"
+    print(
+        f"[{label}] {dt:.2f}s | "
+        f"nodes={n_nodes:,} edges={n_edges:,} | "
+        f"seeds={n_seeds:,} labels={n_labels} alpha={alpha}{epoch_str} | "
+        f"output={shape}"
+    )
+
+
 def guided_label_propagation(
     graph: nk.Graph,
     id_mapper: IDMapper,
@@ -128,6 +156,7 @@ def guided_label_propagation(
     weight_transform: Optional[WeightTransform] = None,
     random_seed: Optional[int] = 42,
     exclude_from_output: Optional[Set[Any]] = None,
+    verbose: bool = True,
 ) -> Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]:
     """
     Propagate labels from seed nodes through network using guided label propagation.
@@ -222,6 +251,10 @@ def guided_label_propagation(
         excluded nodes still participate fully and can influence their
         neighbors; only the output is filtered. IDs not present in the
         graph are silently ignored.
+    verbose : bool, default True
+        Print a one-line wall-clock summary at completion (matching
+        :func:`apply_backbone` and :func:`project_bipartite`). Set to
+        ``False`` to suppress.
 
     Returns
     -------
@@ -279,7 +312,8 @@ def guided_label_propagation(
       ``docs/architecture/glp.md``.
     - Algorithm uses sparse matrix operations for memory efficiency on large graphs
     """
-    
+    _t_start = _time.perf_counter()
+
     # Normalize the seed input shape to the canonical Dict[node, label] before
     # any other processing — everything downstream assumes this shape.
     seed_labels = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
@@ -323,6 +357,12 @@ def guided_label_propagation(
             result = _apply_exclude_from_output(result, exclude_from_output)
 
         logger.info("Completed single propagation")
+        _print_glp_summary(
+            "guided_label_propagation", verbose, _t_start,
+            n_nodes=graph.numberOfNodes(), n_edges=graph.numberOfEdges(),
+            n_seeds=len(seed_labels), n_labels=len(labels), alpha=alpha,
+            directional=False,
+        )
         return result
     
     # For directed graphs with directional=True, run both directions. The
@@ -370,6 +410,12 @@ def guided_label_propagation(
             in_result = _apply_exclude_from_output(in_result, exclude_from_output)
 
         logger.info("Completed directional propagation")
+        _print_glp_summary(
+            "guided_label_propagation", verbose, _t_start,
+            n_nodes=graph.numberOfNodes(), n_edges=graph.numberOfEdges(),
+            n_seeds=len(seed_labels), n_labels=len(labels), alpha=alpha,
+            directional=True,
+        )
         return out_result, in_result
 
 
@@ -555,6 +601,7 @@ def ensemble_label_propagation(
     base_seed: int = 42,
     return_variance: bool = False,
     n_workers: Optional[int] = None,
+    verbose: bool = True,
     **glp_kwargs: Any,
 ) -> Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]:
     """
@@ -610,6 +657,9 @@ def ensemble_label_propagation(
         ``min(n_epochs, os.cpu_count())``. Pass ``1`` for serial execution
         (still gets the build-P-once optimization). Values larger than
         ``n_epochs`` are clamped down.
+    verbose : bool, default True
+        Print a one-line wall-clock summary at completion (matching
+        :func:`apply_backbone`). Set to ``False`` to suppress.
     **glp_kwargs
         Any other :func:`guided_label_propagation` keyword arguments. Any
         ``random_seed`` value is overridden per epoch. If
@@ -656,6 +706,8 @@ def ensemble_label_propagation(
       probabilities means a node can have a different dominant label in
       the ensemble than in any single epoch — this is correct, not a bug.
     """
+    _t_start = _time.perf_counter()
+
     if n_epochs < 2:
         raise ConfigurationError(
             f"n_epochs must be >= 2 for ensembling, got {n_epochs}",
@@ -675,8 +727,9 @@ def ensemble_label_propagation(
             stacklevel=2,
         )
         glp_kwargs.pop("random_seed", None)
+        # Inner call prints its own summary; no need to print here.
         return guided_label_propagation(
-            graph, id_mapper, seed_labels, labels, **glp_kwargs
+            graph, id_mapper, seed_labels, labels, verbose=verbose, **glp_kwargs
         )
 
     # random_seed is set per epoch; drop any user-supplied value.
@@ -852,9 +905,22 @@ def ensemble_label_propagation(
 
         return df
 
-    if mean_in is not None:
-        return _assemble(mean_out, m2_out), _assemble(mean_in, m2_in)
-    return _assemble(mean_out, m2_out)
+    is_directional = mean_in is not None
+    if is_directional:
+        result: Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]] = (
+            _assemble(mean_out, m2_out),
+            _assemble(mean_in, m2_in),
+        )
+    else:
+        result = _assemble(mean_out, m2_out)
+
+    _print_glp_summary(
+        "ensemble_label_propagation", verbose, _t_start,
+        n_nodes=graph.numberOfNodes(), n_edges=graph.numberOfEdges(),
+        n_seeds=len(seed_labels), n_labels=len(labels), alpha=alpha,
+        directional=is_directional, n_epochs=n_epochs,
+    )
+    return result
 
 
 def _validate_inputs(
