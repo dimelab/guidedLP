@@ -463,37 +463,92 @@ user_el, user_mapper = project_bipartite(
 #   output_format="dataframe" → pl.DataFrame  (source_id, target_id, weight)
 ```
 
-### 4. Political Affiliation Analysis
+### 4. Evaluating GLP Quality with Held-Out Seeds
+
+`train_test_split_validation` is the standard "is my model good?" check for GLP. It holds out a fraction of your labelled seeds, trains GLP on the rest, and scores predictions on the held-out portion. The returned dict carries accuracy, per-label precision / recall / F1, a confusion matrix, and the sklearn classification report — everything you need to write a results section.
 
 ```python
-# Analyze political leaning in social networks
-from guidedLP.glp.validation import train_test_split_validation
+import polars as pl
 from guidedLP.network.construction import build_graph_from_edgelist
+from guidedLP.glp.validation import train_test_split_validation
 
-# Load political Twitter network
 political_edges = pl.read_csv("political_network.csv")
 graph, id_mapper = build_graph_from_edgelist(
-    political_edges, "follower", "following"
+    political_edges, source_col="follower", target_col="following",
 )
 
-# Define known political accounts as seeds.
-# Any of the four supported shapes works here — label-keyed dict is convenient
-# when you collected seeds in lists per category.
+# Seeds in any SeedInput shape. Label-keyed dict is convenient when you
+# collected accounts in lists per category.
 political_seeds = {
-    "progressive": ["@aoc", "@berniesanders", "@ewarren"],
-    "conservative": ["@realdonaldtrump", "@tedcruz", "@marcorubio"],
+    "progressive":  ["@aoc", "@berniesanders", "@ewarren",
+                     "@progressive_1", "@progressive_2", "@progressive_3"],
+    "conservative": ["@realdonaldtrump", "@tedcruz", "@marcorubio",
+                     "@conservative_1", "@conservative_2", "@conservative_3"],
 }
 
-# Run validation to test accuracy
-metrics = train_test_split_validation(
-    graph=graph,
-    id_mapper=id_mapper,
-    seed_labels=political_seeds,
-    labels=["progressive", "conservative"],
+# Stratified 20% holdout (default). Any guided_label_propagation kwarg can
+# be passed through — alpha, directional, weight_transform, etc.
+results = train_test_split_validation(
+    graph=graph, id_mapper=id_mapper,
+    seed_labels=political_seeds, labels=["progressive", "conservative"],
     test_size=0.2,
+    stratify=True,            # preserve label proportions in the split
+    random_seed=42,           # reproducible
+    alpha=0.85,               # **glp_kwargs — threaded into GLP
+    directional=False,
 )
 
-print(f"Political classification accuracy: {metrics['accuracy']:.3f}")
+# The result dict has everything you need to summarize quality.
+print(f"Train size: {results['train_size']}  Test size: {results['test_size']}")
+print(f"Accuracy:   {results['accuracy']:.3f}")
+print(f"Macro-F1:   {results['macro_f1']:.3f}")
+for label in ["progressive", "conservative"]:
+    p = results["precision"][label]
+    r = results["recall"][label]
+    f = results["f1_score"][label]
+    print(f"  {label:>13}  P={p:.2f}  R={r:.2f}  F1={f:.2f}")
+
+print(results["classification_report"])   # sklearn-formatted per-label table
+print(results["confusion_matrix"])        # rows=true, cols=predicted (np.ndarray)
+
+# Drill into individual errors. `test_predictions` is the raw GLP frame
+# restricted to the held-out seeds; cross-reference against the input
+# seed dict for the ground truth.
+test_df = results["test_predictions"]
+flat_seeds = {k: v for label, ids in political_seeds.items() for k, v in [(i, label) for i in ids]}
+errors = test_df.with_columns(
+    pl.col("node_id").replace_strict(flat_seeds).alias("true_label")
+).filter(pl.col("dominant_label") != pl.col("true_label"))
+print(f"Misclassified: {errors.height} of {test_df.height}")
+```
+
+**Custom test set instead of a random split.** When you have a separately-curated ground-truth set (e.g. hand-labelled accounts you specifically *don't* want in training), pass it via `test_seeds`. Overlapping IDs are pulled out of training; on label conflicts the test set's label wins (with a warning). `test_size`, `stratify`, and `random_seed` are ignored in this mode.
+
+```python
+known_holdout = {
+    "@verified_left_1":  "progressive",  "@verified_left_2":  "progressive",
+    "@verified_right_1": "conservative", "@verified_right_2": "conservative",
+}
+results = train_test_split_validation(
+    graph=graph, id_mapper=id_mapper,
+    seed_labels=political_seeds,        # train on these
+    test_seeds=known_holdout,           # evaluate on these (curated ground truth)
+    labels=["progressive", "conservative"],
+)
+```
+
+**Small seed sets?** A single held-out split is noisy when you only have a handful of seeds per label. `cross_validate` runs K-fold over the seeds and returns mean ± std for each metric — same kwargs as `train_test_split_validation`, more stable estimates:
+
+```python
+from guidedLP.glp.validation import cross_validate
+
+cv = cross_validate(
+    graph=graph, id_mapper=id_mapper,
+    seed_labels=political_seeds, labels=["progressive", "conservative"],
+    k_folds=5, stratify=True, random_seed=42,
+)
+print(f"5-fold CV: accuracy={cv['mean_accuracy']:.3f} ± {cv['std_accuracy']:.3f}, "
+      f"macro-F1={cv['mean_macro_f1']:.3f} ± {cv['std_macro_f1']:.3f}")
 ```
 
 ### 5. Temporal Network Analysis
