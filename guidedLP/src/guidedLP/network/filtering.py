@@ -27,7 +27,7 @@ from guidedLP.common.exceptions import (
     ValidationError,
 )
 from guidedLP.common.logging_config import get_logger, log_function_entry, LoggingTimer
-from guidedLP.network.construction import _extract_edge_arrays
+from guidedLP.network.construction import _build_induced_subgraph, _extract_edge_arrays
 
 logger = get_logger(__name__)
 
@@ -874,7 +874,7 @@ def filter_by_seed_proximity(
             if include_seeds:
                 kept = kept | seed_internals
 
-            new_graph, new_mapper = _rebuild_subgraph(graph, id_mapper, kept)
+            new_graph, new_mapper = _build_induced_subgraph(graph, id_mapper, kept)
 
             if new_graph.numberOfNodes() == 0:
                 raise ComputationError(
@@ -1197,44 +1197,7 @@ def _lte_select(
 
 
 # Subgraph rebuild ----------------------------------------------------------
-
-
-def _rebuild_subgraph(
-    graph: nk.Graph,
-    id_mapper: IDMapper,
-    keep_internal: Set[int],
-) -> Tuple[nk.Graph, IDMapper]:
-    """Build a new graph with contiguous internal IDs ``0..K-1``.
-
-    Unlike ``_apply_masks_to_graph``, which uses ``removeNode`` and leaves
-    holes in the internal ID space, this rebuilds the graph from scratch so
-    downstream matrix operations can rely on ``range(numberOfNodes())``.
-    """
-    sorted_kept = sorted(keep_internal)
-    old_to_new = {old: new for new, old in enumerate(sorted_kept)}
-
-    new_graph = nk.Graph(
-        n=len(sorted_kept),
-        weighted=graph.isWeighted(),
-        directed=graph.isDirected(),
-    )
-
-    new_mapper = IDMapper()
-    for old_id in sorted_kept:
-        try:
-            original = id_mapper.get_original(old_id)
-        except KeyError:
-            continue
-        new_mapper.add_mapping(original, old_to_new[old_id])
-
-    is_weighted = graph.isWeighted()
-    for u, v in graph.iterEdges():
-        if u in keep_internal and v in keep_internal:
-            new_u = old_to_new[u]
-            new_v = old_to_new[v]
-            if is_weighted:
-                new_graph.addEdge(new_u, new_v, graph.weight(u, v))
-            else:
-                new_graph.addEdge(new_u, new_v)
-
-    return new_graph, new_mapper
+# ``_build_induced_subgraph`` is now defined in
+# :mod:`guidedLP.network.construction` so it can be shared with
+# :mod:`guidedLP.network.reduction` (sampling, influence post-pass). It is
+# imported above; this section is left as a marker only.

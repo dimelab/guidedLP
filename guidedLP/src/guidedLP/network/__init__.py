@@ -51,3 +51,11 @@ from .export import (
     export_graph,
     get_export_info
 )
+
+# Reduced-graph export (grouping / influence / sampling)
+from .reduction import (
+    reduce_by_grouping,
+    reduce_by_influence,
+    reduce_by_sampling,
+    export_reduced_graph,
+)

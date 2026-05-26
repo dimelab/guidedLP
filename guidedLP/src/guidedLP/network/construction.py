@@ -1223,6 +1223,67 @@ def _extract_edge_arrays(
     return sources, targets, weights
 
 
+def _build_induced_subgraph(
+    graph: nk.Graph,
+    id_mapper: IDMapper,
+    keep_internal: Set[int],
+) -> Tuple[nk.Graph, IDMapper]:
+    """Build a new graph with contiguous internal IDs ``0..K-1``.
+
+    Unlike approaches that use ``removeNode`` and leave holes in the internal
+    ID space, this rebuilds the graph from scratch so downstream matrix
+    operations can rely on ``range(numberOfNodes())``. Used by filtering,
+    sampling, and influence-based reductions to materialize an induced
+    subgraph plus a fresh mapper whose internals are dense.
+
+    Parameters
+    ----------
+    graph : nk.Graph
+        The source graph.
+    id_mapper : IDMapper
+        Original-ID mapper for ``graph``.
+    keep_internal : Set[int]
+        Internal node IDs (in ``graph``) to retain. Order of iteration is
+        normalized internally via ``sorted()`` so the resulting internal IDs
+        are deterministic for a given input set.
+
+    Returns
+    -------
+    Tuple[nk.Graph, IDMapper]
+        The induced subgraph and a fresh mapper. The new mapper preserves the
+        original IDs of the kept nodes; only the internal IDs are renumbered.
+    """
+    sorted_kept = sorted(keep_internal)
+    old_to_new = {old: new for new, old in enumerate(sorted_kept)}
+
+    new_graph = nk.Graph(
+        n=len(sorted_kept),
+        weighted=graph.isWeighted(),
+        directed=graph.isDirected(),
+    )
+
+    new_mapper = IDMapper()
+    for old_id in sorted_kept:
+        try:
+            original = id_mapper.get_original(old_id)
+        except KeyError:
+            continue
+        new_mapper.add_mapping(original, old_to_new[old_id])
+
+    is_weighted = graph.isWeighted()
+    keep_set = keep_internal if isinstance(keep_internal, set) else set(keep_internal)
+    for u, v in graph.iterEdges():
+        if u in keep_set and v in keep_set:
+            new_u = old_to_new[u]
+            new_v = old_to_new[v]
+            if is_weighted:
+                new_graph.addEdge(new_u, new_v, graph.weight(u, v))
+            else:
+                new_graph.addEdge(new_u, new_v)
+
+    return new_graph, new_mapper
+
+
 def graph_to_edges(graph: nk.Graph, id_mapper: IDMapper) -> pl.DataFrame:
     """Extract a NetworkIt graph's edges into a Polars frame keyed by original IDs.
 
