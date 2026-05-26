@@ -68,6 +68,7 @@ def filter_graph(
     combine: str = "and",
     *,
     output_format: Optional[str] = None,
+    protected_nodes: Optional[List[Any]] = None,
 ) -> Union[Tuple[nk.Graph, IDMapper], pl.DataFrame]:
     """
     Apply various filters to a network based on specified criteria.
@@ -112,6 +113,15 @@ def filter_graph(
     output_format : str, optional
         ``"graph"``, ``"dataframe"``, or ``None`` (default — match input).
         ``output_format="graph"`` with a frame input is not supported.
+    protected_nodes : list, optional
+        Original IDs of nodes that should be exempt from filtering. A
+        protected node always survives node-level filters (degree,
+        component, centrality, etc.), and every edge incident to a
+        protected node always survives edge-level filters (weight,
+        partition degree). Protection is *localized*: if the other
+        endpoint of a protected edge is dropped by some other criterion,
+        the edge disappears with it. IDs not present in the graph / frame
+        produce a warning and are skipped.
 
     Returns
     -------
@@ -177,7 +187,7 @@ def filter_graph(
                 "output_format='graph' with a DataFrame input is not supported. "
                 "Call build_graph_from_edgelist() on the returned frame instead."
             )
-        return _filter_edges_frame(edges, filters, combine)
+        return _filter_edges_frame(edges, filters, combine, protected_nodes)
 
     if not isinstance(edges, nk.Graph):
         raise ValidationError(
@@ -250,6 +260,15 @@ def filter_graph(
             final_node_mask = _combine_masks(node_masks, combine) if node_masks else None
             final_edge_mask = _combine_masks(edge_masks, combine) if edge_masks else None
 
+            # Apply node-protection overrides: force protected nodes (and the
+            # other endpoint of each protected edge) to survive, and force all
+            # incident edges to survive any edge-level filters.
+            if protected_nodes:
+                final_node_mask, final_edge_mask = _apply_node_protection(
+                    graph, id_mapper, protected_nodes,
+                    final_node_mask, final_edge_mask,
+                )
+
             # Apply filters to create new graph
             filtered_graph, updated_mapper = _apply_masks_to_graph(
                 graph, id_mapper, final_node_mask, final_edge_mask
@@ -288,6 +307,7 @@ def _filter_edges_frame(
     df: pl.DataFrame,
     filters: Dict[str, Any],
     combine: str,
+    protected_nodes: Optional[List[Any]] = None,
 ) -> pl.DataFrame:
     """Frame-input branch of :func:`filter_graph`.
 
@@ -300,6 +320,10 @@ def _filter_edges_frame(
     Within each category (node-derived vs. edge-derived predicates) the
     user's ``combine`` choice applies. Between categories the predicates are
     always AND-combined — matching the graph-input path.
+
+    ``protected_nodes`` (original IDs) are merged in at the very end: any
+    edge with at least one protected endpoint is forced into the kept set,
+    so the protected nodes' neighborhood passes through unfiltered.
     """
     required = {"source_id", "target_id", "weight"}
     missing = required - set(df.columns)
@@ -393,6 +417,26 @@ def _filter_edges_frame(
     elif edge_pred is not None:
         final = edge_pred
     else:
+        final = None
+
+    # Protection override: any edge with at least one protected endpoint
+    # is forced kept, regardless of the assembled filter predicates.
+    if protected_nodes:
+        protected_dedup = list(dict.fromkeys(protected_nodes))
+        all_nodes_in_frame = set(degrees["node"].to_list())
+        missing = [n for n in protected_dedup if n not in all_nodes_in_frame]
+        if missing:
+            logger.warning(
+                f"{len(missing)} of {len(protected_dedup)} protected nodes "
+                f"not present in edge frame (first few: {missing[:5]})"
+            )
+        protection_pred = (
+            pl.col("source_id").is_in(protected_dedup)
+            | pl.col("target_id").is_in(protected_dedup)
+        )
+        final = protection_pred if final is None else (final | protection_pred)
+
+    if final is None:
         return df
 
     out = df.filter(final)
@@ -598,6 +642,65 @@ def _apply_centrality_filter(
 
     mask = np.array(centrality_values) >= min_value
     return mask
+
+
+def _apply_node_protection(
+    graph: nk.Graph,
+    id_mapper: IDMapper,
+    protected_nodes: List[Any],
+    node_mask: Optional[np.ndarray],
+    edge_mask: Optional[np.ndarray],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Force protected nodes (and their incident edges) through node/edge filters.
+
+    Resolves original protected IDs to internal IDs (warns on unknown ones).
+    Returns ``(node_mask, edge_mask)``: True entries are added for protected
+    nodes (so they survive node-level filters) and for every edge with at
+    least one protected endpoint (so they survive edge-level filters).
+
+    Edges from a protected node to a *non-protected* node still disappear if
+    the non-protected endpoint is dropped by some other filter — this is
+    NetworkIt's natural cascade when ``removeNode`` is called and is
+    consistent with the apply_backbone semantics. Protection is *localized*
+    to the protected node; it does not propagate to its neighbors.
+    """
+    protected_internals: Set[int] = set()
+    missing: List[Any] = []
+    for original_id in protected_nodes:
+        try:
+            internal_id = id_mapper.get_internal(original_id)
+        except KeyError:
+            missing.append(original_id)
+            continue
+        if graph.hasNode(internal_id):
+            protected_internals.add(internal_id)
+        else:
+            missing.append(original_id)
+
+    if missing:
+        logger.warning(
+            f"{len(missing)} of {len(protected_nodes)} protected nodes "
+            f"not present in graph (first few: {missing[:5]})"
+        )
+
+    if not protected_internals:
+        return node_mask, edge_mask
+
+    n_nodes = graph.numberOfNodes()
+
+    if node_mask is not None:
+        node_protect_mask = np.zeros(n_nodes, dtype=bool)
+        for i in protected_internals:
+            node_protect_mask[i] = True
+        node_mask = node_mask | node_protect_mask
+
+    if edge_mask is not None:
+        sources, targets, _ = _extract_edge_arrays(graph)
+        prot_arr = np.fromiter(protected_internals, dtype=np.int64)
+        edge_protect_mask = np.isin(sources, prot_arr) | np.isin(targets, prot_arr)
+        edge_mask = edge_mask | edge_protect_mask
+
+    return node_mask, edge_mask
 
 
 def _combine_masks(masks: List[np.ndarray], combine: str) -> np.ndarray:

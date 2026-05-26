@@ -70,6 +70,7 @@ def apply_backbone(
     output_format: Optional[str] = None,
     include_scores: bool = False,
     streaming: bool = False,
+    protected_nodes: Optional[List[Any]] = None,
 ) -> Union[
     Tuple[nk.Graph, IDMapper],
     Tuple[nk.Graph, IDMapper, pl.DataFrame],
@@ -216,6 +217,19 @@ def apply_backbone(
         chained ``with_columns`` plan) and ``method="bipartite_svn"``
         (streaming Polars + chunked ``scipy.poisson.sf``); a no-op for
         the other methods.
+    protected_nodes : list, optional
+        Original IDs of nodes that should be exempt from filtering. Any
+        edge with at least one protected endpoint is forced into the
+        kept set regardless of the method's significance / threshold
+        decision. Protection also overrides ``keep_disconnected=False``
+        (protected nodes survive even if isolated in the backbone) and,
+        for ``method="bipartite_svn"``, ``min_node_retention`` (protected
+        nodes are never dropped by the retention post-filter). When
+        combined with ``target_fraction`` or ``target_edges`` the kept
+        count may exceed the requested budget by the number of protected
+        edges (those are forced kept on top of the method-ranked top-K).
+        IDs not present in the graph / frame / EdgeList produce a
+        warning and are skipped.
 
     Returns
     -------
@@ -296,6 +310,7 @@ def apply_backbone(
             output_format=output_format,
             include_scores=include_scores,
             streaming=streaming,
+            protected_nodes=protected_nodes,
         )
 
     if isinstance(edges, pl.DataFrame):
@@ -320,6 +335,7 @@ def apply_backbone(
             t_start=_t_start,
             include_scores=include_scores,
             streaming=streaming,
+            protected_nodes=protected_nodes,
         )
 
     if not isinstance(edges, nk.Graph):
@@ -389,6 +405,13 @@ def apply_backbone(
             return empty_graph, empty_mapper, _empty_edges_df(method)
         return empty_graph, empty_mapper
 
+    # Resolve protected originals → internal IDs once. The helpers downstream
+    # only need the integer set in the ID space of the edge frame they
+    # operate on, which on this path is the graph's internal IDs.
+    protected_internals: Set[int] = _resolve_protected_internals(
+        protected_nodes, id_mapper, graph,
+    )
+
     with LoggingTimer("apply_backbone", {
         "method": method,
         "nodes": graph.numberOfNodes(),
@@ -400,6 +423,7 @@ def apply_backbone(
                     graph, id_mapper, alpha, target_edges,
                     keep_disconnected, return_edges_for_path,
                     top_k_override=top_k_override,
+                    protected_internals=protected_internals,
                 )
             elif method == "noise_corrected":
                 result = _apply_noise_corrected_filter(
@@ -407,6 +431,7 @@ def apply_backbone(
                     keep_disconnected, return_edges_for_path,
                     streaming=streaming,
                     top_k_override=top_k_override,
+                    protected_internals=protected_internals,
                 )
             elif method == "bipartite_svn":
                 result = _apply_bipartite_svn_filter(
@@ -415,16 +440,19 @@ def apply_backbone(
                     return_edges_for_path,
                     top_k_override=top_k_override,
                     streaming=streaming,
+                    protected_internals=protected_internals,
                 )
             elif method == "weight":
                 result = _apply_weight_threshold(
                     graph, id_mapper, target_edges, weight_threshold,
                     keep_disconnected, return_edges_for_path,
+                    protected_internals=protected_internals,
                 )
             elif method == "degree":
                 result = _apply_degree_threshold(
                     graph, id_mapper, target_nodes,
                     keep_disconnected, return_edges_for_path,
+                    protected_internals=protected_internals,
                 )
             else:
                 # Defensive: _validate_backbone_parameters already guards this.
@@ -477,6 +505,7 @@ def _apply_backbone_frame_path(
     t_start: float,
     include_scores: bool = False,
     streaming: bool = False,
+    protected_nodes: Optional[List[Any]] = None,
 ) -> pl.DataFrame:
     """Frame-input branch of :func:`apply_backbone`.
 
@@ -511,17 +540,21 @@ def _apply_backbone_frame_path(
     if target_fraction is not None:
         top_k_override = max(1, int(np.ceil(target_fraction * n_in)))
 
+    protected_list = _resolve_protected_in_frame(protected_nodes, edges_df) or None
+
     with LoggingTimer("apply_backbone", {"method": method, "edges": n_in, "input": "frame"}):
         try:
             if method == "disparity":
                 result_df = _disparity_on_edges(
                     edges_df, directed, alpha, target_edges,
                     top_k_override=top_k_override,
+                    protected_node_ids=protected_list,
                 )
             elif method == "noise_corrected":
                 result_df = _noise_corrected_on_edges(
                     edges_df, directed, threshold, streaming=streaming,
                     top_k_override=top_k_override,
+                    protected_node_ids=protected_list,
                 )
             elif method == "bipartite_svn":
                 # Treat as weighted if the column actually carries variation.
@@ -530,11 +563,18 @@ def _apply_backbone_frame_path(
                 result_df, _ = _bipartite_svn_on_edges(
                     edges_df, alpha, correction, min_node_retention, is_weighted_effective,
                     top_k_override=top_k_override, streaming=streaming,
+                    protected_node_ids=protected_list,
                 )
             elif method == "weight":
-                result_df = _weight_threshold_on_edges(edges_df, target_edges, weight_threshold)
+                result_df = _weight_threshold_on_edges(
+                    edges_df, target_edges, weight_threshold,
+                    protected_node_ids=protected_list,
+                )
             elif method == "degree":
-                result_df, _ = _degree_threshold_on_edges(edges_df, target_nodes)
+                result_df, _ = _degree_threshold_on_edges(
+                    edges_df, target_nodes,
+                    protected_node_ids=protected_list,
+                )
             else:
                 raise ValidationError(f"Unsupported backbone method: {method}")
 
@@ -602,6 +642,7 @@ def _apply_backbone_edgelist_path(
     output_format: Optional[str],
     include_scores: bool,
     streaming: bool = False,
+    protected_nodes: Optional[List[Any]] = None,
 ) -> Union[Tuple[EdgeList, IDMapper], pl.DataFrame]:
     """EdgeList-input branch of :func:`apply_backbone`.
 
@@ -660,17 +701,33 @@ def _apply_backbone_edgelist_path(
             return empty_df if include_scores else _slim_edges_df(empty_df)
         return edge_list, id_mapper
 
+    # EdgeList ``src``/``tgt`` are coded integer IDs paired with id_mapper —
+    # translate originals → codes once, casting to the frame's dtype so the
+    # ``is_in`` checks downstream don't trip on type mismatches.
+    protected_codes_internals = _resolve_protected_internals(
+        protected_nodes, id_mapper,
+    )
+    protected_codes: Optional[List[int]] = None
+    if protected_codes_internals:
+        protected_codes = (
+            pl.Series("protected", sorted(protected_codes_internals))
+            .cast(edge_list.code_dtype)
+            .to_list()
+        )
+
     with LoggingTimer("apply_backbone", {"method": method, "edges": n_in, "input": "edgelist"}):
         try:
             if method == "disparity":
                 result_df = _disparity_on_edges(
                     edges_df, edge_list.directed, alpha, target_edges,
                     top_k_override=top_k_override,
+                    protected_node_ids=protected_codes,
                 )
             elif method == "noise_corrected":
                 result_df = _noise_corrected_on_edges(
                     edges_df, edge_list.directed, threshold, streaming=streaming,
                     top_k_override=top_k_override,
+                    protected_node_ids=protected_codes,
                 )
             elif method == "bipartite_svn":
                 w = edges_df["weight"].to_numpy()
@@ -678,13 +735,18 @@ def _apply_backbone_edgelist_path(
                 result_df, _ = _bipartite_svn_on_edges(
                     edges_df, alpha, correction, min_node_retention, is_weighted_effective,
                     top_k_override=top_k_override, streaming=streaming,
+                    protected_node_ids=protected_codes,
                 )
             elif method == "weight":
                 result_df = _weight_threshold_on_edges(
                     edges_df, target_edges, weight_threshold,
+                    protected_node_ids=protected_codes,
                 )
             elif method == "degree":
-                result_df, _ = _degree_threshold_on_edges(edges_df, target_nodes)
+                result_df, _ = _degree_threshold_on_edges(
+                    edges_df, target_nodes,
+                    protected_node_ids=protected_codes,
+                )
             else:
                 raise ValidationError(f"Unsupported backbone method: {method}")
 
@@ -852,6 +914,7 @@ def _disparity_on_edges(
     target_edges: Optional[int] = None,
     *,
     top_k_override: Optional[int] = None,
+    protected_node_ids: Optional[List[Any]] = None,
 ) -> pl.DataFrame:
     """Serrano et al. (2009) disparity filter on an edge frame.
 
@@ -1031,6 +1094,8 @@ def _disparity_on_edges(
                     pl.col("_idx").is_in(sorted_valid["_idx"]).alias("kept")
                 ).drop("_idx")
 
+    work = _apply_protection_to_kept(work, protected_node_ids)
+
     return work.select([
         "source_id", "target_id", "weight",
         "p_value", "alpha_score", "kept",
@@ -1059,6 +1124,7 @@ def _apply_disparity_filter(
     return_filtered_edges: bool,
     *,
     top_k_override: Optional[int] = None,
+    protected_internals: Optional[Set[int]] = None,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
     """Graph-shim around :func:`_disparity_on_edges`."""
     logger.debug("Applying disparity filter with alpha=%.3f", alpha)
@@ -1082,6 +1148,7 @@ def _apply_disparity_filter(
     scored = _disparity_on_edges(
         edge_df, directed, alpha, target_edges,
         top_k_override=top_k_override,
+        protected_node_ids=sorted(protected_internals) if protected_internals else None,
     )
 
     kept_df = scored.filter(pl.col("kept"))
@@ -1091,6 +1158,7 @@ def _apply_disparity_filter(
         kept_targets=kept_df["target_id"].to_numpy(),
         kept_weights=kept_df["weight"].to_numpy(),
         keep_disconnected=keep_disconnected, id_mapper=id_mapper,
+        protected_internals=protected_internals,
     )
 
     if return_filtered_edges:
@@ -1153,6 +1221,7 @@ def _noise_corrected_on_edges(
     *,
     streaming: bool = False,
     top_k_override: Optional[int] = None,
+    protected_node_ids: Optional[List[Any]] = None,
 ) -> pl.DataFrame:
     """Coscia & Neffke (2017) noise-corrected backbone on an edge frame.
 
@@ -1346,6 +1415,8 @@ def _noise_corrected_on_edges(
             .drop("_idx")
         )
 
+    scored = _apply_protection_to_kept(scored, protected_node_ids)
+
     return scored
 
 
@@ -1358,6 +1429,7 @@ def _apply_noise_corrected_filter(
     *,
     streaming: bool = False,
     top_k_override: Optional[int] = None,
+    protected_internals: Optional[Set[int]] = None,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
     """Graph-shim around :func:`_noise_corrected_on_edges`."""
     logger.debug("Applying noise-corrected backbone with threshold=%.3f", threshold)
@@ -1381,6 +1453,7 @@ def _apply_noise_corrected_filter(
     scored = _noise_corrected_on_edges(
         edge_df, directed, threshold, streaming=streaming,
         top_k_override=top_k_override,
+        protected_node_ids=sorted(protected_internals) if protected_internals else None,
     )
 
     kept_df = scored.filter(pl.col("kept"))
@@ -1390,6 +1463,7 @@ def _apply_noise_corrected_filter(
         kept_targets=kept_df["target_id"].to_numpy(),
         kept_weights=kept_df["weight"].to_numpy(),
         keep_disconnected=keep_disconnected, id_mapper=id_mapper,
+        protected_internals=protected_internals,
     )
 
     if return_filtered_edges:
@@ -1413,6 +1487,7 @@ def _bipartite_svn_on_edges(
     *,
     top_k_override: Optional[int] = None,
     streaming: bool = False,
+    protected_node_ids: Optional[List[Any]] = None,
 ) -> Tuple[pl.DataFrame, Set[Any]]:
     """Tumminello et al. (2011) SVN filter on a bipartite edge frame.
 
@@ -1573,6 +1648,8 @@ def _bipartite_svn_on_edges(
         pl.Series("kept", keep_mask),
     ])
 
+    work = _apply_protection_to_kept(work, protected_node_ids)
+
     dropped_nodes: Set[Any] = set()
     if min_node_retention is not None:
         # original_degree was computed alongside the strengths above
@@ -1605,6 +1682,8 @@ def _bipartite_svn_on_edges(
         )
         dropped_frame = retention.filter(pl.col("ratio") < min_node_retention)
         dropped_nodes = set(dropped_frame["node"].to_list())
+        if protected_node_ids:
+            dropped_nodes -= set(protected_node_ids)
 
         if dropped_nodes:
             work = work.with_columns(
@@ -1650,6 +1729,7 @@ def _apply_bipartite_svn_filter(
     *,
     top_k_override: Optional[int] = None,
     streaming: bool = False,
+    protected_internals: Optional[Set[int]] = None,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
     """Graph-shim around :func:`_bipartite_svn_on_edges`.
 
@@ -1676,9 +1756,11 @@ def _apply_bipartite_svn_filter(
         "target_id": v_arr,
         "weight": w_arr,
     })
+    protected_list = sorted(protected_internals) if protected_internals else None
     scored, dropped_internal_nodes = _bipartite_svn_on_edges(
         edge_df, alpha, correction, min_node_retention, is_weighted_effective,
         top_k_override=top_k_override, streaming=streaming,
+        protected_node_ids=protected_list,
     )
 
     kept_df = scored.filter(pl.col("kept"))
@@ -1698,15 +1780,20 @@ def _apply_bipartite_svn_filter(
             backbone_graph.addEdge(int(u), int(v))
 
     # Drop retention-flagged nodes explicitly (these may differ from
-    # "no surviving edges" only when keep_disconnected=True).
+    # "no surviving edges" only when keep_disconnected=True). Protected
+    # internals are already excluded from ``dropped_internal_nodes`` by
+    # the on-edges helper.
     for node in dropped_internal_nodes:
         if backbone_graph.hasNode(int(node)):
             backbone_graph.removeNode(int(node))
 
     if not keep_disconnected:
+        protected_set = protected_internals or set()
         nodes_to_remove = [
             node for node in range(backbone_graph.numberOfNodes())
-            if backbone_graph.hasNode(node) and backbone_graph.degree(node) == 0
+            if backbone_graph.hasNode(node)
+            and backbone_graph.degree(node) == 0
+            and node not in protected_set
         ]
         for node in nodes_to_remove:
             backbone_graph.removeNode(node)
@@ -1768,6 +1855,8 @@ def _weight_threshold_on_edges(
     df: pl.DataFrame,
     target_edges: Optional[int] = None,
     weight_threshold: Optional[float] = None,
+    *,
+    protected_node_ids: Optional[List[Any]] = None,
 ) -> pl.DataFrame:
     """Weight-threshold filter on an edge frame.
 
@@ -1810,11 +1899,13 @@ def _weight_threshold_on_edges(
         keep_mask = weights >= threshold
         logger.debug("Weight threshold: %s (median fallback)", threshold)
 
-    return df.with_columns([
+    out = df.with_columns([
         pl.lit(float("nan"), dtype=pl.Float64).alias("p_value"),
         pl.lit(float("nan"), dtype=pl.Float64).alias("alpha_score"),
         pl.Series("kept", keep_mask),
-    ]).select(["source_id", "target_id", "weight", "p_value", "alpha_score", "kept"])
+    ])
+    out = _apply_protection_to_kept(out, protected_node_ids)
+    return out.select(["source_id", "target_id", "weight", "p_value", "alpha_score", "kept"])
 
 
 def _apply_weight_threshold(
@@ -1824,6 +1915,8 @@ def _apply_weight_threshold(
     weight_threshold: Optional[float],
     keep_disconnected: bool,
     return_filtered_edges: bool,
+    *,
+    protected_internals: Optional[Set[int]] = None,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
     """Graph-shim around :func:`_weight_threshold_on_edges`."""
     if not graph.isWeighted():
@@ -1845,7 +1938,10 @@ def _apply_weight_threshold(
         "target_id": targets,
         "weight": weights,
     })
-    scored = _weight_threshold_on_edges(edge_df, target_edges, weight_threshold)
+    scored = _weight_threshold_on_edges(
+        edge_df, target_edges, weight_threshold,
+        protected_node_ids=sorted(protected_internals) if protected_internals else None,
+    )
 
     kept_df = scored.filter(pl.col("kept"))
     backbone_graph, updated_mapper = _assemble_backbone(
@@ -1854,6 +1950,7 @@ def _apply_weight_threshold(
         kept_targets=kept_df["target_id"].to_numpy(),
         kept_weights=kept_df["weight"].to_numpy(),
         keep_disconnected=keep_disconnected, id_mapper=id_mapper,
+        protected_internals=protected_internals,
     )
 
     if return_filtered_edges:
@@ -1871,6 +1968,8 @@ def _apply_weight_threshold(
 def _degree_threshold_on_edges(
     df: pl.DataFrame,
     target_nodes: Optional[int] = None,
+    *,
+    protected_node_ids: Optional[List[Any]] = None,
 ) -> Tuple[pl.DataFrame, pl.DataFrame]:
     """Degree-threshold filter on an edge frame.
 
@@ -1916,6 +2015,13 @@ def _degree_threshold_on_edges(
         logger.debug("Degree threshold: %d (median fallback)", threshold)
 
     node_df = degrees.with_columns(pl.Series("kept_node", node_keep_mask))
+    # Force protected nodes into the kept-node set so the edge predicate
+    # below admits any edge between them and any other kept node.
+    if protected_node_ids:
+        node_df = node_df.with_columns(
+            (pl.col("kept_node") | pl.col("node").is_in(protected_node_ids))
+            .alias("kept_node")
+        )
     kept_node_ids = node_df.filter(pl.col("kept_node"))["node"].to_list()
 
     edge_out = df.with_columns([
@@ -1925,7 +2031,9 @@ def _degree_threshold_on_edges(
             pl.col("source_id").is_in(kept_node_ids)
             & pl.col("target_id").is_in(kept_node_ids)
         ).alias("kept"),
-    ]).select(["source_id", "target_id", "weight", "p_value", "alpha_score", "kept"])
+    ])
+    edge_out = _apply_protection_to_kept(edge_out, protected_node_ids)
+    edge_out = edge_out.select(["source_id", "target_id", "weight", "p_value", "alpha_score", "kept"])
 
     return edge_out, node_df
 
@@ -1936,6 +2044,8 @@ def _apply_degree_threshold(
     target_nodes: Optional[int],
     keep_disconnected: bool,
     return_filtered_edges: bool,
+    *,
+    protected_internals: Optional[Set[int]] = None,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[nk.Graph, IDMapper, pl.DataFrame]]:
     """Graph-shim around :func:`_degree_threshold_on_edges`."""
     n_nodes = graph.numberOfNodes()
@@ -1948,7 +2058,10 @@ def _apply_degree_threshold(
         "target_id": targets,
         "weight": weights,
     })
-    scored, node_df = _degree_threshold_on_edges(edge_df, target_nodes)
+    scored, node_df = _degree_threshold_on_edges(
+        edge_df, target_nodes,
+        protected_node_ids=sorted(protected_internals) if protected_internals else None,
+    )
 
     kept_df = scored.filter(pl.col("kept"))
     kept_sources = kept_df["source_id"].to_numpy()
@@ -1957,16 +2070,23 @@ def _apply_degree_threshold(
 
     # `keep_disconnected` here controls whether high-degree nodes that
     # lost all their edges are preserved (True) or dropped (False).
-    if keep_disconnected:
-        node_survives = np.zeros(n_nodes, dtype=bool)
-        if node_df.height > 0:
-            kept_nodes = node_df.filter(pl.col("kept_node"))["node"].to_numpy().astype(np.int64)
-            node_survives[kept_nodes] = True
-    else:
-        node_survives = np.zeros(n_nodes, dtype=bool)
-        if kept_sources.size > 0:
-            node_survives[kept_sources] = True
-            node_survives[kept_targets] = True
+    node_survives = np.zeros(n_nodes, dtype=bool)
+    if keep_disconnected and node_df.height > 0:
+        kept_nodes = node_df.filter(pl.col("kept_node"))["node"].to_numpy().astype(np.int64)
+        node_survives[kept_nodes] = True
+
+    # Always include endpoints of any kept edge: under normal degree-filter
+    # operation every kept edge's endpoints already satisfy the threshold,
+    # but protection can force a kept edge whose neighbor is *not* in
+    # ``kept_node`` — the addEdge below would KeyError without this.
+    if kept_sources.size > 0:
+        node_survives[kept_sources] = True
+        node_survives[kept_targets] = True
+
+    if protected_internals:
+        for i in protected_internals:
+            if 0 <= int(i) < n_nodes:
+                node_survives[int(i)] = True
 
     surviving_node_ids = np.where(node_survives)[0]
     node_mapping = {int(old): new for new, old in enumerate(surviving_node_ids)}
@@ -1999,6 +2119,84 @@ def _apply_degree_threshold(
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+def _apply_protection_to_kept(
+    df: pl.DataFrame,
+    protected_node_ids: Optional[List[Any]],
+) -> pl.DataFrame:
+    """Force ``kept=True`` for any edge with at least one protected endpoint.
+
+    No-op when ``protected_node_ids`` is empty/None. The IDs must live in the
+    same value space as the frame's ``source_id`` / ``target_id`` columns
+    (internal IDs on the graph path, originals on the frame path, codes on
+    the EdgeList path).
+    """
+    if not protected_node_ids:
+        return df
+    return df.with_columns(
+        (
+            pl.col("kept")
+            | pl.col("source_id").is_in(protected_node_ids)
+            | pl.col("target_id").is_in(protected_node_ids)
+        ).alias("kept")
+    )
+
+
+def _resolve_protected_internals(
+    protected_nodes: Optional[List[Any]],
+    id_mapper: Optional[IDMapper],
+    graph: Optional[nk.Graph] = None,
+) -> Set[int]:
+    """Translate original protected IDs to internal IDs (warns on misses).
+
+    Returns an empty set if ``protected_nodes`` is falsy or no IDs resolve.
+    When ``graph`` is given, also verifies each ID is present in the graph;
+    missing/invalid IDs are warned and skipped (matching the convention used
+    by ``nodes`` / ``exclude_nodes`` filters elsewhere in the codebase).
+    """
+    if not protected_nodes or id_mapper is None:
+        return set()
+
+    deduped: List[Any] = list(dict.fromkeys(protected_nodes))
+    resolved: Set[int] = set()
+    missing: List[Any] = []
+    for original_id in deduped:
+        try:
+            internal_id = id_mapper.get_internal(original_id)
+        except KeyError:
+            missing.append(original_id)
+            continue
+        if graph is not None and not graph.hasNode(internal_id):
+            missing.append(original_id)
+            continue
+        resolved.add(int(internal_id))
+
+    if missing:
+        logger.warning(
+            "%d of %d protected nodes not present in graph (first few: %s)",
+            len(missing), len(deduped), missing[:5],
+        )
+
+    return resolved
+
+
+def _resolve_protected_in_frame(
+    protected_nodes: Optional[List[Any]],
+    edges_df: pl.DataFrame,
+) -> List[Any]:
+    """Deduplicate ``protected_nodes`` and warn about IDs absent from the frame."""
+    if not protected_nodes:
+        return []
+    deduped: List[Any] = list(dict.fromkeys(protected_nodes))
+    in_frame = set(edges_df["source_id"].to_list()) | set(edges_df["target_id"].to_list())
+    missing = [n for n in deduped if n not in in_frame]
+    if missing:
+        logger.warning(
+            "%d of %d protected nodes not present in edge frame (first few: %s)",
+            len(missing), len(deduped), missing[:5],
+        )
+    return deduped
+
+
 def _assemble_backbone(
     n_nodes: int,
     directed: bool,
@@ -2008,6 +2206,7 @@ def _assemble_backbone(
     kept_weights: np.ndarray,
     keep_disconnected: bool,
     id_mapper: IDMapper,
+    protected_internals: Optional[Set[int]] = None,
 ) -> Tuple[nk.Graph, IDMapper]:
     """Construct the backbone graph and updated id mapper.
 
@@ -2015,6 +2214,9 @@ def _assemble_backbone(
     set as the original. Otherwise, isolated nodes are dropped and the
     surviving nodes are renumbered to a consecutive 0..N-1 internal-ID
     space (the new id_mapper reflects this renumbering).
+
+    ``protected_internals`` (internal IDs) are always retained even when
+    ``keep_disconnected=False`` and the node has no kept edges.
     """
     if keep_disconnected:
         backbone_graph = nk.Graph(n_nodes, weighted=weighted, directed=directed)
@@ -2025,10 +2227,13 @@ def _assemble_backbone(
                 backbone_graph.addEdge(int(u), int(v))
         return backbone_graph, id_mapper
 
-    if kept_sources.size == 0:
+    if kept_sources.size == 0 and not protected_internals:
         return nk.Graph(0, weighted=weighted, directed=directed), IDMapper()
 
-    connected = sorted({int(x) for x in kept_sources} | {int(x) for x in kept_targets})
+    connected_set = {int(x) for x in kept_sources} | {int(x) for x in kept_targets}
+    if protected_internals:
+        connected_set |= {int(i) for i in protected_internals}
+    connected = sorted(connected_set)
     node_mapping = {old: new for new, old in enumerate(connected)}
 
     backbone_graph = nk.Graph(len(connected), weighted=weighted, directed=directed)

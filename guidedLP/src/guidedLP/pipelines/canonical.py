@@ -145,6 +145,8 @@ def run_canonical_pipeline(
     # Stage 4: projection backbone.
     projection_threshold: float = 1.0,
     projection_target_fraction: Optional[float] = None,
+    # Cross-stage protection.
+    protected_nodes: Optional[List[Any]] = None,
     # Memory & I/O.
     memory_mode: MemoryMode = "balanced",
     checkpoint_dir: Optional[Union[str, Path]] = None,
@@ -202,6 +204,17 @@ def run_canonical_pipeline(
         ``apply_backbone(method="noise_corrected")`` parameters.
         ``projection_target_fraction`` is the recommended way to size
         the final backbone on directed projections.
+    protected_nodes : list, optional
+        Original IDs to exempt from filtering in *both* backbone stages.
+        Edges incident to a protected node are forced kept by stage 2
+        (bipartite_svn) and stage 4 (noise_corrected); protected nodes
+        also survive each stage's ``min_node_retention`` /
+        ``keep_disconnected`` post-passes. The same list is forwarded to
+        both calls — IDs that aren't present in a given stage's mapper
+        produce a warning and are skipped, so it's safe to pass a list
+        that only some stages know about (typical use: protect specific
+        ``projected_col`` nodes, which exist in both the bipartite and
+        projection mappers).
     memory_mode : {"fast", "balanced", "low"}, default "balanced"
         See module docstring. In short: ``"fast"`` runs the backbones
         in-memory for max throughput; ``"balanced"`` and ``"low"``
@@ -360,6 +373,7 @@ def run_canonical_pipeline(
             target_fraction=bipartite_target_fraction,
             streaming=stream_backbones,
             verbose=verbose,
+            protected_nodes=protected_nodes,
         )
         stats.append(StageStats(
             name="apply_backbone(bipartite_svn)",
@@ -446,6 +460,7 @@ def run_canonical_pipeline(
             target_fraction=projection_target_fraction,
             streaming=stream_backbones,
             verbose=verbose,
+            protected_nodes=protected_nodes,
         )
         stats.append(StageStats(
             name="apply_backbone(noise_corrected)",

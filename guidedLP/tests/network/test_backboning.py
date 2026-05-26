@@ -1060,5 +1060,146 @@ class TestBackboneEdgeCasesPorted:
         assert backbone.numberOfEdges() >= 0
 
 
+class TestApplyBackboneProtectedNodes:
+    """``protected_nodes`` exemption across methods + input paths."""
+
+    def _star_graph(self):
+        """5-leaf star with one strong arm; the rest are weak."""
+        edges = pl.DataFrame({
+            "source": ["center"] * 5,
+            "target": ["l1", "l2", "l3", "l4", "l5"],
+            "weight": [1.0, 1.0, 1.0, 1.0, 10.0],
+        })
+        return build_graph_from_edgelist(edges, weight_col="weight")
+
+    def test_protected_node_keeps_weak_edge_disparity(self):
+        """Weak-edge endpoint marked protected → its edge is forced kept."""
+        g, m = self._star_graph()
+        # Without protection a tight disparity drops most weak edges; with
+        # l1 protected, the (center, l1) edge must survive.
+        backbone, _, edges = apply_backbone(
+            g, m, method="disparity", alpha=0.01,
+            return_filtered_edges=True,
+            protected_nodes=["l1"],
+        )
+        kept_l1 = edges.filter(
+            ((pl.col("source_id") == "l1") | (pl.col("target_id") == "l1"))
+            & pl.col("kept")
+        )
+        assert kept_l1.height == 1
+        assert backbone.numberOfEdges() >= 1
+
+    def test_protected_node_weight_method(self):
+        """``method='weight'`` with a low target — weak edge survives via protection."""
+        edges = pl.DataFrame({
+            "source": ["a", "a", "a"],
+            "target": ["b", "c", "d"],
+            "weight": [1.0, 5.0, 10.0],
+        })
+        g, m = build_graph_from_edgelist(edges, weight_col="weight")
+        # target_edges=1 would normally keep only the (a, d, 10) edge.
+        backbone, mapper = apply_backbone(
+            g, m, method="weight", target_edges=1,
+            protected_nodes=["b"],
+        )
+        # Now b's edge (a-b) must also be kept → 2 edges total.
+        assert backbone.numberOfEdges() == 2
+
+    def test_protected_node_degree_method(self):
+        """``method='degree'`` — protected low-degree node survives and its edge holds."""
+        # Hub-and-spoke + an outlier pair: hub has high degree, spokes & pair are low.
+        edges = pl.DataFrame({
+            "source": ["hub", "hub", "hub", "hub", "x"],
+            "target": ["s1", "s2", "s3", "s4", "y"],
+            "weight": [1.0] * 5,
+        })
+        g, m = build_graph_from_edgelist(edges, weight_col="weight")
+        # target_nodes=2 keeps hub + one of its spokes (or rather: top-2 by degree).
+        # hub has degree 4, all others have degree 1 — so kept = {hub, one tied spoke}.
+        # Protect 'x' (degree 1) → x survives, and edge x-y is forced kept,
+        # so y also survives.
+        backbone, mapper = apply_backbone(
+            g, m, method="degree", target_nodes=2,
+            protected_nodes=["x"],
+        )
+        # x must be in the surviving set.
+        survivors = {mapper.get_original(i) for i in range(backbone.numberOfNodes())
+                     if backbone.hasNode(i)}
+        assert "x" in survivors
+        # Edge x-y kept → y also present.
+        assert "y" in survivors
+
+    def test_protection_overrides_keep_disconnected(self):
+        """``keep_disconnected=False`` cannot remove a protected node."""
+        # Build a graph where protected node 'iso' has no incident edges that
+        # would survive any reasonable score-based filter — but we'll fake it
+        # by giving it a weight-1 edge in a graph dominated by weight-100 edges.
+        edges = pl.DataFrame({
+            "source": ["a", "b", "iso"],
+            "target": ["b", "c", "side"],
+            "weight": [100.0, 100.0, 1.0],
+        })
+        g, m = build_graph_from_edgelist(edges, weight_col="weight")
+        # Weight threshold cuts the iso-side edge; without protection iso is
+        # isolated and dropped. With protection iso (and its edge) survive.
+        backbone, mapper = apply_backbone(
+            g, m, method="weight", weight_threshold=50.0,
+            protected_nodes=["iso"], keep_disconnected=False,
+        )
+        survivors = {mapper.get_original(i) for i in range(backbone.numberOfNodes())
+                     if backbone.hasNode(i)}
+        assert "iso" in survivors
+
+    def test_protection_overrides_min_node_retention(self):
+        """``min_node_retention`` does not remove protected nodes (bipartite_svn)."""
+        # A bipartite-ish graph; we run bipartite_svn with an aggressive
+        # retention threshold and check protected survives.
+        rng = np.random.default_rng(0)
+        users = [f"u{i}" for i in range(8)]
+        items = [f"i{i}" for i in range(8)]
+        srcs, tgts, wgts = [], [], []
+        for u in users:
+            for it in rng.choice(items, size=3, replace=False):
+                srcs.append(u); tgts.append(it); wgts.append(float(rng.integers(1, 5)))
+        edges = pl.DataFrame({"source": srcs, "target": tgts, "weight": wgts})
+        g, m = build_graph_from_edgelist(edges, weight_col="weight")
+
+        backbone, mapper = apply_backbone(
+            g, m, method="bipartite_svn", alpha=0.5, correction="fdr_bh",
+            min_node_retention=0.95,  # very strict; would normally drop most users
+            protected_nodes=["u0"], keep_disconnected=True,
+        )
+        survivors = {mapper.get_original(i) for i in range(backbone.numberOfNodes())
+                     if backbone.hasNode(i)}
+        assert "u0" in survivors
+
+    def test_protected_node_frame_input(self):
+        """Frame-input path forwards ``protected_nodes`` to the kept mask."""
+        edges = pl.DataFrame({
+            "source_id": ["a", "a", "a"],
+            "target_id": ["b", "c", "d"],
+            "weight": [1.0, 5.0, 10.0],
+        })
+        out = apply_backbone(
+            edges, None, method="weight", target_edges=1,
+            protected_nodes=["b"], verbose=False,
+        )
+        # Lean output: two rows now (a-d via score, a-b via protection).
+        assert out.height == 2
+
+    def test_missing_protected_id_warns(self, caplog):
+        """Unknown protected IDs warn but don't error."""
+        import logging
+        g, m = self._star_graph()
+        with caplog.at_level(logging.WARNING):
+            apply_backbone(
+                g, m, method="disparity", alpha=0.5,
+                protected_nodes=["l1", "does-not-exist"],
+                verbose=False,
+            )
+        assert any("protected nodes not present in graph" in r.message
+                   for r in caplog.records)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

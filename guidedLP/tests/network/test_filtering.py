@@ -328,6 +328,121 @@ class TestFilterGraph:
                     updated_mapper.get_original(internal_id)
 
 
+class TestFilterGraphProtectedNodes:
+    """Protected-nodes exemption in filter_graph (graph + frame paths)."""
+
+    def setup_method(self):
+        # Degrees: A=3, B=4, C=2, D=1, E=2 — same as TestFilterGraph
+        self.graph = nk.Graph(5)
+        self.graph.addEdge(0, 1)
+        self.graph.addEdge(0, 2)
+        self.graph.addEdge(0, 3)
+        self.graph.addEdge(1, 2)
+        self.graph.addEdge(1, 4)
+        self.graph.addEdge(1, 3)
+        self.mapper = IDMapper()
+        for i, name in enumerate(["A", "B", "C", "D", "E"]):
+            self.mapper.add_mapping(name, i)
+
+        # Weighted graph for edge-level tests.
+        self.wgraph = nk.Graph(4, weighted=True)
+        self.wgraph.addEdge(0, 1, 1.0)
+        self.wgraph.addEdge(1, 2, 5.0)
+        self.wgraph.addEdge(2, 3, 3.0)
+        self.wgraph.addEdge(3, 0, 2.0)
+        self.wmapper = IDMapper()
+        for i in range(4):
+            self.wmapper.add_mapping(f"n{i}", i)
+
+    def _surviving(self, g, mapper):
+        out = set()
+        for internal_id in range(max(5, g.numberOfNodes() + 5)):
+            if g.hasNode(internal_id):
+                try:
+                    out.add(mapper.get_original(internal_id))
+                except KeyError:
+                    pass
+        return out
+
+    def test_protected_node_survives_node_filter(self):
+        """A protected node passes a node-level filter it would otherwise fail."""
+        # min_degree=3 normally keeps {A, B}. Protect D (degree=1) → D survives.
+        filtered, new_mapper = filter_graph(
+            self.graph, self.mapper, {"min_degree": 3},
+            protected_nodes=["D"],
+        )
+        survivors = self._surviving(filtered, new_mapper)
+        assert "D" in survivors
+        assert {"A", "B"}.issubset(survivors)
+
+    def test_protected_edge_survives_weight_filter(self):
+        """An edge incident to a protected node survives min_weight."""
+        # Default: min_weight=2.5 drops the (n0, n1, 1.0) edge.
+        filtered, new_mapper = filter_graph(
+            self.wgraph, self.wmapper, {"min_weight": 2.5},
+            protected_nodes=["n0"],
+        )
+        # Edges (n0, n1, 1.0) and (n3, n0, 2.0) touch n0 → both kept.
+        # Edges (n1, n2, 5.0) and (n2, n3, 3.0) pass min_weight themselves.
+        assert filtered.numberOfEdges() == 4
+
+    def test_protection_does_not_propagate_to_neighbors(self):
+        """Neighbors of protected nodes are not implicitly protected."""
+        # min_degree=3 keeps {A, B}. Protect D (degree=1). D survives.
+        # But D's only neighbors are A and B (both kept) — so the edges
+        # A-D, B-D should also survive since both endpoints exist.
+        filtered, new_mapper = filter_graph(
+            self.graph, self.mapper, {"min_degree": 3},
+            protected_nodes=["D"],
+        )
+        survivors = self._surviving(filtered, new_mapper)
+        # E (degree=2) should still be dropped — not a neighbor of D.
+        assert "E" not in survivors
+
+    def test_missing_protected_id_warns(self, caplog):
+        """Unknown protected IDs produce a warning but don't error."""
+        import logging
+        with caplog.at_level(logging.WARNING):
+            filtered, new_mapper = filter_graph(
+                self.graph, self.mapper, {"min_degree": 3},
+                protected_nodes=["D", "ZZZ"],
+            )
+        assert any("protected nodes not present in graph" in r.message
+                   for r in caplog.records)
+
+    def test_protected_node_with_giant_component(self):
+        """Protected node in a small component survives giant_component_only."""
+        # Disconnected graph: comp1 = {0,1,2}, comp2 = {3,4}, isolated = 5.
+        g = nk.Graph(6)
+        g.addEdge(0, 1); g.addEdge(1, 2); g.addEdge(2, 0)
+        g.addEdge(3, 4)
+        m = IDMapper()
+        for i in range(6):
+            m.add_mapping(f"c{i}", i)
+        # Protect c3 from the smaller component.
+        filtered, new_mapper = filter_graph(
+            g, m, {"giant_component_only": True},
+            protected_nodes=["c3"],
+        )
+        survivors = self._surviving(filtered, new_mapper)
+        assert "c3" in survivors
+        assert {"c0", "c1", "c2"}.issubset(survivors)
+
+    def test_protected_node_frame_input(self):
+        """Frame-input path forces protected edges through min_weight."""
+        df = pl.DataFrame({
+            "source_id": ["n0", "n1", "n2", "n3"],
+            "target_id": ["n1", "n2", "n3", "n0"],
+            "weight": [1.0, 5.0, 3.0, 2.0],
+        })
+        out = filter_graph(
+            df, None, {"min_weight": 2.5},
+            protected_nodes=["n0"],
+        )
+        # Same as graph path: all 4 edges kept (two by min_weight, two by protection).
+        assert out.height == 4
+
+
 class TestParameterValidation:
     """Parameter validation for filter_graph."""
 
