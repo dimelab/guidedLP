@@ -556,19 +556,24 @@ class TestInputValidation:
             guided_label_propagation(graph, id_mapper, seed_labels, labels)
     
     def test_missing_seed_nodes(self):
-        """Test validation with seed nodes not in graph."""
+        """Missing seeds are warned and skipped; raise only when none remain."""
         graph = nk.Graph(2, weighted=True)
         graph.addEdge(0, 1, 1.0)
-        
+
         id_mapper = IDMapper()
         id_mapper.add_mapping("A", 0)
         id_mapper.add_mapping("B", 1)
-        
-        seed_labels = {"C": "label1"}  # C not in graph
         labels = ["label1", "label2"]
-        
-        with pytest.raises(ValidationError, match="Seed nodes not found in graph"):
-            guided_label_propagation(graph, id_mapper, seed_labels, labels)
+
+        # Partial misses: warn and skip the unknown seed, propagation succeeds.
+        result = guided_label_propagation(
+            graph, id_mapper, {"A": "label1", "C": "label2"}, labels
+        )
+        assert result.height == 2
+
+        # All seeds missing: raise.
+        with pytest.raises(ValidationError, match="None of the supplied seeds"):
+            guided_label_propagation(graph, id_mapper, {"C": "label1"}, labels)
     
     def test_convergence_failure(self):
         """Test convergence failure handling."""

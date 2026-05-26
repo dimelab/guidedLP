@@ -935,16 +935,25 @@ def _validate_inputs(
             details={"unknown_labels": list(unknown_labels), "valid_labels": labels}
         )
     
-    # Check that all seed nodes exist in the graph (via ID mapper)
-    missing_seeds = []
-    for seed_id in seed_labels.keys():
-        if not id_mapper.has_original(seed_id):
-            missing_seeds.append(seed_id)
-    
+    # Warn about seeds that aren't in the graph and drop them from the dict
+    # in place. This matches the convention used elsewhere in the codebase
+    # (filter_graph, protected_nodes, filter_by_seed_proximity) — unknown IDs
+    # are skipped with a warning; only raise if nothing usable remains.
+    missing_seeds = [s for s in seed_labels.keys() if not id_mapper.has_original(s)]
     if missing_seeds:
+        for s in missing_seeds:
+            del seed_labels[s]
+        logger.warning(
+            f"{len(missing_seeds)} of {len(missing_seeds) + len(seed_labels)} "
+            f"seed nodes not found in graph and were skipped "
+            f"(first few: {missing_seeds[:5]})"
+        )
+
+    if not seed_labels:
         raise ValidationError(
-            f"Seed nodes not found in graph: {missing_seeds[:5]}{'...' if len(missing_seeds) > 5 else ''}",
-            details={"missing_seeds_count": len(missing_seeds), "missing_seeds_sample": missing_seeds[:10]}
+            "None of the supplied seeds are present in the graph.",
+            details={"missing_seeds_count": len(missing_seeds),
+                     "missing_seeds_sample": missing_seeds[:10]},
         )
 
 
