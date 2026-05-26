@@ -2684,7 +2684,7 @@ def temporal_bipartite_to_unipartite(
     edgelist: Union[str, pl.DataFrame, EdgeList],
     source_col: str = "source",
     target_col: str = "target",
-    timestamp_col: Optional[str] = "timestamp",
+    timestamp_col: Optional[str] = None,
     weight_col: Optional[str] = None,
     intermediate_col: str = "target",
     projected_col: str = "source",
@@ -2765,16 +2765,15 @@ def temporal_bipartite_to_unipartite(
     target_col : str, default "target"
         Name of target node column in edgelist. For EdgeList input, the
         column is conceptually ``tgt``.
-    timestamp_col : Optional[str], default "timestamp"
-        Name of timestamp column for the temporal-decay factor in the
-        edge-weight formula. For EdgeList input, the same column name
-        must exist on ``edgelist.df`` (typically because the EdgeList
-        was built with
+    timestamp_col : Optional[str], default None
+        Name of timestamp column. When provided, the temporal-decay
+        factor ``1 / (1 + Δdays)`` is included in the edge weight, and
+        the column must exist on the input (for EdgeList input,
+        typically via
         ``build_edgelist_from_frame(..., passthrough_cols=[timestamp_col])``).
-        Pass ``None`` when the caller has pre-sorted rows by some
-        non-timestamp key — edge direction still follows row order, but
-        the ``Δdays`` term drops out of the weight (see
-        ``add_edge_weights``).
+        When ``None`` (default), the function still trusts the caller's
+        latest-first row order to determine edge direction, but the
+        decay term drops out of the weight (see ``add_edge_weights``).
     weight_col : Optional[str], default None
         Name of weight column. If None, edges get unit weight.
     intermediate_col : str, default "target"
