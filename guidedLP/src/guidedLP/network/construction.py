@@ -2684,7 +2684,7 @@ def temporal_bipartite_to_unipartite(
     edgelist: Union[str, pl.DataFrame, EdgeList],
     source_col: str = "source",
     target_col: str = "target",
-    timestamp_col: str = "timestamp",
+    timestamp_col: Optional[str] = "timestamp",
     weight_col: Optional[str] = None,
     intermediate_col: str = "target",
     projected_col: str = "source",
@@ -2723,14 +2723,21 @@ def temporal_bipartite_to_unipartite(
     .. note::
         **Input order is trusted, not validated.** This function does NOT sort
         the edgelist. The caller is responsible for sorting it so that, within
-        each ``intermediate_col`` group, rows are ordered by ``timestamp_col``
-        **DESCENDING** (latest first). If your data is not in this order the
-        edge directions will be wrong without any error being raised.
+        each ``intermediate_col`` group, rows are ordered **latest first**
+        (i.e. the later sharer of each intermediate node appears earlier in
+        the frame). If your data is not in this order the edge directions
+        will be wrong without any error being raised.
 
         Pre-sort with::
 
             edgelist = edgelist.sort([intermediate_col, timestamp_col],
                                      descending=[False, True])
+
+        Passing ``timestamp_col=None`` is allowed when the caller has
+        already arranged rows in the required latest-first order by some
+        other key (e.g. a monotonic sequence number) — in that case the
+        function trusts row order entirely and the temporal-decay factor
+        drops out of the edge-weight formula (see ``add_edge_weights``).
 
     The algorithm:
 
@@ -2758,11 +2765,16 @@ def temporal_bipartite_to_unipartite(
     target_col : str, default "target"
         Name of target node column in edgelist. For EdgeList input, the
         column is conceptually ``tgt``.
-    timestamp_col : str, default "timestamp"
-        Name of timestamp column for temporal ordering. For EdgeList
-        input, the same column name must exist on ``edgelist.df``
-        (typically because the EdgeList was built with
+    timestamp_col : Optional[str], default "timestamp"
+        Name of timestamp column for the temporal-decay factor in the
+        edge-weight formula. For EdgeList input, the same column name
+        must exist on ``edgelist.df`` (typically because the EdgeList
+        was built with
         ``build_edgelist_from_frame(..., passthrough_cols=[timestamp_col])``).
+        Pass ``None`` when the caller has pre-sorted rows by some
+        non-timestamp key — edge direction still follows row order, but
+        the ``Δdays`` term drops out of the weight (see
+        ``add_edge_weights``).
     weight_col : Optional[str], default None
         Name of weight column. If None, edges get unit weight.
     intermediate_col : str, default "target"
@@ -2774,8 +2786,13 @@ def temporal_bipartite_to_unipartite(
     remove_self_loops : bool, default True
         Whether to remove self-loops in the resulting unipartite graph
     add_edge_weights : bool, default True
-        Whether to calculate edge weights based on temporal relationships.
-        Weight = ``(w_later + w_earlier) / 2 * 1 / (1 + Δdays)``.
+        Whether to calculate edge weights based on endpoint weights and
+        (when available) temporal decay. The formula degrades by which
+        inputs are present:
+
+        - ``timestamp_col`` given → ``(w_later + w_earlier) / 2 * 1 / (1 + Δdays)``
+        - ``timestamp_col=None`` → ``(w_later + w_earlier) / 2`` (no decay term)
+        - ``add_edge_weights=False`` → every edge gets unit weight.
     verbose : bool, default True
         Print a one-line summary at the end.
     id_mapper : IDMapper, optional
@@ -2981,19 +2998,27 @@ def temporal_bipartite_to_unipartite(
         # Step 2: Validate required columns and intermediate/projected wiring.
         if input_is_edgelist:
             # For EdgeList input the side-mapping check already ran above; here
-            # we just need to confirm the timestamp column lives on el.df.
-            required_cols = [inter_col_actual, proj_col_actual, ts_col_actual]
+            # we just need to confirm the timestamp column lives on el.df
+            # (only when a timestamp_col was requested).
+            required_cols = [inter_col_actual, proj_col_actual]
+            if ts_col_actual is not None:
+                required_cols.append(ts_col_actual)
             missing_cols = [c for c in required_cols if c not in working_df.columns]
             if missing_cols:
-                raise DataFormatError(
-                    f"EdgeList is missing required columns: {missing_cols}. "
-                    f"Build it with build_edgelist_from_frame(..., "
+                hint = (
+                    f" Build it with build_edgelist_from_frame(..., "
                     f"passthrough_cols=['{timestamp_col}'], "
                     f"auto_weight=False, remove_duplicates=False) so the "
                     f"timestamp survives onto el.df."
+                    if timestamp_col is not None else ""
+                )
+                raise DataFormatError(
+                    f"EdgeList is missing required columns: {missing_cols}.{hint}"
                 )
         else:
-            required_cols = [source_col, target_col, timestamp_col]
+            required_cols = [source_col, target_col]
+            if timestamp_col is not None:
+                required_cols.append(timestamp_col)
             missing_cols = [c for c in required_cols if c not in working_df.columns]
             if missing_cols:
                 raise DataFormatError(f"Missing required columns: {missing_cols}")
@@ -3023,7 +3048,8 @@ def temporal_bipartite_to_unipartite(
         try:
             # Step 3: Ensure timestamp is Datetime — needed for the
             # temporal weight subtraction below. Does not change row order.
-            if working_df[ts_col_actual].dtype != pl.Datetime:
+            # Skipped when no timestamp_col was requested.
+            if ts_col_actual is not None and working_df[ts_col_actual].dtype != pl.Datetime:
                 try:
                     working_df = working_df.with_columns(
                         pl.col(ts_col_actual).str.to_datetime().alias(ts_col_actual)
@@ -3034,15 +3060,21 @@ def temporal_bipartite_to_unipartite(
                     )
 
             # NOTE: trusts the caller's row order. Input MUST be pre-sorted
-            # by intermediate_col (any order), then timestamp_col DESCENDING
-            # (latest first) within each intermediate-node group. We do not
-            # re-sort because callers working with very large datasets often
-            # pre-sort once and reuse.
-            logger.info(
-                "Assuming pre-sorted input: by %s (grouped), "
-                "then %s DESCENDING within each group",
-                inter_col_actual, ts_col_actual,
-            )
+            # by intermediate_col (any order), then latest-first within each
+            # intermediate-node group. We do not re-sort because callers
+            # working with very large datasets often pre-sort once and reuse.
+            if ts_col_actual is not None:
+                logger.info(
+                    "Assuming pre-sorted input: by %s (grouped), "
+                    "then %s DESCENDING within each group",
+                    inter_col_actual, ts_col_actual,
+                )
+            else:
+                logger.info(
+                    "Assuming pre-sorted input: by %s (grouped), "
+                    "then latest-first within each group (no timestamp_col)",
+                    inter_col_actual,
+                )
 
             # Step 4: Vectorized temporal projection (Polars self-join).
             # Replaces the legacy per-group Python loop that built lists of
@@ -3191,7 +3223,7 @@ def _compute_temporal_projection_frame(
     df: pl.DataFrame,
     intermediate_col: str,
     projected_col: str,
-    timestamp_col: str,
+    timestamp_col: Optional[str],
     weight_col: Optional[str],
     add_edge_weights: bool,
     remove_self_loops: bool,
@@ -3201,8 +3233,8 @@ def _compute_temporal_projection_frame(
     Replaces the legacy per-group Python loop (``for intermediate_node,
     group in edgelist.group_by(...)`` + ``np.triu_indices`` + appending to
     Python lists) with a single Polars self-join. Same citation-convention
-    semantics: within each intermediate-node group, the caller's descending
-    timestamp order is preserved by :func:`pl.DataFrame.unique` with
+    semantics: within each intermediate-node group, the caller's latest-first
+    row order is preserved by :func:`pl.DataFrame.unique` with
     ``keep="first"``, then a self-join on ``intermediate_col`` paired with
     an ``i < j`` filter enumerates the upper-triangular pairs. Index ``i``
     is the later sharer (source), ``j`` is the earlier sharer (target).
@@ -3211,12 +3243,18 @@ def _compute_temporal_projection_frame(
     ----------
     df : pl.DataFrame
         Input edge frame, pre-sorted by ``intermediate_col`` (any order)
-        then ``timestamp_col`` DESCENDING within each group. Must contain
-        ``intermediate_col``, ``projected_col``, ``timestamp_col`` (already
-        cast to ``pl.Datetime`` by the caller), and ``weight_col`` when
-        non-None.
+        then latest-first within each group. Must contain
+        ``intermediate_col``, ``projected_col``, ``weight_col`` when
+        non-None, and ``timestamp_col`` (already cast to ``pl.Datetime``
+        by the caller) when non-None.
+    timestamp_col : Optional[str]
+        If non-None, the temporal-decay term ``1 / (1 + Δdays)`` is
+        included in the weight; if None, the term drops out and edge
+        direction is determined purely by row order.
     add_edge_weights : bool
-        If True, edge weight is ``(w_i + w_j) / 2 * 1 / (1 + Δdays)``.
+        If True and ``timestamp_col`` is non-None, edge weight is
+        ``(w_i + w_j) / 2 * 1 / (1 + Δdays)``. If True and
+        ``timestamp_col`` is None, edge weight is ``(w_i + w_j) / 2``.
         If False, every edge gets weight ``1.0``.
     remove_self_loops : bool
         If True, drop edges where ``source == target`` (can happen when
@@ -3241,22 +3279,28 @@ def _compute_temporal_projection_frame(
         maintain_order=True,
     )
 
-    # 2. Normalize to (intermediate, node, ts, w, rank). The per-intermediate
+    # 2. Normalize to (intermediate, node, [ts], w, rank). The per-intermediate
     #    rank starts at 0 for the latest sharer (input row 0 in the group)
     #    and increases for earlier sharers — same ordering as `unique_nodes`
     #    in the legacy loop, but now derivable from a Polars window function
-    #    rather than a Python list.
+    #    rather than a Python list. __ts is only carried when a
+    #    timestamp_col was provided; without it, the decay factor drops
+    #    out of the weight formula and edge direction is determined
+    #    purely by the caller's row order.
     if weight_col is None:
         weight_expr = pl.lit(1.0).cast(pl.Float64).alias("__w")
     else:
         weight_expr = pl.col(weight_col).cast(pl.Float64).alias("__w")
 
-    normalized = deduped.select([
+    normalized_cols = [
         pl.col(intermediate_col).alias("__inter"),
         pl.col(projected_col).alias("__node"),
-        pl.col(timestamp_col).alias("__ts"),
         weight_expr,
-    ]).with_columns(
+    ]
+    if timestamp_col is not None:
+        normalized_cols.append(pl.col(timestamp_col).alias("__ts"))
+
+    normalized = deduped.select(normalized_cols).with_columns(
         pl.int_range(pl.len()).over("__inter").alias("__rank")
     )
 
@@ -3264,20 +3308,24 @@ def _compute_temporal_projection_frame(
     #    only the strict-upper-triangular pairs — same as np.triu_indices(n, k=1)
     #    in the legacy kernel, but executed at the Rust level over all
     #    intermediate groups at once.
-    left = normalized.select([
+    left_cols = [
         pl.col("__inter"),
         pl.col("__node").alias("source"),
-        pl.col("__ts").alias("__ts_i"),
         pl.col("__w").alias("__w_i"),
         pl.col("__rank").alias("__i"),
-    ])
-    right = normalized.select([
+    ]
+    right_cols = [
         pl.col("__inter"),
         pl.col("__node").alias("target"),
-        pl.col("__ts").alias("__ts_j"),
         pl.col("__w").alias("__w_j"),
         pl.col("__rank").alias("__j"),
-    ])
+    ]
+    if timestamp_col is not None:
+        left_cols.append(pl.col("__ts").alias("__ts_i"))
+        right_cols.append(pl.col("__ts").alias("__ts_j"))
+
+    left = normalized.select(left_cols)
+    right = normalized.select(right_cols)
     pairs = left.join(right, on="__inter").filter(pl.col("__i") < pl.col("__j"))
 
     if pairs.is_empty():
@@ -3287,9 +3335,11 @@ def _compute_temporal_projection_frame(
             "weight": pl.Series([], dtype=pl.Float64),
         })
 
-    # 4. Temporal-decay edge weight (same formula as the legacy kernel:
-    #    average of the two endpoint weights scaled by 1/(1 + Δdays)).
-    if add_edge_weights:
+    # 4. Edge weight — three cases:
+    #      - add_edge_weights + timestamps  → (w_i + w_j)/2 * 1/(1+Δdays)
+    #      - add_edge_weights, no timestamps → (w_i + w_j)/2 (decay drops out)
+    #      - add_edge_weights=False         → 1.0
+    if add_edge_weights and timestamp_col is not None:
         time_diff_days = (
             (pl.col("__ts_i") - pl.col("__ts_j"))
             .dt.total_seconds()
@@ -3300,6 +3350,10 @@ def _compute_temporal_projection_frame(
         weight_value = (
             ((pl.col("__w_i") + pl.col("__w_j")) / 2.0)
             * (1.0 / (1.0 + time_diff_days))
+        ).alias("weight")
+    elif add_edge_weights:
+        weight_value = (
+            (pl.col("__w_i") + pl.col("__w_j")) / 2.0
         ).alias("weight")
     else:
         weight_value = pl.lit(1.0).cast(pl.Float64).alias("weight")
