@@ -70,6 +70,7 @@ def filter_graph(
     *,
     output_format: Optional[str] = None,
     protected_nodes: Optional[List[Any]] = None,
+    keep_disconnected: bool = False,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[EdgeList, IDMapper], pl.DataFrame]:
     """
     Apply various filters to a network based on specified criteria.
@@ -127,6 +128,15 @@ def filter_graph(
         endpoint of a protected edge is dropped by some other criterion,
         the edge disappears with it. IDs not present in the graph / frame
         produce a warning and are skipped.
+    keep_disconnected : bool, default False
+        **EdgeList input only.** When ``False`` (default), drop nodes that
+        have no surviving edges after filtering and renumber the remaining
+        codes densely to ``0..K-1`` (the paired ``IDMapper`` is rebuilt to
+        match). When ``True``, keep all nodes from the input mapper even if
+        they end up isolated. Protected nodes always survive — they are
+        retained as orphan entries in the mapper even when ``False``.
+        Ignored for graph and DataFrame inputs (the graph path keeps
+        isolated nodes regardless; frames have no node-count metadata).
 
     Returns
     -------
@@ -188,7 +198,8 @@ def filter_graph(
     # Dispatch on input type.
     if isinstance(edges, EdgeList):
         return _filter_edges_edgelist(
-            edges, id_mapper, filters, combine, output_format, protected_nodes
+            edges, id_mapper, filters, combine, output_format, protected_nodes,
+            keep_disconnected=keep_disconnected,
         )
 
     if isinstance(edges, pl.DataFrame):
@@ -466,6 +477,8 @@ def _filter_edges_edgelist(
     combine: str,
     output_format: Optional[str],
     protected_nodes: Optional[List[Any]],
+    *,
+    keep_disconnected: bool = False,
 ) -> Union[Tuple[EdgeList, IDMapper], pl.DataFrame]:
     """EdgeList-input branch of :func:`filter_graph`.
 
@@ -474,8 +487,14 @@ def _filter_edges_edgelist(
     ``source_id``/``target_id`` and handed to :func:`_filter_edges_frame`.
     User-supplied original IDs (``nodes`` / ``exclude_nodes`` / ``protected_nodes``)
     are translated to codes via ``id_mapper`` before filtering so they match
-    the in-frame code values. The mapper is returned unchanged — no isolated-
-    node renumbering is performed on the EdgeList path.
+    the in-frame code values.
+
+    When ``keep_disconnected=False`` (default), nodes that lose all their
+    edges are dropped from the result: distinct codes appearing in the
+    filtered frame (plus protected codes) are renumbered densely to
+    ``0..K-1`` and a fresh ``IDMapper`` is built. When ``keep_disconnected=True``,
+    the original mapper and ``n_nodes`` are preserved (isolated nodes
+    survive as orphan mapper entries).
     """
     if id_mapper is None:
         raise ValidationError("`id_mapper` is required when `edges` is an EdgeList")
@@ -561,21 +580,115 @@ def _filter_edges_edgelist(
     if output_format == "dataframe":
         return filtered_df
 
-    # Rewrap as EdgeList: drop the synthesized weight if we added it, and
-    # rename source_id/target_id back to src/tgt. Passthrough columns
-    # (timestamp, etc.) ride along on the filtered frame untouched.
+    if keep_disconnected:
+        # Preserve the input mapper and n_nodes; nodes whose edges all got
+        # filtered survive as orphan mapper entries.
+        if synthesized_weight:
+            filtered_df = filtered_df.drop("weight")
+        filtered_df = filtered_df.rename({"source_id": "src", "target_id": "tgt"})
+        new_edge_list = EdgeList(
+            df=filtered_df,
+            directed=edge_list.directed,
+            bipartite=edge_list.bipartite,
+            n_nodes=edge_list.n_nodes,
+            code_dtype=edge_list.code_dtype,
+        )
+        return new_edge_list, id_mapper
+
+    # Drop isolated nodes: renumber surviving codes densely and rebuild the
+    # paired mapper. Protected codes are forced into the kept set even if
+    # they have no surviving edges (matching the graph path's protection
+    # override of node-level filters).
+    return _build_induced_edgelist(
+        edge_list,
+        id_mapper,
+        filtered_df,
+        protected_codes=translated_protected,
+        synthesized_weight=synthesized_weight,
+    )
+
+
+def _build_induced_edgelist(
+    edge_list: EdgeList,
+    id_mapper: IDMapper,
+    filtered_df: pl.DataFrame,
+    *,
+    protected_codes: Optional[List[int]],
+    synthesized_weight: bool,
+) -> Tuple[EdgeList, IDMapper]:
+    """Rebuild an EdgeList with dense codes ``0..K-1`` after edge filtering.
+
+    Identifies all codes still appearing in the filtered frame, unions them
+    with ``protected_codes`` (so explicitly-protected nodes survive as
+    orphans even if all their edges were dropped), renumbers them densely,
+    and rebuilds the paired mapper. Mirrors :func:`_build_induced_subgraph`
+    for the EdgeList container.
+    """
+    src_codes = set(int(c) for c in filtered_df["source_id"].to_list())
+    tgt_codes = set(int(c) for c in filtered_df["target_id"].to_list())
+    keep_codes = src_codes | tgt_codes
+    if protected_codes:
+        keep_codes |= {int(c) for c in protected_codes}
+
+    sorted_kept = sorted(keep_codes)
+    n_kept = len(sorted_kept)
+
+    new_mapper = IDMapper()
+    for new_code, old_code in enumerate(sorted_kept):
+        try:
+            original = id_mapper.get_original(old_code)
+        except KeyError:
+            continue
+        new_mapper.add_mapping(original, new_code)
+
     if synthesized_weight:
         filtered_df = filtered_df.drop("weight")
-    filtered_df = filtered_df.rename({"source_id": "src", "target_id": "tgt"})
+
+    if n_kept == 0:
+        empty_df = filtered_df.head(0).rename({"source_id": "src", "target_id": "tgt"})
+        return (
+            EdgeList(
+                df=empty_df,
+                directed=edge_list.directed,
+                bipartite=edge_list.bipartite,
+                n_nodes=0,
+                code_dtype=edge_list.code_dtype,
+            ),
+            new_mapper,
+        )
+
+    old_series = pl.Series("old", sorted_kept, dtype=edge_list.code_dtype)
+    new_series = pl.Series("new", list(range(n_kept)), dtype=edge_list.code_dtype)
+
+    renumbered = (
+        filtered_df
+        .with_columns([
+            pl.col("source_id")
+              .replace_strict(old=old_series, new=new_series)
+              .alias("src"),
+            pl.col("target_id")
+              .replace_strict(old=old_series, new=new_series)
+              .alias("tgt"),
+        ])
+        .drop(["source_id", "target_id"])
+    )
+
+    # Reorder columns to canonical EdgeList layout: src, tgt, weight, then
+    # any passthrough columns the input carried (e.g. timestamp).
+    leading = ["src", "tgt"]
+    if "weight" in renumbered.columns:
+        leading.append("weight")
+    rest = [c for c in renumbered.columns if c not in leading]
+    renumbered = renumbered.select(leading + rest)
 
     new_edge_list = EdgeList(
-        df=filtered_df,
+        df=renumbered,
         directed=edge_list.directed,
         bipartite=edge_list.bipartite,
-        n_nodes=edge_list.n_nodes,
+        n_nodes=n_kept,
         code_dtype=edge_list.code_dtype,
     )
-    return new_edge_list, id_mapper
+    return new_edge_list, new_mapper
 
 
 def _translate_originals_to_codes(
