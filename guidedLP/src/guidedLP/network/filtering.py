@@ -22,6 +22,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from guidedLP.common.id_mapper import IDMapper
+from guidedLP.common.edgelist import EdgeList
 from guidedLP.common.exceptions import (
     ComputationError,
     ValidationError,
@@ -62,32 +63,36 @@ TRAVERSAL_REQUIRED_FILTERS = {"giant_component_only", "centrality"}
 
 
 def filter_graph(
-    edges: Union[nk.Graph, pl.DataFrame],
+    edges: Union[nk.Graph, pl.DataFrame, EdgeList],
     id_mapper: Optional[IDMapper] = None,
     filters: Optional[Dict[str, Any]] = None,
     combine: str = "and",
     *,
     output_format: Optional[str] = None,
     protected_nodes: Optional[List[Any]] = None,
-) -> Union[Tuple[nk.Graph, IDMapper], pl.DataFrame]:
+) -> Union[Tuple[nk.Graph, IDMapper], Tuple[EdgeList, IDMapper], pl.DataFrame]:
     """
     Apply various filters to a network based on specified criteria.
 
-    Accepts either a NetworkIt graph (with an ``id_mapper``) or a Polars edge
-    frame (with columns ``source_id``, ``target_id``, ``weight``). The output
-    format defaults to matching the input but can be forced via
-    ``output_format``. ``frame → graph`` is intentionally not supported — call
-    :func:`build_graph_from_edgelist` on the returned frame if you need a
-    graph.
+    Accepts a NetworkIt graph (with an ``id_mapper``), a Polars edge frame
+    (with columns ``source_id``, ``target_id``, ``weight``), or a coded
+    :class:`EdgeList` (with an ``id_mapper``). The output format defaults to
+    matching the input but can be forced via ``output_format``.
+    ``frame/EdgeList → graph`` is intentionally not supported — call
+    :func:`build_graph_from_edgelist` (frame) or :func:`edgelist_to_graph`
+    (EdgeList) if you need a graph.
 
     Parameters
     ----------
-    edges : nk.Graph or pl.DataFrame
-        Either a NetworkIt graph or a Polars edge frame with columns
-        ``source_id``, ``target_id``, ``weight``.
+    edges : nk.Graph, pl.DataFrame, or EdgeList
+        Either a NetworkIt graph, a Polars edge frame with columns
+        ``source_id``, ``target_id``, ``weight``, or a coded
+        :class:`EdgeList` whose ``src``/``tgt`` columns are integer codes
+        paired with ``id_mapper``.
     id_mapper : IDMapper, optional
-        Required when ``edges`` is a Graph; ignored when it's a frame
-        (frames already use original IDs).
+        Required when ``edges`` is a Graph or EdgeList; ignored when it's a
+        frame (frames already use original IDs). For EdgeList input the
+        mapper is returned unchanged.
     filters : Dict[str, Any]
         Dictionary specifying filter criteria. Supported filters:
         - "min_degree": int - Minimum total degree threshold
@@ -181,6 +186,11 @@ def filter_graph(
     _validate_filter_parameters(filters, combine)
 
     # Dispatch on input type.
+    if isinstance(edges, EdgeList):
+        return _filter_edges_edgelist(
+            edges, id_mapper, filters, combine, output_format, protected_nodes
+        )
+
     if isinstance(edges, pl.DataFrame):
         if output_format == "graph":
             raise ValidationError(
@@ -191,7 +201,8 @@ def filter_graph(
 
     if not isinstance(edges, nk.Graph):
         raise ValidationError(
-            f"`edges` must be a NetworkIt graph or a Polars DataFrame, got {type(edges).__name__}"
+            f"`edges` must be a NetworkIt graph, Polars DataFrame, or EdgeList; "
+            f"got {type(edges).__name__}"
         )
     if id_mapper is None:
         raise ValidationError("`id_mapper` is required when `edges` is a NetworkIt graph")
@@ -446,6 +457,155 @@ def _filter_edges_frame(
             context={"operation": "filter_graph", "filters": filters},
         )
     return out
+
+
+def _filter_edges_edgelist(
+    edge_list: EdgeList,
+    id_mapper: Optional[IDMapper],
+    filters: Dict[str, Any],
+    combine: str,
+    output_format: Optional[str],
+    protected_nodes: Optional[List[Any]],
+) -> Union[Tuple[EdgeList, IDMapper], pl.DataFrame]:
+    """EdgeList-input branch of :func:`filter_graph`.
+
+    Routes through the same vectorized Polars logic as the frame path. The
+    EdgeList's ``src``/``tgt`` columns (integer codes) are renamed to
+    ``source_id``/``target_id`` and handed to :func:`_filter_edges_frame`.
+    User-supplied original IDs (``nodes`` / ``exclude_nodes`` / ``protected_nodes``)
+    are translated to codes via ``id_mapper`` before filtering so they match
+    the in-frame code values. The mapper is returned unchanged — no isolated-
+    node renumbering is performed on the EdgeList path.
+    """
+    if id_mapper is None:
+        raise ValidationError("`id_mapper` is required when `edges` is an EdgeList")
+
+    if output_format == "graph":
+        raise ValidationError(
+            "output_format='graph' with an EdgeList input is not supported. "
+            "Call edgelist_to_graph() on the returned EdgeList instead."
+        )
+    if output_format not in (None, "dataframe"):
+        raise ValidationError(
+            f"output_format must be 'dataframe' or None for EdgeList input; "
+            f"got {output_format!r}"
+        )
+
+    # Reject traversal-required filters early, mirroring the frame path.
+    needs_graph = TRAVERSAL_REQUIRED_FILTERS & set(filters.keys())
+    if needs_graph:
+        raise ValidationError(
+            f"Filter type(s) {sorted(needs_graph)} require a graph object "
+            "(connected-component or centrality computations are not expressible "
+            "as a pure edge-frame operation). Materialize a graph via "
+            "edgelist_to_graph() and pass it to filter_graph()."
+        )
+
+    log_function_entry(
+        "filter_graph",
+        edge_list_nodes=edge_list.number_of_nodes(),
+        edge_list_edges=edge_list.number_of_edges(),
+        filters=list(filters.keys()),
+        combine=combine,
+        input="edgelist",
+    )
+
+    if edge_list.number_of_edges() == 0:
+        logger.warning("Empty EdgeList provided. Returning empty EdgeList.")
+        if output_format == "dataframe":
+            empty = edge_list.df.rename({"src": "source_id", "tgt": "target_id"})
+            if "weight" not in empty.columns:
+                empty = empty.with_columns(pl.lit(1.0).cast(pl.Float64).alias("weight"))
+            return empty
+        return edge_list, id_mapper
+
+    # Build a frame in the column shape the frame helper expects. Codes pass
+    # through unchanged — group_by/joins are dtype-agnostic. Synthesize
+    # weight=1.0 if the EdgeList is unweighted so min_weight (if asked) and
+    # the required-column check both work.
+    edges_df = edge_list.df.rename({"src": "source_id", "tgt": "target_id"})
+    synthesized_weight = "weight" not in edges_df.columns
+    if synthesized_weight:
+        edges_df = edges_df.with_columns(pl.lit(1.0).cast(pl.Float64).alias("weight"))
+
+    # Translate any filter values that contain original IDs to integer codes
+    # so they match the EdgeList's frame. Unresolvable IDs are warned and
+    # skipped (matching the convention used elsewhere in the codebase).
+    translated_filters = dict(filters)
+    for key in ("nodes", "exclude_nodes"):
+        if key in translated_filters:
+            translated_filters[key] = _translate_originals_to_codes(
+                translated_filters[key], id_mapper, edge_list.code_dtype, key
+            )
+
+    translated_protected: Optional[List[int]] = None
+    if protected_nodes:
+        translated_protected = _translate_originals_to_codes(
+            protected_nodes, id_mapper, edge_list.code_dtype, "protected_nodes"
+        )
+
+    with LoggingTimer(
+        "filter_graph",
+        {"filters": list(filters.keys()), "edges": edge_list.number_of_edges(),
+         "input": "edgelist"},
+    ):
+        filtered_df = _filter_edges_frame(
+            edges_df, translated_filters, combine, translated_protected
+        )
+
+    logger.info(
+        "Graph filtering completed (EdgeList): %d → %d edges",
+        edge_list.number_of_edges(), filtered_df.height,
+    )
+
+    if output_format == "dataframe":
+        return filtered_df
+
+    # Rewrap as EdgeList: drop the synthesized weight if we added it, and
+    # rename source_id/target_id back to src/tgt. Passthrough columns
+    # (timestamp, etc.) ride along on the filtered frame untouched.
+    if synthesized_weight:
+        filtered_df = filtered_df.drop("weight")
+    filtered_df = filtered_df.rename({"source_id": "src", "target_id": "tgt"})
+
+    new_edge_list = EdgeList(
+        df=filtered_df,
+        directed=edge_list.directed,
+        bipartite=edge_list.bipartite,
+        n_nodes=edge_list.n_nodes,
+        code_dtype=edge_list.code_dtype,
+    )
+    return new_edge_list, id_mapper
+
+
+def _translate_originals_to_codes(
+    original_ids: List[Any],
+    id_mapper: IDMapper,
+    code_dtype: Any,
+    label: str,
+) -> List[int]:
+    """Translate a list of original IDs to integer codes via ``id_mapper``.
+
+    Deduplicates input, warns about IDs that aren't in the mapper, and casts
+    the surviving codes to ``code_dtype`` so equality / ``is_in`` checks
+    against the EdgeList's frame don't trip on dtype mismatch.
+    """
+    deduped = list(dict.fromkeys(original_ids))
+    codes: List[int] = []
+    missing: List[Any] = []
+    for original in deduped:
+        try:
+            codes.append(int(id_mapper.get_internal(original)))
+        except KeyError:
+            missing.append(original)
+    if missing:
+        logger.warning(
+            f"{len(missing)} of {len(deduped)} {label} not found in id_mapper "
+            f"(first few: {missing[:5]})"
+        )
+    if not codes:
+        return []
+    return pl.Series(label, codes).cast(code_dtype).to_list()
 
 
 # Helper functions for validation
