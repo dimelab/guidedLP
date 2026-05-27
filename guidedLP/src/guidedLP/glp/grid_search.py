@@ -17,7 +17,12 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import networkit as nk
 import polars as pl
 
-from guidedLP.common.exceptions import ConfigurationError, ValidationError
+from guidedLP.common.exceptions import (
+    ComputationError,
+    ConfigurationError,
+    ConvergenceError,
+    ValidationError,
+)
 from guidedLP.common.id_mapper import IDMapper
 from guidedLP.common.logging_config import LoggingTimer, get_logger
 from guidedLP.common.seed_input import SeedInput
@@ -123,7 +128,11 @@ class GLPGridSearch:
         ``n_epochs, alpha, test_size, distance_prior, repeat, random_seed,
         accuracy, macro_f1, macro_precision, macro_recall,
         total_errors, noise_errors, hard_errors, noise_error_share,
-        train_count, test_count, runtime_seconds, cell_index``.
+        train_count, test_count, runtime_seconds, error, cell_index``.
+
+        Cells whose propagation fails (e.g. ``ConvergenceError``) are
+        recorded as rows with NaN metric values and a non-null ``error``
+        message — the grid keeps running through the remaining cells.
 
     Examples
     --------
@@ -308,16 +317,30 @@ class GLPGridSearch:
                 )
                 row["cell_index"] = cell_idx
                 rows.append(row)
-                logger.info(
-                    f"Cell {cell_idx + 1}/{n_cells} "
-                    f"[n_epochs={n_epochs}, alpha={alpha}, "
-                    f"test_size={test_size}, distance_prior={distance_prior}, "
-                    f"repeat={repeat}] → "
-                    f"macro_f1={row['macro_f1']:.3f}, "
-                    f"noise_error_share={row['noise_error_share']:.3f}"
-                )
+                if row.get("error") is None:
+                    logger.info(
+                        f"Cell {cell_idx + 1}/{n_cells} "
+                        f"[n_epochs={n_epochs}, alpha={alpha}, "
+                        f"test_size={test_size}, distance_prior={distance_prior}, "
+                        f"repeat={repeat}] → "
+                        f"macro_f1={row['macro_f1']:.3f}, "
+                        f"noise_error_share={row['noise_error_share']:.3f}"
+                    )
+                else:
+                    logger.info(
+                        f"Cell {cell_idx + 1}/{n_cells} "
+                        f"[n_epochs={n_epochs}, alpha={alpha}, "
+                        f"test_size={test_size}, distance_prior={distance_prior}, "
+                        f"repeat={repeat}] → FAILED ({row['error']})"
+                    )
 
         self.results = pl.DataFrame(rows)
+        # Force `error` to a string column so it concatenates cleanly across
+        # runs even when all cells succeeded (would otherwise be Null dtype).
+        if "error" in self.results.columns:
+            self.results = self.results.with_columns(
+                pl.col("error").cast(pl.Utf8)
+            )
         return self.results
 
     def _run_cell(
@@ -363,22 +386,56 @@ class GLPGridSearch:
                 propagator = _bind_random_seed(base_propagator, cell_seed)
 
         t0 = time.perf_counter()
-        results = train_test_split_validation(
-            graph=self.graph,
-            id_mapper=self.id_mapper,
-            seed_labels=self.seed_labels,
-            labels=self.labels,
-            test_size=test_size,
-            stratify=self.stratify,
-            random_seed=cell_seed,
-            seed_node_col=self.seed_node_col,
-            seed_label_col=self.seed_label_col,
-            propagator=propagator,
-            directional_pass=self.directional_pass,
-            **propagator_kwargs,
-        )
-        runtime = time.perf_counter() - t0
+        try:
+            results = train_test_split_validation(
+                graph=self.graph,
+                id_mapper=self.id_mapper,
+                seed_labels=self.seed_labels,
+                labels=self.labels,
+                test_size=test_size,
+                stratify=self.stratify,
+                random_seed=cell_seed,
+                seed_node_col=self.seed_node_col,
+                seed_label_col=self.seed_label_col,
+                propagator=propagator,
+                directional_pass=self.directional_pass,
+                **propagator_kwargs,
+            )
+        except (ConvergenceError, ComputationError) as exc:
+            # Record the cell as a failed run rather than crashing the whole
+            # grid. Metrics become NaN/None; the `error` column carries the
+            # one-line reason so the user can spot which cells failed and
+            # why. Other exception types (ValidationError, ConfigurationError)
+            # still propagate — those indicate misuse, not numerical issues.
+            runtime = time.perf_counter() - t0
+            error_msg = str(exc)
+            logger.warning(
+                f"Cell failed [n_epochs={n_epochs}, alpha={alpha}, "
+                f"test_size={test_size}, distance_prior={distance_prior}, "
+                f"repeat={repeat}]: {error_msg}"
+            )
+            return {
+                "n_epochs": n_epochs,
+                "alpha": float(alpha),
+                "test_size": float(test_size),
+                "distance_prior": bool(distance_prior),
+                "repeat": repeat,
+                "random_seed": cell_seed if cell_seed is not None else -1,
+                "accuracy": float("nan"),
+                "macro_f1": float("nan"),
+                "macro_precision": float("nan"),
+                "macro_recall": float("nan"),
+                "total_errors": None,
+                "noise_errors": None,
+                "hard_errors": None,
+                "noise_error_share": float("nan"),
+                "train_count": None,
+                "test_count": None,
+                "runtime_seconds": runtime,
+                "error": error_msg,
+            }
 
+        runtime = time.perf_counter() - t0
         return {
             "n_epochs": n_epochs,
             "alpha": float(alpha),
@@ -397,6 +454,7 @@ class GLPGridSearch:
             "train_count": int(results["train_size"]),
             "test_count": int(results["test_size"]),
             "runtime_seconds": runtime,
+            "error": None,
         }
 
     def summary(self, sort_by: str = "macro_f1", descending: bool = True) -> pl.DataFrame:
@@ -422,45 +480,51 @@ class GLPGridSearch:
         if self.results is None:
             raise ValidationError("Call .run() before .summary().")
 
+        cols_single = [
+            "n_epochs",
+            "alpha",
+            "test_size",
+            "distance_prior",
+            "macro_f1",
+            "noise_error_share",
+            "accuracy",
+            "noise_errors",
+            "hard_errors",
+            "total_errors",
+            "runtime_seconds",
+        ]
+        if "error" in self.results.columns:
+            cols_single.append("error")
+
         if self.n_repeats == 1:
-            view = self.results.select(
-                [
-                    "n_epochs",
-                    "alpha",
-                    "test_size",
-                    "distance_prior",
-                    "macro_f1",
-                    "noise_error_share",
-                    "accuracy",
-                    "noise_errors",
-                    "hard_errors",
-                    "total_errors",
-                    "runtime_seconds",
-                ]
-            )
+            view = self.results.select(cols_single)
             if sort_by not in view.columns:
                 raise ValidationError(
                     f"sort_by={sort_by!r} not in summary columns: {view.columns}"
                 )
-            return view.sort(sort_by, descending=descending)
+            return view.sort(sort_by, descending=descending, nulls_last=True)
+
+        agg_exprs = [
+            pl.col("macro_f1").mean().alias("macro_f1_mean"),
+            pl.col("macro_f1").std(ddof=1).alias("macro_f1_std"),
+            pl.col("noise_error_share").mean().alias("noise_error_share_mean"),
+            pl.col("noise_error_share").std(ddof=1).alias("noise_error_share_std"),
+            pl.col("accuracy").mean().alias("accuracy_mean"),
+            pl.col("accuracy").std(ddof=1).alias("accuracy_std"),
+            pl.col("noise_errors").mean().alias("noise_errors_mean"),
+            pl.col("hard_errors").mean().alias("hard_errors_mean"),
+            pl.col("total_errors").mean().alias("total_errors_mean"),
+            pl.col("runtime_seconds").mean().alias("runtime_seconds_mean"),
+            pl.len().alias("n_repeats"),
+        ]
+        if "error" in self.results.columns:
+            agg_exprs.append(
+                pl.col("error").is_not_null().sum().alias("n_failed")
+            )
 
         agg = self.results.group_by(
             ["n_epochs", "alpha", "test_size", "distance_prior"]
-        ).agg(
-            [
-                pl.col("macro_f1").mean().alias("macro_f1_mean"),
-                pl.col("macro_f1").std(ddof=1).alias("macro_f1_std"),
-                pl.col("noise_error_share").mean().alias("noise_error_share_mean"),
-                pl.col("noise_error_share").std(ddof=1).alias("noise_error_share_std"),
-                pl.col("accuracy").mean().alias("accuracy_mean"),
-                pl.col("accuracy").std(ddof=1).alias("accuracy_std"),
-                pl.col("noise_errors").mean().alias("noise_errors_mean"),
-                pl.col("hard_errors").mean().alias("hard_errors_mean"),
-                pl.col("total_errors").mean().alias("total_errors_mean"),
-                pl.col("runtime_seconds").mean().alias("runtime_seconds_mean"),
-                pl.len().alias("n_repeats"),
-            ]
-        )
+        ).agg(agg_exprs)
 
         # Allow sorting by the user-facing metric name; remap to its mean column.
         sort_col = sort_by
@@ -491,12 +555,35 @@ class GLPGridSearch:
             raise ValidationError(
                 f"metric={metric!r} not in results columns: {self.results.columns}"
             )
-        idx = (
-            int(self.results[metric].arg_max())
-            if maximize
-            else int(self.results[metric].arg_min())
+        # Skip cells whose propagation failed (NaN/null metrics, non-null error).
+        valid = (
+            self.results.filter(pl.col("error").is_null())
+            if "error" in self.results.columns else self.results
         )
-        return self.results.row(idx, named=True)
+        if len(valid) == 0:
+            raise ValidationError(
+                "All grid cells failed; nothing to pick from. Inspect "
+                "`grid.results` to see the per-cell error messages."
+            )
+        idx = (
+            int(valid[metric].arg_max())
+            if maximize
+            else int(valid[metric].arg_min())
+        )
+        return valid.row(idx, named=True)
+
+    def failed_cells(self) -> pl.DataFrame:
+        """Return the subset of cells whose propagation failed.
+
+        Empty if every cell succeeded. Useful for diagnosing which
+        ``(alpha, n_epochs, ...)`` combinations are too aggressive
+        for your graph / convergence_threshold.
+        """
+        if self.results is None:
+            raise ValidationError("Call .run() before .failed_cells().")
+        if "error" not in self.results.columns:
+            return self.results.head(0)
+        return self.results.filter(pl.col("error").is_not_null())
 
     def pivot(
         self,
@@ -576,9 +663,15 @@ def get_grid_search_summary(grid: GLPGridSearch) -> str:
     if grid.results is None:
         return "GLPGridSearch has not been run yet — call .run() first."
 
+    n_failed = (
+        int(grid.results.filter(pl.col("error").is_not_null()).height)
+        if "error" in grid.results.columns else 0
+    )
+
     lines = [
         "=== GLPGridSearch Summary ===",
         f"Cells run:             {len(grid.results)}",
+        f"Cells failed:          {n_failed}",
         f"n_epochs grid:         {grid.n_epochs_grid}",
         f"alpha grid:            {grid.alpha_grid}",
         f"test_size grid:        {grid.test_size_grid}",
