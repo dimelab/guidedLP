@@ -78,6 +78,13 @@ class GLPGridSearch:
         Propagation alpha values to try; each must be in ``[0, 1]``.
     test_size_grid : Optional[List[float]], default [0.2]
         Test-fraction values to try; each must be in ``(0, 1)``.
+    distance_prior_grid : Optional[List[bool]], default [False]
+        Whether to enable the per-class geodesic distance prior (see
+        :func:`guided_label_propagation`'s ``distance_prior``). Pass
+        ``[False, True]`` to compare with vs. without in the same grid.
+        For backwards compatibility, if this is omitted but
+        ``distance_prior=True`` appears in ``**glp_kwargs``, the latter
+        becomes a single-cell default.
     n_repeats : int, default 1
         Repeat every (n_epochs, alpha, test_size) combination with different
         random seeds. Repeat ``r`` uses seed ``random_seed + r``. The results
@@ -113,7 +120,7 @@ class GLPGridSearch:
     ----------
     results : Optional[pl.DataFrame]
         Populated by :meth:`run`. Columns:
-        ``n_epochs, alpha, test_size, repeat, random_seed,
+        ``n_epochs, alpha, test_size, distance_prior, repeat, random_seed,
         accuracy, macro_f1, macro_precision, macro_recall,
         total_errors, noise_errors, hard_errors, noise_error_share,
         train_count, test_count, runtime_seconds, cell_index``.
@@ -136,6 +143,7 @@ class GLPGridSearch:
     DEFAULT_N_EPOCHS: List[int] = [10]
     DEFAULT_ALPHA: List[float] = [0.85]
     DEFAULT_TEST_SIZE: List[float] = [0.2]
+    DEFAULT_DISTANCE_PRIOR: List[bool] = [False]
 
     def __init__(
         self,
@@ -147,6 +155,7 @@ class GLPGridSearch:
         n_epochs_grid: Optional[List[int]] = None,
         alpha_grid: Optional[List[float]] = None,
         test_size_grid: Optional[List[float]] = None,
+        distance_prior_grid: Optional[List[bool]] = None,
         n_repeats: int = 1,
         random_seed: Optional[int] = 42,
         stratify: bool = True,
@@ -173,6 +182,16 @@ class GLPGridSearch:
         self.test_size_grid = (
             list(test_size_grid) if test_size_grid is not None else list(self.DEFAULT_TEST_SIZE)
         )
+
+        # `distance_prior` can also arrive via **glp_kwargs from older calls;
+        # the explicit grid wins, but if the grid is omitted we honour the
+        # kwarg as a single-cell default so existing code keeps working.
+        if distance_prior_grid is None:
+            fallback = bool(glp_kwargs.pop("distance_prior", False))
+            self.distance_prior_grid = [fallback]
+        else:
+            glp_kwargs.pop("distance_prior", None)
+            self.distance_prior_grid = list(distance_prior_grid)
 
         if n_repeats < 1:
             raise ConfigurationError(
@@ -238,6 +257,18 @@ class GLPGridSearch:
                     parameter="test_size_grid",
                     value=t,
                 )
+        if not self.distance_prior_grid:
+            raise ConfigurationError(
+                "distance_prior_grid cannot be empty",
+                parameter="distance_prior_grid",
+            )
+        for d in self.distance_prior_grid:
+            if not isinstance(d, bool):
+                raise ConfigurationError(
+                    f"distance_prior values must be bool, got {d!r}",
+                    parameter="distance_prior_grid",
+                    value=d,
+                )
 
     def run(self) -> pl.DataFrame:
         """Execute the grid search.
@@ -253,6 +284,7 @@ class GLPGridSearch:
                 self.test_size_grid,
                 self.alpha_grid,
                 self.n_epochs_grid,
+                self.distance_prior_grid,
                 range(self.n_repeats),
             )
         )
@@ -262,18 +294,24 @@ class GLPGridSearch:
             f"({len(self.test_size_grid)} test_size × "
             f"{len(self.alpha_grid)} alpha × "
             f"{len(self.n_epochs_grid)} n_epochs × "
+            f"{len(self.distance_prior_grid)} distance_prior × "
             f"{self.n_repeats} repeat{'s' if self.n_repeats != 1 else ''})"
         )
 
         rows: List[Dict[str, Any]] = []
         with LoggingTimer(f"GLPGridSearch over {n_cells} cells"):
-            for cell_idx, (test_size, alpha, n_epochs, repeat) in enumerate(combos):
-                row = self._run_cell(test_size, alpha, n_epochs, repeat)
+            for cell_idx, (
+                test_size, alpha, n_epochs, distance_prior, repeat
+            ) in enumerate(combos):
+                row = self._run_cell(
+                    test_size, alpha, n_epochs, distance_prior, repeat
+                )
                 row["cell_index"] = cell_idx
                 rows.append(row)
                 logger.info(
                     f"Cell {cell_idx + 1}/{n_cells} "
-                    f"[n_epochs={n_epochs}, alpha={alpha}, test_size={test_size}, "
+                    f"[n_epochs={n_epochs}, alpha={alpha}, "
+                    f"test_size={test_size}, distance_prior={distance_prior}, "
                     f"repeat={repeat}] → "
                     f"macro_f1={row['macro_f1']:.3f}, "
                     f"noise_error_share={row['noise_error_share']:.3f}"
@@ -283,7 +321,12 @@ class GLPGridSearch:
         return self.results
 
     def _run_cell(
-        self, test_size: float, alpha: float, n_epochs: int, repeat: int
+        self,
+        test_size: float,
+        alpha: float,
+        n_epochs: int,
+        distance_prior: bool,
+        repeat: int,
     ) -> Dict[str, Any]:
         cell_seed: Optional[int] = (
             self.random_seed + repeat if self.random_seed is not None else None
@@ -302,6 +345,7 @@ class GLPGridSearch:
         propagator_kwargs["directional"] = self.directional
         propagator_kwargs["enable_noise_category"] = self.enable_noise_category
         propagator_kwargs["noise_ratio"] = self.noise_ratio
+        propagator_kwargs["distance_prior"] = distance_prior
 
         propagator: Callable = base_propagator
         if use_ensemble:
@@ -339,6 +383,7 @@ class GLPGridSearch:
             "n_epochs": n_epochs,
             "alpha": float(alpha),
             "test_size": float(test_size),
+            "distance_prior": bool(distance_prior),
             "repeat": repeat,
             "random_seed": cell_seed if cell_seed is not None else -1,
             "accuracy": float(results["accuracy"]),
@@ -383,6 +428,7 @@ class GLPGridSearch:
                     "n_epochs",
                     "alpha",
                     "test_size",
+                    "distance_prior",
                     "macro_f1",
                     "noise_error_share",
                     "accuracy",
@@ -398,7 +444,9 @@ class GLPGridSearch:
                 )
             return view.sort(sort_by, descending=descending)
 
-        agg = self.results.group_by(["n_epochs", "alpha", "test_size"]).agg(
+        agg = self.results.group_by(
+            ["n_epochs", "alpha", "test_size", "distance_prior"]
+        ).agg(
             [
                 pl.col("macro_f1").mean().alias("macro_f1_mean"),
                 pl.col("macro_f1").std(ddof=1).alias("macro_f1_std"),
@@ -485,7 +533,7 @@ class GLPGridSearch:
             raise ValidationError(
                 f"metric={metric!r} not in results columns: {self.results.columns}"
             )
-        axis_cols = {"n_epochs", "alpha", "test_size"}
+        axis_cols = {"n_epochs", "alpha", "test_size", "distance_prior"}
         if index not in axis_cols or columns not in axis_cols or index == columns:
             raise ValidationError(
                 f"index and columns must be distinct values from {axis_cols}, "
@@ -493,15 +541,20 @@ class GLPGridSearch:
             )
 
         df = self.results
-        third_axis = (axis_cols - {index, columns}).pop()
-        if df[third_axis].n_unique() > 1:
-            chosen = test_size if third_axis == "test_size" else df[third_axis].min()
-            if chosen is None:
-                chosen = df[third_axis].min()
-            df = df.filter(pl.col(third_axis) == chosen)
+        # Collapse the unused axes (every axis except `index` and `columns`).
+        # `test_size` honours the explicit `test_size=` arg; everything else
+        # filters to its first observed value to keep the pivot 2D.
+        for other in axis_cols - {index, columns}:
+            if df[other].n_unique() <= 1:
+                continue
+            if other == "test_size" and test_size is not None:
+                chosen: Any = test_size
+            else:
+                chosen = df[other].min()
+            df = df.filter(pl.col(other) == chosen)
             logger.info(
-                f"pivot: collapsing {third_axis}={chosen} (the grid has "
-                f"multiple {third_axis} values)"
+                f"pivot: collapsing {other}={chosen} (the grid has "
+                f"multiple {other} values)"
             )
 
         agg_expr = (
@@ -525,11 +578,12 @@ def get_grid_search_summary(grid: GLPGridSearch) -> str:
 
     lines = [
         "=== GLPGridSearch Summary ===",
-        f"Cells run:          {len(grid.results)}",
-        f"n_epochs grid:      {grid.n_epochs_grid}",
-        f"alpha grid:         {grid.alpha_grid}",
-        f"test_size grid:     {grid.test_size_grid}",
-        f"Repeats per cell:   {grid.n_repeats}",
+        f"Cells run:             {len(grid.results)}",
+        f"n_epochs grid:         {grid.n_epochs_grid}",
+        f"alpha grid:            {grid.alpha_grid}",
+        f"test_size grid:        {grid.test_size_grid}",
+        f"distance_prior grid:   {grid.distance_prior_grid}",
+        f"Repeats per cell:      {grid.n_repeats}",
         "",
         "Per-cell results (sorted by macro_f1, best first):",
     ]
@@ -544,12 +598,14 @@ def get_grid_search_summary(grid: GLPGridSearch) -> str:
                 "",
                 "Best macro_f1: "
                 f"n_epochs={best_f1['n_epochs']}, alpha={best_f1['alpha']}, "
-                f"test_size={best_f1['test_size']} → "
+                f"test_size={best_f1['test_size']}, "
+                f"distance_prior={best_f1['distance_prior']} → "
                 f"macro_f1={best_f1['macro_f1']:.3f}, "
                 f"noise_error_share={best_f1['noise_error_share']:.3f}",
                 "Best noise_error_share: "
                 f"n_epochs={best_noise['n_epochs']}, alpha={best_noise['alpha']}, "
-                f"test_size={best_noise['test_size']} → "
+                f"test_size={best_noise['test_size']}, "
+                f"distance_prior={best_noise['distance_prior']} → "
                 f"noise_error_share={best_noise['noise_error_share']:.3f}, "
                 f"macro_f1={best_noise['macro_f1']:.3f}",
             ]
