@@ -157,6 +157,7 @@ def guided_label_propagation(
     random_seed: Optional[int] = 42,
     exclude_from_output: Optional[Set[Any]] = None,
     distance_prior: bool = False,
+    distance_prior_exponent: float = 1.0,
     verbose: bool = True,
 ) -> Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]:
     """
@@ -258,16 +259,30 @@ def guided_label_propagation(
 
             ``F^(t+1) = α P (F^(t) ⊙ D) + (1-α) Y``
 
-        where ``D[i, c] = mean over s in seeds(c) of 1/(d_geo(i, s) + 1)``
-        and ``d_geo`` is shortest-path distance on the undirected version
-        of the graph. This biases each class to flow more strongly through
-        nodes that are geodesically close to that class's seeds — a
-        revival of the legacy ``stlp`` distance map, but layered on top of
-        the row-normalized random walk ``P = D⁻¹A`` (so the high-degree-seed
-        dominance bug that motivated the rewrite stays fixed). Adds one
-        BFS per seed (O(|seeds|·(n+m)) work) on top of normal propagation.
-        Off by default; opt in only when distance-based class structure
-        matters (well-separated clusters, sparse seeds).
+        where ``D[i, c] = mean over s in seeds(c) of 1/(d_geo(i, s) + 1)^β``
+        with ``β = distance_prior_exponent``, and ``d_geo`` is shortest-path
+        distance on the undirected version of the graph. This biases each
+        class to flow more strongly through nodes that are geodesically
+        close to that class's seeds — a revival of the legacy ``stlp``
+        distance map, but layered on top of the row-normalized random walk
+        ``P = D⁻¹A`` (so the high-degree-seed dominance bug that motivated
+        the rewrite stays fixed). Adds one BFS per seed (O(|seeds|·(n+m))
+        work) on top of normal propagation. Off by default; opt in only
+        when distance-based class structure matters (well-separated
+        clusters, sparse seeds).
+    distance_prior_exponent : float, default 1.0
+        Decay exponent ``β`` in the distance prior ``D[i, c] = 1/(d+1)^β``.
+        Only has effect when ``distance_prior=True``.
+
+        - ``β = 1.0`` (default): matches the legacy ``stlp`` shape.
+        - ``β > 1``: sharper penalty on distant nodes. With noise seeds
+          scattered uniformly, the noise class then wins in regions far
+          from any real-class cluster (this is the "send-far-things-to-
+          noise" regularizer behaviour).
+        - ``β < 1``: gentler decay, classes spread further before
+          attenuating.
+
+        Typical values to sweep: ``1, 2, 3, 5``.
     verbose : bool, default True
         Print a one-line wall-clock summary at completion (matching
         :func:`apply_backbone` and :func:`project_bipartite`). Set to
@@ -362,6 +377,7 @@ def guided_label_propagation(
             direction="undirected" if not is_directed else "out_degree",
             weight_transform=weight_transform,
             distance_prior=distance_prior,
+            distance_prior_exponent=distance_prior_exponent,
         )
 
         # Apply confidence thresholding if enabled
@@ -404,6 +420,7 @@ def guided_label_propagation(
                 direction="out_degree",
                 weight_transform=weight_transform,
                 distance_prior=distance_prior,
+                distance_prior_exponent=distance_prior_exponent,
             )
             # In-degree pass: each node labeled by avg of its in-neighbors
             # (transposed adjacency, row-normalized by in-degree)
@@ -414,6 +431,7 @@ def guided_label_propagation(
                 direction="in_degree",
                 weight_transform=weight_transform,
                 distance_prior=distance_prior,
+                distance_prior_exponent=distance_prior_exponent,
             )
             out_result = out_future.result()
             in_result = in_future.result()
@@ -839,6 +857,7 @@ def ensemble_label_propagation(
     # here. The noise column is filled per-epoch by the worker, since
     # noise seeds resample each epoch.
     distance_prior_flag = glp_kwargs.get("distance_prior", False)
+    distance_prior_exponent = float(glp_kwargs.get("distance_prior_exponent", 1.0))
     if distance_prior_flag:
         undirected_graph = (
             nk.graphtools.toUndirected(graph) if graph.isDirected() else graph
@@ -855,6 +874,7 @@ def ensemble_label_propagation(
         base_D = _compute_class_distance_columns(
             undirected_graph, seed_internals_by_class,
             graph.numberOfNodes(), len(processed_labels),
+            decay_exponent=distance_prior_exponent,
         )
     else:
         undirected_graph = None
@@ -897,7 +917,7 @@ def ensemble_label_propagation(
                 P_out, P_in, base_Y, non_seed_pool, n_noise_seeds,
                 noise_label_idx, alpha, max_iterations, convergence_threshold,
                 normalize, base_seed + epoch,
-                base_D, undirected_graph,
+                base_D, undirected_graph, distance_prior_exponent,
             )
             for epoch in range(n_epochs)
         ]
@@ -1087,6 +1107,7 @@ def _run_single_propagation(
     direction: str,
     weight_transform: Optional[WeightTransform] = None,
     distance_prior: bool = False,
+    distance_prior_exponent: float = 1.0,
 ) -> pl.DataFrame:
     """Run a single propagation (either undirected, out-degree, or in-degree)."""
 
@@ -1106,7 +1127,10 @@ def _run_single_propagation(
 
         # Per-class distance prior (optional, off by default).
         D = (
-            _compute_distance_prior(graph, id_mapper, seed_labels, labels)
+            _compute_distance_prior(
+                graph, id_mapper, seed_labels, labels,
+                decay_exponent=distance_prior_exponent,
+            )
             if distance_prior else None
         )
 
@@ -1186,15 +1210,20 @@ def _compute_class_distance_columns(
     seed_internals_by_class: Dict[int, List[int]],
     n_nodes: int,
     n_labels: int,
+    decay_exponent: float = 1.0,
 ) -> np.ndarray:
     """Fill the columns of a distance-prior matrix from seed lists per class.
 
     For each class column ``c`` present in ``seed_internals_by_class``,
-    sets ``D[:, c] = mean over s in seeds(c) of 1/(d_geo(:, s) + 1)``,
-    using BFS on the (undirected) graph. Columns not in the dict stay zero.
+    sets ``D[:, c] = mean over s in seeds(c) of 1/(d_geo(:, s) + 1)^β``,
+    using BFS on the (undirected) graph and ``β = decay_exponent``.
+    Columns not in the dict stay zero.
+
+    Larger ``decay_exponent`` → steeper penalty on distant nodes → real
+    classes are confined more tightly to their seed neighborhoods.
 
     NetworkIt's BFS returns ``sys.float_info.max`` (~1.8e308) for
-    unreachable nodes; ``1.0 / (d + 1.0)`` underflows to 0 for those —
+    unreachable nodes; the inverse-power underflows to 0 for those —
     so unreachable nodes naturally get a 0 prior for that class.
     """
     D = np.zeros((n_nodes, n_labels), dtype=np.float64)
@@ -1206,7 +1235,7 @@ def _compute_class_distance_columns(
             bfs = nk.distance.BFS(undirected_graph, src)
             bfs.run()
             distances = np.asarray(bfs.getDistances(), dtype=np.float64)
-            col += 1.0 / (distances + 1.0)
+            col += 1.0 / (distances + 1.0) ** decay_exponent
         D[:, class_idx] = col / len(seed_internals)
     return D
 
@@ -1216,22 +1245,30 @@ def _compute_distance_prior(
     id_mapper: IDMapper,
     seed_labels: Dict[Any, str],
     labels: List[str],
+    decay_exponent: float = 1.0,
 ) -> np.ndarray:
     """Compute the per-class distance prior matrix ``D`` for GLP.
 
-    ``D[i, c] = mean over s in seeds(c) of 1/(d_geo(i, s) + 1)``.
+    ``D[i, c] = mean over s in seeds(c) of 1/(d_geo(i, s) + 1)^β``,
+    where ``β = decay_exponent``.
 
-    Mirrors the legacy ``stlp`` distance map: closer to a class's seeds →
-    larger prior for that class. Distances are computed on the undirected
-    unweighted version of the graph so they are symmetric (matching
-    ``stlp``'s ``toUndirected(toUnweighted(...))`` choice).
+    Mirrors the legacy ``stlp`` distance map but with a tunable decay
+    exponent. ``β = 1`` recovers the original ``1/(d+1)`` shape; larger
+    ``β`` produces a sharper penalty (real classes confined closer to
+    their seeds), pushing far-from-seed nodes toward the noise class.
+
+    Distances are computed on the undirected unweighted version of the
+    graph so they are symmetric (matching ``stlp``'s
+    ``toUndirected(toUnweighted(...))`` choice).
 
     Returns
     -------
     np.ndarray
         ``(n_nodes, n_labels)`` matrix of nonnegative floats in ``[0, 1]``.
     """
-    with LoggingTimer("Computing per-class distance prior"):
+    with LoggingTimer(
+        f"Computing per-class distance prior (β={decay_exponent})"
+    ):
         n_nodes = graph.numberOfNodes()
         n_labels = len(labels)
         label_to_idx = {label: i for i, label in enumerate(labels)}
@@ -1251,7 +1288,8 @@ def _compute_distance_prior(
         )
 
         return _compute_class_distance_columns(
-            undirected_graph, seed_internals_by_class, n_nodes, n_labels
+            undirected_graph, seed_internals_by_class, n_nodes, n_labels,
+            decay_exponent=decay_exponent,
         )
 
 
@@ -1654,6 +1692,7 @@ def _ensemble_run_epoch(
     epoch_seed: int,
     base_D: Optional[np.ndarray] = None,
     undirected_graph: Optional[nk.Graph] = None,
+    distance_prior_exponent: float = 1.0,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Run one ensemble epoch on shared, pre-built transition matrices.
@@ -1729,7 +1768,7 @@ def _ensemble_run_epoch(
                 bfs = nk.distance.BFS(undirected_graph, src)
                 bfs.run()
                 distances = np.asarray(bfs.getDistances(), dtype=np.float64)
-                col += 1.0 / (distances + 1.0)
+                col += 1.0 / (distances + 1.0) ** distance_prior_exponent
             D[:, noise_label_idx] = col / len(noise_internals)
 
     F_out = Y.copy()
