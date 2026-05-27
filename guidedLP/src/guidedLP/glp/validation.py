@@ -256,7 +256,7 @@ def train_test_split_validation(
         results = {
             "accuracy": metrics["accuracy"],
             "precision": metrics["precision"],
-            "recall": metrics["recall"], 
+            "recall": metrics["recall"],
             "f1_score": metrics["f1_score"],
             "macro_precision": metrics["macro_precision"],
             "macro_recall": metrics["macro_recall"],
@@ -266,6 +266,10 @@ def train_test_split_validation(
             "train_size": len(train_seeds),
             "test_size": len(test_seeds),
             "classification_report": metrics["classification_report"],
+            "total_errors": metrics["total_errors"],
+            "noise_errors": metrics["noise_errors"],
+            "hard_errors": metrics["hard_errors"],
+            "noise_error_share": metrics["noise_error_share"],
             # Note: convergence_iterations not directly available from current GLP API
             # Could be added in future if GLP returns convergence info
         }
@@ -564,45 +568,69 @@ def _extract_test_predictions(
 
 def _calculate_validation_metrics(
     true_labels: List[str],
-    predicted_labels: List[str], 
-    all_labels: List[str]
+    predicted_labels: List[str],
+    all_labels: List[str],
+    noise_label: str = "noise",
 ) -> Dict[str, Any]:
-    """Calculate comprehensive validation metrics using sklearn."""
-    
+    """Calculate comprehensive validation metrics using sklearn.
+
+    Also reports a noise-aware error breakdown: among misclassified nodes,
+    how many were labelled as ``noise_label`` (a "safe" miss — the model
+    abstained rather than committing to the wrong real class) versus the
+    wrong real class (a "hard" miss). ``noise_error_share`` is the fraction
+    of all errors that landed on ``noise_label``; higher is better when the
+    noise category is enabled. Returns ``0.0`` when there are no errors.
+    """
+
     # Overall accuracy
     accuracy = accuracy_score(true_labels, predicted_labels)
-    
+
     # Per-label metrics
     precision_scores, recall_scores, f1_scores, support = precision_recall_fscore_support(
         true_labels, predicted_labels, labels=all_labels, average=None, zero_division=0
     )
-    
+
     # Macro averages
     macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
         true_labels, predicted_labels, average='macro', zero_division=0
     )
-    
+
     # Confusion matrix
     conf_matrix = confusion_matrix(true_labels, predicted_labels, labels=all_labels)
-    
+
     # Classification report for detailed diagnostics
     class_report = classification_report(true_labels, predicted_labels, labels=all_labels)
-    
+
     # Convert to dictionaries for easy access
     precision_dict = dict(zip(all_labels, precision_scores))
     recall_dict = dict(zip(all_labels, recall_scores))
     f1_dict = dict(zip(all_labels, f1_scores))
-    
+
+    # Noise-aware error breakdown
+    total_errors = 0
+    noise_errors = 0
+    for t, p in zip(true_labels, predicted_labels):
+        if t != p:
+            total_errors += 1
+            if p == noise_label:
+                noise_errors += 1
+    hard_errors = total_errors - noise_errors
+    noise_error_share = (noise_errors / total_errors) if total_errors > 0 else 0.0
+
     return {
         "accuracy": float(accuracy),
         "precision": precision_dict,
         "recall": recall_dict,
         "f1_score": f1_dict,
         "macro_precision": float(macro_precision),
-        "macro_recall": float(macro_recall), 
+        "macro_recall": float(macro_recall),
         "macro_f1": float(macro_f1),
         "confusion_matrix": conf_matrix,
-        "classification_report": class_report
+        "classification_report": class_report,
+        "total_errors": total_errors,
+        "noise_errors": noise_errors,
+        "hard_errors": hard_errors,
+        "noise_error_share": float(noise_error_share),
     }
 
 
@@ -693,7 +721,11 @@ def external_validation(
             "confusion_matrix": metrics["confusion_matrix"],
             "test_predictions": validation_predictions,
             "validation_size": len(validation_labels),
-            "classification_report": metrics["classification_report"]
+            "classification_report": metrics["classification_report"],
+            "total_errors": metrics["total_errors"],
+            "noise_errors": metrics["noise_errors"],
+            "hard_errors": metrics["hard_errors"],
+            "noise_error_share": metrics["noise_error_share"],
         }
         
         logger.info(f"External validation complete. Accuracy: {results['accuracy']:.3f}")
@@ -738,12 +770,26 @@ def get_validation_summary(validation_results: Dict[str, Any]) -> str:
         f1 = validation_results['f1_score'][label]
         summary_lines.append(f"  {label}: P={precision:.3f}, R={recall:.3f}, F1={f1:.3f}")
     
+    if "total_errors" in validation_results:
+        total_err = validation_results["total_errors"]
+        noise_err = validation_results.get("noise_errors", 0)
+        hard_err = validation_results.get("hard_errors", total_err - noise_err)
+        share = validation_results.get("noise_error_share", 0.0)
+        summary_lines.extend([
+            "",
+            "Error Breakdown:",
+            f"  Total errors:       {total_err}",
+            f"  Noise errors:       {noise_err} (predicted as 'noise' — safe miss)",
+            f"  Hard errors:        {hard_err} (predicted as wrong real class)",
+            f"  Noise error share:  {share:.3f}",
+        ])
+
     summary_lines.extend([
         "",
         "Confusion Matrix:",
         str(validation_results['confusion_matrix'])
     ])
-    
+
     return "\n".join(summary_lines)
 
 
@@ -1142,7 +1188,11 @@ def _process_single_fold(
         "macro_f1": metrics["macro_f1"],
         "confusion_matrix": metrics["confusion_matrix"],
         "train_size": len(train_seeds),
-        "test_size": len(test_seeds)
+        "test_size": len(test_seeds),
+        "total_errors": metrics["total_errors"],
+        "noise_errors": metrics["noise_errors"],
+        "hard_errors": metrics["hard_errors"],
+        "noise_error_share": metrics["noise_error_share"],
     }
 
 
@@ -1199,7 +1249,20 @@ def _aggregate_cv_results(
     
     # Aggregate confusion matrices
     aggregate_confusion_matrix = np.sum(confusion_matrices, axis=0)
-    
+
+    # Noise-aware error aggregation: pool error counts across folds so the
+    # share reflects the full test set rather than a mean-of-fractions that
+    # over-weights small folds with few errors.
+    total_errors_sum = int(sum(r.get("total_errors", 0) for r in fold_results))
+    noise_errors_sum = int(sum(r.get("noise_errors", 0) for r in fold_results))
+    hard_errors_sum = total_errors_sum - noise_errors_sum
+    noise_error_share = (
+        noise_errors_sum / total_errors_sum if total_errors_sum > 0 else 0.0
+    )
+    fold_noise_error_shares = [
+        float(r.get("noise_error_share", 0.0)) for r in fold_results
+    ]
+
     return {
         "mean_accuracy": float(mean_accuracy),
         "std_accuracy": float(std_accuracy),
@@ -1214,5 +1277,10 @@ def _aggregate_cv_results(
         "std_macro_f1": float(std_macro_f1),
         "fold_results": fold_results,
         "aggregate_confusion_matrix": aggregate_confusion_matrix,
-        "k_folds": k_folds
+        "k_folds": k_folds,
+        "total_errors": total_errors_sum,
+        "noise_errors": noise_errors_sum,
+        "hard_errors": hard_errors_sum,
+        "noise_error_share": float(noise_error_share),
+        "fold_noise_error_shares": fold_noise_error_shares,
     }
