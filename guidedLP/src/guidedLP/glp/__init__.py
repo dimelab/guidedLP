@@ -46,3 +46,9 @@ from .evaluation import (
     analyze_label_distribution,
     compare_directional_results
 )
+
+# Grid search
+from .grid_search import (
+    GLPGridSearch,
+    get_grid_search_summary,
+)

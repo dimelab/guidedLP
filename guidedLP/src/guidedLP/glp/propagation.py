@@ -156,6 +156,7 @@ def guided_label_propagation(
     weight_transform: Optional[WeightTransform] = None,
     random_seed: Optional[int] = 42,
     exclude_from_output: Optional[Set[Any]] = None,
+    distance_prior: bool = False,
     verbose: bool = True,
 ) -> Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]:
     """
@@ -251,6 +252,22 @@ def guided_label_propagation(
         excluded nodes still participate fully and can influence their
         neighbors; only the output is filtered. IDs not present in the
         graph are silently ignored.
+    distance_prior : bool, default False
+        If ``True``, multiply neighbor affinities by a per-class
+        geodesic-distance prior before each propagation step:
+
+            ``F^(t+1) = α P (F^(t) ⊙ D) + (1-α) Y``
+
+        where ``D[i, c] = mean over s in seeds(c) of 1/(d_geo(i, s) + 1)``
+        and ``d_geo`` is shortest-path distance on the undirected version
+        of the graph. This biases each class to flow more strongly through
+        nodes that are geodesically close to that class's seeds — a
+        revival of the legacy ``stlp`` distance map, but layered on top of
+        the row-normalized random walk ``P = D⁻¹A`` (so the high-degree-seed
+        dominance bug that motivated the rewrite stays fixed). Adds one
+        BFS per seed (O(|seeds|·(n+m)) work) on top of normal propagation.
+        Off by default; opt in only when distance-based class structure
+        matters (well-separated clusters, sparse seeds).
     verbose : bool, default True
         Print a one-line wall-clock summary at completion (matching
         :func:`apply_backbone` and :func:`project_bipartite`). Set to
@@ -344,6 +361,7 @@ def guided_label_propagation(
             max_iterations, convergence_threshold, normalize,
             direction="undirected" if not is_directed else "out_degree",
             weight_transform=weight_transform,
+            distance_prior=distance_prior,
         )
 
         # Apply confidence thresholding if enabled
@@ -385,6 +403,7 @@ def guided_label_propagation(
                 max_iterations, convergence_threshold, normalize,
                 direction="out_degree",
                 weight_transform=weight_transform,
+                distance_prior=distance_prior,
             )
             # In-degree pass: each node labeled by avg of its in-neighbors
             # (transposed adjacency, row-normalized by in-degree)
@@ -394,6 +413,7 @@ def guided_label_propagation(
                 max_iterations, convergence_threshold, normalize,
                 direction="in_degree",
                 weight_transform=weight_transform,
+                distance_prior=distance_prior,
             )
             out_result = out_future.result()
             in_result = in_future.result()
@@ -667,6 +687,11 @@ def ensemble_label_propagation(
         result (and to each direction's DataFrame for directional runs),
         not per epoch — the excluded nodes still participate fully in
         every epoch's propagation, only the final output is filtered.
+        If ``distance_prior=True`` is passed, the per-class distance prior
+        is enabled (see :func:`guided_label_propagation`). The non-noise
+        columns of ``D`` are computed once and shared across workers; the
+        noise column is recomputed per epoch from that epoch's noise
+        sample.
 
     Returns
     -------
@@ -809,6 +834,32 @@ def ensemble_label_propagation(
         if do_directional else None
     )
 
+    # Per-class distance prior (optional). The non-noise columns depend
+    # only on the user seeds and the graph, so they are computed ONCE
+    # here. The noise column is filled per-epoch by the worker, since
+    # noise seeds resample each epoch.
+    distance_prior_flag = glp_kwargs.get("distance_prior", False)
+    if distance_prior_flag:
+        undirected_graph = (
+            nk.graphtools.toUndirected(graph) if graph.isDirected() else graph
+        )
+        label_to_idx = {label: i for i, label in enumerate(processed_labels)}
+        seed_internals_by_class: Dict[int, List[int]] = {}
+        for original_id, label in seed_labels.items():
+            if label not in label_to_idx:
+                continue
+            internal_id = id_mapper.get_internal(original_id)
+            seed_internals_by_class.setdefault(
+                label_to_idx[label], []
+            ).append(internal_id)
+        base_D = _compute_class_distance_columns(
+            undirected_graph, seed_internals_by_class,
+            graph.numberOfNodes(), len(processed_labels),
+        )
+    else:
+        undirected_graph = None
+        base_D = None
+
     # Resolve worker count. None → use all cores up to n_epochs.
     if n_workers is None:
         n_workers = min(n_epochs, max(1, os.cpu_count() or 1))
@@ -846,6 +897,7 @@ def ensemble_label_propagation(
                 P_out, P_in, base_Y, non_seed_pool, n_noise_seeds,
                 noise_label_idx, alpha, max_iterations, convergence_threshold,
                 normalize, base_seed + epoch,
+                base_D, undirected_graph,
             )
             for epoch in range(n_epochs)
         ]
@@ -1034,6 +1086,7 @@ def _run_single_propagation(
     normalize: bool,
     direction: str,
     weight_transform: Optional[WeightTransform] = None,
+    distance_prior: bool = False,
 ) -> pl.DataFrame:
     """Run a single propagation (either undirected, out-degree, or in-degree)."""
 
@@ -1050,20 +1103,27 @@ def _run_single_propagation(
 
         # Create transition matrix P
         P = _create_transition_matrix(graph, direction, weight_transform=weight_transform)
-        
+
+        # Per-class distance prior (optional, off by default).
+        D = (
+            _compute_distance_prior(graph, id_mapper, seed_labels, labels)
+            if distance_prior else None
+        )
+
         # Initialize propagation matrix
         F = Y.copy()
-        
+
         # Iterative propagation
         converged_iteration = _iterative_propagation(
-            F, P, Y, alpha, max_iterations, convergence_threshold
+            F, P, Y, alpha, max_iterations, convergence_threshold,
+            distance_prior=D,
         )
-        
+
         # Post-process results
         result_df = _create_results_dataframe(
             F, Y, labels, id_mapper, normalize, converged_iteration, direction
         )
-        
+
         logger.info(f"Propagation converged after {converged_iteration} iterations")
         return result_df
 
@@ -1119,6 +1179,80 @@ def _initialize_label_matrix(
     
     logger.debug(f"Initialized {len(seed_labels)} seed nodes in label matrix")
     return Y
+
+
+def _compute_class_distance_columns(
+    undirected_graph: nk.Graph,
+    seed_internals_by_class: Dict[int, List[int]],
+    n_nodes: int,
+    n_labels: int,
+) -> np.ndarray:
+    """Fill the columns of a distance-prior matrix from seed lists per class.
+
+    For each class column ``c`` present in ``seed_internals_by_class``,
+    sets ``D[:, c] = mean over s in seeds(c) of 1/(d_geo(:, s) + 1)``,
+    using BFS on the (undirected) graph. Columns not in the dict stay zero.
+
+    NetworkIt's BFS returns ``sys.float_info.max`` (~1.8e308) for
+    unreachable nodes; ``1.0 / (d + 1.0)`` underflows to 0 for those —
+    so unreachable nodes naturally get a 0 prior for that class.
+    """
+    D = np.zeros((n_nodes, n_labels), dtype=np.float64)
+    for class_idx, seed_internals in seed_internals_by_class.items():
+        if not seed_internals:
+            continue
+        col = np.zeros(n_nodes, dtype=np.float64)
+        for src in seed_internals:
+            bfs = nk.distance.BFS(undirected_graph, src)
+            bfs.run()
+            distances = np.asarray(bfs.getDistances(), dtype=np.float64)
+            col += 1.0 / (distances + 1.0)
+        D[:, class_idx] = col / len(seed_internals)
+    return D
+
+
+def _compute_distance_prior(
+    graph: nk.Graph,
+    id_mapper: IDMapper,
+    seed_labels: Dict[Any, str],
+    labels: List[str],
+) -> np.ndarray:
+    """Compute the per-class distance prior matrix ``D`` for GLP.
+
+    ``D[i, c] = mean over s in seeds(c) of 1/(d_geo(i, s) + 1)``.
+
+    Mirrors the legacy ``stlp`` distance map: closer to a class's seeds →
+    larger prior for that class. Distances are computed on the undirected
+    unweighted version of the graph so they are symmetric (matching
+    ``stlp``'s ``toUndirected(toUnweighted(...))`` choice).
+
+    Returns
+    -------
+    np.ndarray
+        ``(n_nodes, n_labels)`` matrix of nonnegative floats in ``[0, 1]``.
+    """
+    with LoggingTimer("Computing per-class distance prior"):
+        n_nodes = graph.numberOfNodes()
+        n_labels = len(labels)
+        label_to_idx = {label: i for i, label in enumerate(labels)}
+
+        seed_internals_by_class: Dict[int, List[int]] = {}
+        for original_id, label in seed_labels.items():
+            if label not in label_to_idx:
+                # Defensive: skip seeds whose label isn't in the master list.
+                continue
+            internal_id = id_mapper.get_internal(original_id)
+            seed_internals_by_class.setdefault(
+                label_to_idx[label], []
+            ).append(internal_id)
+
+        undirected_graph = (
+            nk.graphtools.toUndirected(graph) if graph.isDirected() else graph
+        )
+
+        return _compute_class_distance_columns(
+            undirected_graph, seed_internals_by_class, n_nodes, n_labels
+        )
 
 
 def _create_transition_matrix(
@@ -1199,14 +1333,26 @@ def _propagate_iteration(
     F: np.ndarray,
     P: sp.csr_matrix,
     Y: np.ndarray,
-    alpha: float
+    alpha: float,
+    distance_prior: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Perform a single propagation iteration step.
-    
-    This function implements the core propagation update:
-    F^(t+1) = α P F^(t) + (1-α) Y
-    
+
+    Without a distance prior::
+
+        F^(t+1) = α P F^(t) + (1-α) Y
+
+    With a per-class distance prior ``D`` (shape ``(n_nodes, n_labels)``)::
+
+        F^(t+1) = α P (F^(t) ⊙ D) + (1-α) Y
+
+    The Hadamard product ``F ⊙ D`` scales each neighbor's per-class
+    contribution by its geodesic-distance prior for that class — closer to
+    a class's seeds means the neighbor propagates that class more strongly.
+    This is the matrix-form translation of the legacy ``stlp`` distance
+    weighting.
+
     Parameters
     ----------
     F : np.ndarray
@@ -1217,39 +1363,29 @@ def _propagate_iteration(
         Initial seed label matrix (n_nodes × n_labels)
     alpha : float
         Propagation coefficient (0-1)
-    
+    distance_prior : Optional[np.ndarray]
+        Per-class geodesic-distance prior, shape (n_nodes, n_labels) and
+        nonnegative. ``None`` (default) recovers the standard update.
+
     Returns
     -------
     np.ndarray
         Updated label probability matrix F^(t+1)
-    
+
     Raises
     ------
     ComputationError
         If matrix operations fail due to numerical issues
-    
-    Examples
-    --------
-    >>> F_new = _propagate_iteration(F_old, P, Y, alpha=0.85)
-    >>> F_new.shape == F_old.shape
-    True
-    
-    Notes
-    -----
-    This function performs the mathematical core of label propagation:
-    - P @ F: propagates current probabilities through network connections
-    - α controls balance between neighbor influence vs. seed retention
-    - (1-α) Y ensures seeds maintain their original labels
     """
     try:
-        # Matrix multiplication: P @ F (propagate through network)
-        propagated = P.dot(F)
-        
-        # Update: F = α * propagated + (1-α) * Y
+        if distance_prior is None:
+            propagated = P.dot(F)
+        else:
+            propagated = P.dot(F * distance_prior)
+
         F_new = alpha * propagated + (1 - alpha) * Y
-        
         return F_new
-        
+
     except Exception as e:
         raise ComputationError(
             f"Matrix operation failed during propagation iteration",
@@ -1406,7 +1542,8 @@ def _iterative_propagation(
     Y: np.ndarray,
     alpha: float,
     max_iterations: int,
-    convergence_threshold: float
+    convergence_threshold: float,
+    distance_prior: Optional[np.ndarray] = None,
 ) -> int:
     """
     Perform iterative label propagation until convergence.
@@ -1446,7 +1583,7 @@ def _iterative_propagation(
             F_prev = F.copy()
             
             # Perform single propagation iteration
-            F_new = _propagate_iteration(F, P, Y, alpha)
+            F_new = _propagate_iteration(F, P, Y, alpha, distance_prior=distance_prior)
             F[:] = F_new  # Update in-place
             
             # Check convergence
@@ -1515,6 +1652,8 @@ def _ensemble_run_epoch(
     convergence_threshold: float,
     normalize: bool,
     epoch_seed: int,
+    base_D: Optional[np.ndarray] = None,
+    undirected_graph: Optional[nk.Graph] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Run one ensemble epoch on shared, pre-built transition matrices.
@@ -1566,14 +1705,37 @@ def _ensemble_run_epoch(
         ``(F_out, F_in)`` where ``F_in`` is ``None`` iff ``P_in`` is.
     """
     Y = base_Y.copy()
+    noise_internals: List[int] = []
     if noise_label_idx is not None and n_noise_seeds > 0 and non_seed_pool:
         rng = random.Random(epoch_seed)
         noise_internals = rng.sample(non_seed_pool, n_noise_seeds)
         Y[noise_internals, noise_label_idx] = 1.0
 
+    # Build this epoch's distance prior: base_D (non-noise columns) + a
+    # fresh noise column from BFSes seeded by `noise_internals`. base_D
+    # is shared/read-only — copy before writing.
+    if base_D is None:
+        D: Optional[np.ndarray] = None
+    else:
+        D = base_D.copy()
+        if (
+            noise_internals
+            and undirected_graph is not None
+            and noise_label_idx is not None
+        ):
+            n_nodes = D.shape[0]
+            col = np.zeros(n_nodes, dtype=np.float64)
+            for src in noise_internals:
+                bfs = nk.distance.BFS(undirected_graph, src)
+                bfs.run()
+                distances = np.asarray(bfs.getDistances(), dtype=np.float64)
+                col += 1.0 / (distances + 1.0)
+            D[:, noise_label_idx] = col / len(noise_internals)
+
     F_out = Y.copy()
     _iterative_propagation(
-        F_out, P_out, Y, alpha, max_iterations, convergence_threshold
+        F_out, P_out, Y, alpha, max_iterations, convergence_threshold,
+        distance_prior=D,
     )
     if normalize:
         F_out = _normalize_F(F_out)
@@ -1582,7 +1744,8 @@ def _ensemble_run_epoch(
     if P_in is not None:
         F_in = Y.copy()
         _iterative_propagation(
-            F_in, P_in, Y, alpha, max_iterations, convergence_threshold
+            F_in, P_in, Y, alpha, max_iterations, convergence_threshold,
+            distance_prior=D,
         )
         if normalize:
             F_in = _normalize_F(F_in)
