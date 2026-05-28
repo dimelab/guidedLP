@@ -71,6 +71,155 @@ _VALID_OUTPUT_MODES = frozenset({"aggregated", "long", "lazy"})
 
 
 # ---------------------------------------------------------------------------
+# URL normalization
+# ---------------------------------------------------------------------------
+
+# Known tracking / analytics query parameters stripped from URLs when
+# ``normalize=True``. Names are matched case-insensitively. Curated from
+# spreadAnalysis's ``link_utils.py`` plus a handful of widely-deployed click-ID
+# parameters; ambiguous single-letter or very generic names (``r``, ``type``,
+# ``set``, ``print``, ``do``, ``from``, ``ref``, ``src``, ``feature``, ``list``,
+# ``keywords``) are intentionally excluded to avoid stripping path-meaningful
+# parameters. Extend by editing this tuple and re-deriving the regexes below.
+_TRACKING_PARAMS = (
+    # Google Analytics / UTM family
+    "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
+    "utm_name", "utm_referrer", "utm_id", "utm_creative_format",
+    "utm_marketing_tactic",
+    # Click IDs (ad networks)
+    "fbclid",                                # Facebook
+    "gclid", "gclsrc", "dclid",              # Google
+    "msclkid",                               # Microsoft / Bing
+    "yclid",                                 # Yandex
+    "twclid",                                # Twitter
+    "li_fat_id",                             # LinkedIn
+    # Email-marketing trackers
+    "mc_cid", "mc_eid",                      # Mailchimp
+    "mkt_tok",                               # Marketo
+    "_hsenc", "_hsmi",                       # HubSpot
+    "vero_id", "vero_conv",                  # Vero
+    # Platform-specific share trackers
+    "igshid",                                # Instagram
+    "si",                                    # Spotify, YouTube short URLs
+    "__twitter_impression",                  # Twitter beacon
+    "ref_src",                               # Twitter referral
+    "trk", "trkCampaign",                    # LinkedIn
+    # News / publisher trackers
+    "ncid", "ocid",                          # Yahoo, MSN
+    "ito",                                   # Microsoft News
+    "smid",                                  # NYT
+    "wt_zmc",                                # Die Zeit
+    "cmp", "CMP",                            # Various
+    "soc_src", "soc_trk",                    # Generic social
+    "at_medium", "at_campaign",              # BBC
+    "dmcid",
+    "mktci", "mktcval", "mktcid",            # Marketo variants
+    "ns_mchannel", "ns_campaign",
+    "wtrid", "rcode", "smtyp",
+    "cid_source", "flattrss_redirect",
+    # Yahoo GUCE / consent banners
+    "guccounter", "guce_referrer", "guce_referrer_sig",
+    # Misc
+    "refsrc", "noredirect", "highlightedUpdateUrns",
+)
+
+_TRACKING_ALTERNATION = "|".join(_TRACKING_PARAMS)
+
+# Pass 1: strip a contiguous run of tracking params at the *start* of the
+# query string, preserving the leading ``?`` so any kept params downstream
+# remain parseable. The trailing ``&?`` consumes the separator before the
+# next param so we don't leave a stray ``?&`` behind.
+_TRACKING_LEADING_REGEX = (
+    r"(?i)\?(?:(?:" + _TRACKING_ALTERNATION + r")=[^&#]*&?)+"
+)
+# Pass 2: strip any tracking param that appears later in the query string
+# (preceded by ``&``). Pass 1 already consumed leading runs, so the remaining
+# matches here are always non-first.
+_TRACKING_TRAILING_REGEX = (
+    r"(?i)&(?:" + _TRACKING_ALTERNATION + r")=[^&#]*"
+)
+
+
+def _normalize_url_expr(expr: pl.Expr) -> pl.Expr:
+    """
+    Build a Polars expression that canonicalizes a column of URLs.
+
+    Steps, in order:
+
+    1. Unescape HTML-encoded ampersands (``amp;`` and ``amp%3B``) that often
+       leak in from HTML-pasted sources.
+    2. Cut markdown link tails: a stray ``](...`` is treated as a sentinel
+       and everything from there to the end of the URL string is dropped.
+    3. Lowercase the scheme (``HTTPS://`` → ``https://``).
+    4. Lowercase the host portion only — the path/query/fragment keeps its
+       original case since those are case-sensitive in HTTP.
+    5. Canonicalize YouTube URLs:
+       - ``youtu.be/<id>`` → ``https://youtube.com/watch?v=<id>``
+       - ``youtube.com/watch?...&v=<id>&...`` → ``https://youtube.com/watch?v=<id>``
+    6. Strip well-known tracking parameters (``utm_*``, ``fbclid``, ``gclid``,
+       ``mc_cid``, …) — see :data:`_TRACKING_PARAMS`.
+    7. Clean up dangling ``?`` or ``&`` left after parameter removal
+       (e.g. ``site.com?`` → ``site.com``, ``site.com?#frag`` → ``site.com#frag``).
+    8. Strip trailing sentence punctuation.
+
+    All steps are pure Polars/regex expressions — no Python row loops, so the
+    whole pipeline stays vectorized over the column.
+    """
+    # 1) Unescape ampersands from HTML-pasted URLs.
+    expr = expr.str.replace_all("amp%3B", "").str.replace_all("amp;", "")
+
+    # 2) Markdown ``](`` tail cut. The default URL regex already excludes
+    # ``]`` and ``(`` so this is defensive — it covers callers that pass in
+    # pre-extracted URLs from a looser pattern.
+    expr = expr.str.replace(r"\]\(.*$", "")
+
+    # 3) Scheme → lowercase. The replacement string is literal lowercase, so
+    # any case variant of the case-insensitive match is normalized.
+    expr = expr.str.replace(r"(?i)^https://", "https://")
+    expr = expr.str.replace(r"(?i)^http://", "http://")
+
+    # 4) Host → lowercase, preserving path case. Split into scheme + host +
+    # rest via regex captures, lowercase the host, recombine. ``str.replace``
+    # of an unmatched pattern is a no-op, so bare ``www.``-style URLs (no
+    # scheme) flow through with an empty scheme part.
+    after_scheme = expr.str.replace(r"^https?://", "")
+    scheme_part = expr.str.extract(r"^(https?://)", 1).fill_null("")
+    host_part = (
+        after_scheme.str.extract(r"^([^/?#]+)", 1)
+        .fill_null("")
+        .str.to_lowercase()
+    )
+    path_part = after_scheme.str.replace(r"^[^/?#]+", "")
+    expr = scheme_part + host_part + path_part
+
+    # 5) YouTube canonicalization. Both rules anchor on ``^...$`` so they
+    # only fire on full-URL matches; non-YouTube URLs flow through.
+    expr = expr.str.replace(
+        r"^https?://(?:www\.)?youtu\.be/([A-Za-z0-9_-]+).*$",
+        "https://youtube.com/watch?v=$1",
+    )
+    expr = expr.str.replace(
+        r"^https?://(?:www\.)?youtube\.com/watch\?(?:[^&]*&)*v=([A-Za-z0-9_-]+).*$",
+        "https://youtube.com/watch?v=$1",
+    )
+
+    # 6) Tracking-param stripping (two passes — see regex definitions above
+    # for why this isn't a single pattern).
+    expr = expr.str.replace_all(_TRACKING_LEADING_REGEX, "?")
+    expr = expr.str.replace_all(_TRACKING_TRAILING_REGEX, "")
+
+    # 7) Tidy dangling query-string delimiters left after param removal.
+    expr = expr.str.replace(r"\?#", "#")
+    expr = expr.str.replace(r"\?$", "")
+    expr = expr.str.replace(r"&$", "")
+
+    # 8) Trailing sentence punctuation.
+    expr = expr.str.strip_chars_end(_TRAILING_PUNCT)
+
+    return expr
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
@@ -153,6 +302,7 @@ def extract_urls(
     post_col: str = "post",
     datetime_col: Optional[str] = "datetime",
     url_col: str = "url",
+    normalize: bool = True,
 ) -> pl.DataFrame:
     """
     Extract URLs from posts into a long-form sender→URL edge list.
@@ -180,6 +330,17 @@ def extract_urls(
         sender→URL edge list).
     url_col : str, default "url"
         Name of the URL column in the output.
+    normalize : bool, default True
+        If True, canonicalize each extracted URL: lowercase scheme + host
+        (preserving path case), strip ``utm_*``/``fbclid``/``gclid``/etc.
+        tracking parameters, collapse ``youtu.be/<id>`` and
+        ``youtube.com/watch?...&v=<id>`` into a canonical form, and clean up
+        HTML-escaped ``amp;``. This is the default because the same article
+        shared with different tracking codes would otherwise produce distinct
+        URL nodes when fed into ``build_graph_from_edgelist``. Set to False to
+        keep the raw extracted URLs and apply only the trailing-punctuation
+        strip. See :func:`_normalize_url_expr` for the full step list and
+        :data:`_TRACKING_PARAMS` for the parameter list.
 
     Returns
     -------
@@ -197,7 +358,8 @@ def extract_urls(
     ----------
     O(N · L) where N is the number of input rows and L is the average post
     length — a single vectorized pass over ``post_col`` with the Rust regex
-    engine, then a flat explode and filter.
+    engine, then a flat explode and filter. Normalization adds a constant
+    number of additional regex passes over the (much shorter) URL column.
 
     Examples
     --------
@@ -224,9 +386,12 @@ def extract_urls(
         out_col=url_col,
     )
 
-    return result.with_columns(
-        pl.col(url_col).str.strip_chars_end(_TRAILING_PUNCT)
-    )
+    if normalize:
+        url_expr = _normalize_url_expr(pl.col(url_col))
+    else:
+        url_expr = pl.col(url_col).str.strip_chars_end(_TRAILING_PUNCT)
+
+    return result.with_columns(url_expr.alias(url_col))
 
 
 def extract_domains(
@@ -236,6 +401,7 @@ def extract_domains(
     datetime_col: Optional[str] = "datetime",
     domain_col: str = "domain",
     strip_www: bool = True,
+    normalize: bool = True,
 ) -> pl.DataFrame:
     """
     Extract URLs from posts and reduce each one to its host (domain).
@@ -266,6 +432,11 @@ def extract_domains(
         If True, drop a leading ``www.`` from each host so ``www.bbc.co.uk``
         and ``bbc.co.uk`` collapse to the same domain. Set False to keep
         the ``www.`` subdomain distinct.
+    normalize : bool, default True
+        Forwarded to :func:`extract_urls`. The most domain-visible effect is
+        that ``youtu.be/<id>`` URLs collapse to the ``youtube.com`` domain
+        rather than being treated as a separate host. Set to False to keep
+        platforms' short-URL hosts distinct.
 
     Returns
     -------
@@ -302,6 +473,7 @@ def extract_domains(
         post_col=post_col,
         datetime_col=datetime_col,
         url_col="_glp_url_tmp",
+        normalize=normalize,
     )
 
     # Strip scheme, then take everything up to the first path/query/fragment
