@@ -221,11 +221,13 @@ class TestNoiseCategoryFeatures:
         """Test parameter validation for noise category features."""
         graph, mapper, seed_labels, labels = graph_and_mapper
         
-        # Test invalid noise_ratio
-        with pytest.raises(ConfigurationError, match="Noise ratio must be between 0.0 and 1.0"):
+        # Test invalid (negative) noise_ratio. Values > 1 are now allowed
+        # — noise_ratio is a multiplier on the user-seed count, capped at
+        # the non-seed pool, so the only invalid input is < 0.
+        with pytest.raises(ConfigurationError, match="Noise ratio must be non-negative"):
             guided_label_propagation(
                 graph, mapper, seed_labels, labels,
-                enable_noise_category=True, noise_ratio=1.5
+                enable_noise_category=True, noise_ratio=-0.1
             )
         
         # Test invalid confidence_threshold

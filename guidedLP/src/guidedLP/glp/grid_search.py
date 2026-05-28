@@ -142,7 +142,9 @@ class GLPGridSearch:
         Auto-add a ``"noise"`` category. Required for ``noise_error_share`` to
         be a meaningful metric.
     noise_ratio : float, default 0.1
-        Fraction of non-seed nodes assigned as noise seeds.
+        Multiplier on the user-seed count for the noise sample size
+        (``n_noise = max(1, int(noise_ratio * n_user_seeds))``, capped
+        at the non-seed pool). Values ``> 1`` are allowed.
     n_workers : Optional[int], default None
         Workers for ``ensemble_label_propagation`` within a cell. ``None``
         uses the ensemble's default (cap at ``min(n_epochs, cpu_count)``).

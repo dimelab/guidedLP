@@ -222,8 +222,13 @@ def guided_label_propagation(
         Automatically add a "noise" category for nodes with weak label associations.
         Helps identify outlier nodes and improves classification confidence.
     noise_ratio : float, default 0.1
-        Fraction of non-seed nodes to randomly assign as noise seeds (0.0-1.0).
-        Only used when enable_noise_category=True.
+        Multiplier on the user-seed count that determines how many random
+        non-seed nodes are tagged as noise seeds:
+        ``n_noise = max(1, int(noise_ratio * n_user_seeds))``, capped at
+        the size of the non-seed pool. Values ``> 1`` are allowed and
+        produce more noise seeds than user seeds — useful when you
+        suspect most of the graph lies outside your labelled classes.
+        Must be ``>= 0``. Only used when ``enable_noise_category=True``.
     confidence_threshold : float, default 0.0
         Minimum probability threshold for classification. Nodes with max probability
         below this threshold are classified as "uncertain" (0.0-1.0).
@@ -1045,9 +1050,9 @@ def _validate_inputs(
     
     # Validate noise category parameters
     if enable_noise_category:
-        if not 0.0 <= noise_ratio <= 1.0:
+        if noise_ratio < 0.0:
             raise ConfigurationError(
-                f"Noise ratio must be between 0.0 and 1.0, got {noise_ratio}",
+                f"Noise ratio must be non-negative, got {noise_ratio}",
                 parameter="noise_ratio",
                 value=noise_ratio
             )
@@ -1949,7 +1954,9 @@ def _process_noise_category(
     enable_noise_category : bool
         Whether to add noise category
     noise_ratio : float
-        Fraction of non-seed nodes to use as noise seeds
+        Multiplier on the user-seed count for ``n_noise = max(1,
+        int(noise_ratio * n_user_seeds))``, capped at the non-seed
+        pool size. Values ``> 1`` are allowed.
     
     Returns
     -------
@@ -2012,7 +2019,9 @@ def _generate_noise_seeds(
     seed_labels : Dict[Any, str]
         Existing seed labels
     noise_ratio : float
-        Fraction of non-seed nodes to use as noise seeds
+        Multiplier on the user-seed count for ``n_noise = max(1,
+        int(noise_ratio * n_user_seeds))``, capped at the non-seed
+        pool size. Values ``> 1`` are allowed.
     random_seed : Optional[int], default 42
         Seed for the local RNG used to sample noise nodes. Use distinct values
         per call to draw independent noise samples (e.g., from
