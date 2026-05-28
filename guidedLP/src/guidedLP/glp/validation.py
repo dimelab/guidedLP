@@ -138,6 +138,9 @@ def train_test_split_validation(
         - macro_f1: Macro-averaged F1 score (float)
         - confusion_matrix: Confusion matrix (np.ndarray)
         - test_predictions: Predictions on test set (pl.DataFrame)
+        - misclassified_predictions: Subset of ``test_predictions`` where
+          ``dominant_label != true_label``, with a ``true_label`` column
+          appended (pl.DataFrame)
         - train_size: Number of training seeds (int)
         - test_size: Number of test seeds (int)
         - convergence_iterations: Iterations until convergence (int)
@@ -251,7 +254,16 @@ def train_test_split_validation(
             test_predictions["dominant_label"].to_list(),
             labels
         )
-        
+
+        # Misclassified subset for inspection: test_predictions with a
+        # true_label column added, filtered to rows where prediction != truth.
+        test_predictions_with_truth = test_predictions.with_columns(
+            pl.Series("true_label", test_labels_list)
+        )
+        misclassified_predictions = test_predictions_with_truth.filter(
+            pl.col("dominant_label") != pl.col("true_label")
+        )
+
         # Step 5: Build comprehensive results
         results = {
             "accuracy": metrics["accuracy"],
@@ -263,6 +275,7 @@ def train_test_split_validation(
             "macro_f1": metrics["macro_f1"],
             "confusion_matrix": metrics["confusion_matrix"],
             "test_predictions": test_predictions,
+            "misclassified_predictions": misclassified_predictions,
             "train_size": len(train_seeds),
             "test_size": len(test_seeds),
             "classification_report": metrics["classification_report"],
