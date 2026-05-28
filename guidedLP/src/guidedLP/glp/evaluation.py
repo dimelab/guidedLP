@@ -45,7 +45,12 @@ def analyze_label_distribution(
     -------
     Dict[str, Any]
         Comprehensive distribution analysis containing:
+        - total_nodes: int - Total number of nodes in the result
+        - total_labeled_nodes: int - Number of nodes whose dominant_label is in
+          ``labels`` (excludes "uncertain" assignments from confidence
+          thresholding)
         - label_counts: Dict[str, int] - Number of nodes per dominant label
+          (includes any "uncertain"/"noise" buckets if present)
         - mean_confidence: float - Average confidence across all nodes
         - confidence_by_label: Dict[str, float] - Mean confidence per label
         - probability_distributions: Dict[str, np.ndarray] - Probability histograms
@@ -91,29 +96,39 @@ def analyze_label_distribution(
     with LoggingTimer("Analyzing label distribution"):
         
         # Basic label counts
-        label_counts = _calculate_label_counts(predictions)
-        
+        label_counts = _calculate_label_counts(predictions, labels)
+
+        # Node totals — total nodes vs. nodes assigned a real label from `labels`
+        # (excludes "uncertain" classifications from confidence thresholding).
+        total_nodes = len(predictions)
+        total_labeled_nodes = int(
+            predictions.filter(pl.col("dominant_label").is_in(labels)).height
+        )
+
         # Confidence statistics
         mean_confidence = float(predictions["confidence"].mean())
         confidence_by_label = _calculate_confidence_by_label(predictions, labels)
         seed_vs_nonseed_confidence = _calculate_seed_confidence_comparison(predictions)
-        
+
         # Probability distributions (histograms)
         probability_distributions = _calculate_probability_distributions(predictions, labels)
-        
+
         # High/low confidence node identification
         high_confidence_nodes = predictions.filter(pl.col("confidence") > 0.8)
         uncertain_nodes = predictions.filter(pl.col("confidence") < 0.5)
-        
+
         # Label entropy calculation
         label_entropy = _calculate_label_entropy(predictions, labels)
-        
+
         logger.info(f"Distribution analysis complete: {len(label_counts)} labels, "
+                   f"{total_labeled_nodes}/{total_nodes} nodes labeled, "
                    f"mean confidence {mean_confidence:.3f}, "
                    f"{len(high_confidence_nodes)} high confidence nodes, "
                    f"{len(uncertain_nodes)} uncertain nodes")
-        
+
         return {
+            "total_nodes": total_nodes,
+            "total_labeled_nodes": total_labeled_nodes,
             "label_counts": label_counts,
             "mean_confidence": mean_confidence,
             "confidence_by_label": confidence_by_label,
@@ -274,11 +289,23 @@ def _validate_directional_inputs(
         )
 
 
-def _calculate_label_counts(predictions: pl.DataFrame) -> Dict[str, int]:
-    """Calculate count of nodes per dominant label."""
-    
+def _calculate_label_counts(
+    predictions: pl.DataFrame,
+    labels: List[str] = None,
+) -> Dict[str, int]:
+    """Calculate count of nodes per dominant label.
+
+    If ``labels`` is provided, every label in it is present in the result
+    (with 0 for labels that no node has as dominant). Any additional
+    dominant-label values found in the data (e.g. ``"uncertain"`` or
+    ``"noise"``) are also included.
+    """
+
     counts = predictions.group_by("dominant_label").count()
-    return {row["dominant_label"]: row["count"] for row in counts.iter_rows(named=True)}
+    result: Dict[str, int] = {label: 0 for label in labels} if labels else {}
+    for row in counts.iter_rows(named=True):
+        result[row["dominant_label"]] = row["count"]
+    return result
 
 
 def _calculate_confidence_by_label(predictions: pl.DataFrame, labels: List[str]) -> Dict[str, float]:

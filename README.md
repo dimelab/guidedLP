@@ -457,7 +457,7 @@ labels = guided_label_propagation(
 
 See `docs/architecture/glp.md` ("Bipartite Graphs & Stat-User Augmentation") for the design rationale (why ordering matters, what the synthetic edges actually compute) and `bipartite_glp_notes.md` at the repo root for related literature (Co-HITS, BiRank, personalized PageRank with concentrated teleportation).
 
-### 6. End-to-End Pipeline Wrapper
+### 6. End-to-End Pipeline Wrappers
 
 For the canonical attribution workflow — raw input → bipartite EdgeList → bipartite-side backbone → temporal projection → projection-side backbone — `guidedLP.pipelines.run_canonical_pipeline` composes all four stages in a single call with explicit memory management between steps. Compared to calling the four functions by hand, the wrapper releases intermediates between stages so they don't co-exist in RAM, and optionally checkpoints to disk for memory-constrained runs.
 
@@ -503,7 +503,40 @@ With `verbose=True` the pipeline prints a per-stage one-liner plus a final TOTAL
 | `"balanced"` (default) | `del` + `gc.collect()` between stages | none | the 80% case — moderately lower peak, ~30% slower stages |
 | `"low"` | additionally checkpoints each EdgeList to parquet between stages | a few seconds | memory-constrained runs |
 
-Use the wrapper when running the canonical four-stage pipeline as-is. Skip it when your workflow deviates — extra steps, different projection method, additional joins/filters between stages — and call the lower-level functions directly. The wrapper also accepts a `content_seeds` DataFrame to attach stat-user anchor edges between projection and projection backbone (see Example 5).
+Use the wrapper when running the canonical four-stage pipeline as-is. Skip it when your workflow deviates — extra steps, different projection method, additional joins/filters between stages — and call the lower-level functions directly. The wrapper also accepts a `content_seeds` DataFrame to attach stat-user anchor edges between projection and projection backbone (see Example 5). When the directed citation projection is the wrong shape for your analysis, see the undirected variant below.
+
+#### Undirected variant — `run_undirected_bipartite_pipeline`
+
+When you want a symmetric co-occurrence graph (e.g. Jaccard similarity between users who share content) rather than directed citation attribution, use the undirected sibling. Same four-stage shape — bipartite EdgeList → `bipartite_svn` backbone → projection → `noise_corrected` backbone — but stage 3 swaps `temporal_bipartite_to_unipartite` for `project_bipartite`, so the output is undirected and weighted by a topological similarity (`"jaccard"`, `"count"`, or `"overlap"`).
+
+```python
+from guidedLP.pipelines import run_undirected_bipartite_pipeline
+
+result = run_undirected_bipartite_pipeline(
+    source="shares.parquet",
+    source_col="user", target_col="item",
+    projection_mode="source",                  # collapse items, keep users
+    projection_weight_method="jaccard",        # "count" | "jaccard" | "overlap"
+    min_source_degree=25,
+    bipartite_alpha=0.01, bipartite_correction="fdr_bh",
+    projection_target_fraction=0.2,
+    memory_mode="balanced",
+    verbose=True,
+)
+
+backbone = result.edgelist                     # undirected, weighted EdgeList
+mapper = result.id_mapper
+print(f"{backbone.number_of_edges():,} edges, {backbone.n_nodes:,} nodes")
+```
+
+Key differences vs `run_canonical_pipeline`:
+
+- **No temporal inputs.** No `timestamp_col`, `weight_col`, `time_decay`, or `presort_temporal` — `project_bipartite` computes edge weights from shared-neighbor topology, ignoring per-edge weights and timestamps.
+- **Default weight is Jaccard.** `projection_weight_method="jaccard"` is bounded in `[0, 1]`, which tends to behave better under `noise_corrected` backboning and downstream GLP than the raw `"count"` weights.
+- **Output is undirected** → run downstream GLP with `directional=False` (a single `predictions_df`, not the `(out_df, in_df)` tuple the canonical pipeline produces).
+- **`content_seeds` emits each anchor edge once.** The undirected projection treats both orientations as equivalent, so the `forward + reverse` mirroring used in Example 5 isn't needed here — supply `("__lbl_left", "u1", 1.0)` and you're done.
+
+Memory modes (`"fast"` / `"balanced"` / `"low"`), `result.stage_stats`, `keep_intermediates`, `protected_nodes`, and the optional `content_seeds` stage all work identically to the canonical wrapper above — the only knobs that change are the stage-3 ones (`projection_mode`, `projection_weight_method`). Use this pipeline for symmetric similarity / community-style analyses; use `run_canonical_pipeline` when later-sharer → earlier-sharer attribution direction matters (PageRank / HITS-flavored analyses).
 
 ### 7. Evaluating GLP Quality with Held-Out Seeds
 

@@ -155,9 +155,9 @@ class TestAnalyzeLabelDistribution:
         
         result = analyze_label_distribution(predictions, labels)
         
-        # Check label counts
-        assert result["label_counts"] == {"A": 2}
-        assert "B" not in result["label_counts"]  # No nodes with dominant label B
+        # Check label counts — every label in `labels` is present, with 0 for
+        # labels that no node has as dominant.
+        assert result["label_counts"] == {"A": 2, "B": 0}
         
         # Check confidence by label
         assert result["confidence_by_label"]["A"] > 0
