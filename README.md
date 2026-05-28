@@ -360,9 +360,9 @@ edges = apply_backbone(edges, method="noise_corrected", threshold=1.0, directed=
 Examples 3 and 4 covered the standard bipartite case — seeds live on the same partition you want to propagate over (seeds are users, project to users, run GLP). But labels often live on the *other* partition. A curated list of left/right-leaning news outlets (content side), and you want to score *users* by what they engage with. Two options:
 
 - **Run GLP on the bipartite directly with content seeds**, then keep the user rows. Simple, but pays the period-2 random-walk cost (user-to-user "distance" takes two iterations per hop).
-- **Stat-user augmentation** (this example). Collapse each labeled content node into a synthetic "stat user" that lives in the user partition and stays anchored to that label throughout propagation via the `(1−α)Y` term. GLP then operates cleanly on the user-user projection.
+- **Stat-user augmentation** (this example). Construct synthetic "stat user" nodes that live in the user partition and stay anchored to a label throughout propagation via the `(1−α)Y` term. GLP then operates cleanly on the user-user projection.
 
-`make_stat_user_edges` builds the synthetic edges; `exclude_from_output` on GLP drops the synthetic nodes from the result. **Important:** augment *after* any backboning of the user-user graph — stat users have an artificial degree profile (degree 1 on the bipartite, audience-size on the projection) that backboning methods aren't calibrated for.
+You own the anchor edges — schema is `source_id` (the synthetic anchor ID), `target_id` (the real user), `weight` (Float64). Build the frame however suits your data; `make_stat_user_edges` is a convenience that aggregates engagement-strength weights from a bipartite frame + a `{content: label}` dict. You also own the seed labels you hand to GLP, and the set of synthetic IDs you ask GLP to drop from the output via `exclude_from_output`.
 
 ```python
 import polars as pl
@@ -388,18 +388,32 @@ user_edges = project_bipartite(
 )
 
 # ── Step 2: backbone the user-user graph (BEFORE augmenting) ─────────────
-# Filtering / backboning runs on real edges only; augmentation comes after.
+# Filtering / backboning runs on real edges only; augmentation comes after,
+# because stat users have an artificial degree profile (degree 1 on the
+# bipartite, audience-size on the projection) that backboning methods
+# aren't calibrated for.
 user_edges = apply_backbone(
     user_edges, method="disparity", alpha=0.05, directed=False,
 )
 
-# ── Step 3: generate stat-user edges from the bipartite + seeds ──────────
-# Each labeled outlet becomes a synthetic node `__stat__{outlet}` with one
-# edge per user who engaged with it, weighted by their engagement strength.
+# ── Step 3: build the anchor edges ───────────────────────────────────────
+# Convenience path — make_stat_user_edges aggregates per-(user, content)
+# engagement weights into the `source_id / target_id / weight` schema and
+# also returns a seeds dict and the synthetic node IDs.
 stat_edges, stat_seeds, stat_ids = make_stat_user_edges(
     engagement, outlet_seeds,
     user_col="user", content_col="outlet", weight_col="weight",
 )
+# Or hand-build the same shape — you control the weights, edge set, and
+# direction. The shape below is what the rest of the example consumes:
+#
+#   stat_edges = pl.DataFrame({
+#       "source_id": ["__stat__nytimes.com", ...],
+#       "target_id": ["u123", ...],
+#       "weight":    [1.0, ...],            # any Float64 scale you want
+#   })
+#   stat_seeds = {"__stat__nytimes.com": "left", ...}
+#   stat_ids   = {"__stat__nytimes.com", ...}
 
 # ── Step 4: concat, build graph, propagate, drop stat users from output ──
 augmented = pl.concat([user_edges, stat_edges])
@@ -411,6 +425,34 @@ result = guided_label_propagation(
     exclude_from_output=stat_ids,   # drops __stat__... rows from result
 )
 # `result` has one row per real user with left_prob / right_prob.
+```
+
+**Attaching anchor edges to an existing EdgeList.** When you already have an `EdgeList` (e.g. the projection from an earlier step), `EdgeList.attach(extra_df, mapper)` concatenates and re-encodes in one call — no manual decode / concat / re-encode:
+
+```python
+projected_el, projected_mapper = project_bipartite(
+    bipartite_el, full_mapper, projection_mode="source", weight_method="jaccard",
+)
+augmented_el, augmented_mapper = projected_el.attach(stat_edges, projected_mapper)
+graph, mapper = edgelist_to_graph(augmented_el, augmented_mapper)
+```
+
+**Doing the whole thing in the canonical pipeline.** The temporal-attribution pipeline (`run_canonical_pipeline`) accepts a `content_seeds` DataFrame in the same schema and attaches it between the projection and the projection backbone (Stage 3.5). Because the attach runs *before* the backbone, you control whether the synthetic edges survive — pass `protected_nodes=list(stat_ids)` or pick weights deliberately:
+
+```python
+from guidedLP.pipelines import run_canonical_pipeline
+
+result = run_canonical_pipeline(
+    engagement, source_col="user", target_col="outlet", timestamp_col="ts",
+    weight_col="weight",
+    content_seeds=stat_edges,           # same source_id/target_id/weight frame
+    protected_nodes=list(stat_ids),     # keep anchors past noise_corrected
+)
+graph, mapper = edgelist_to_graph(result.edgelist, result.id_mapper)
+labels = guided_label_propagation(
+    graph, mapper, stat_seeds, ["left", "right"],
+    exclude_from_output=stat_ids,
+)
 ```
 
 See `docs/architecture/glp.md` ("Bipartite Graphs & Stat-User Augmentation") for the design rationale (why ordering matters, what the synthetic edges actually compute) and `bipartite_glp_notes.md` at the repo root for related literature (Co-HITS, BiRank, personalized PageRank with concentrated teleportation).

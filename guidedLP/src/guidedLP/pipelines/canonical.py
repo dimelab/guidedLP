@@ -9,24 +9,19 @@ Composes the four canonical stages most attribution-style analyses use:
    edges to the statistically significant subset.
 3. :func:`temporal_bipartite_to_unipartite` — citation-direction
    projection onto one partition (default: the source-side).
+
+Optional Stage 3.5 (enabled by passing ``content_seeds`` as a DataFrame):
+attach caller-supplied edges (e.g. synthetic label-anchor / stat-user
+edges) onto the projection via :meth:`guidedLP.common.EdgeList.attach`
+before the projection backbone runs. The caller is responsible for the
+edge contents (source/target IDs, weights, direction) — see
+``docs/architecture/glp.md`` ("Bipartite Graphs & Stat-User
+Augmentation") and the README's example 5 for the underlying pattern.
+
 4. :func:`apply_backbone(method="noise_corrected")` — backbone the
    projection. ``target_fraction`` is the recommended knob here on
    directed graphs (see ``docs/architecture/chunked_projection_design.md``
    for why the threshold path tends to keep ~100% on directed inputs).
-
-Optional Stage 5 (enabled by passing ``content_seeds``):
-
-5. :func:`make_stat_user_edges` — when labels live on the intermediate
-   (content) partition rather than the projected (user) partition,
-   collapse each labeled content node into a synthetic "stat user" that
-   stays anchored to its label via GLP's ``(1-α)Y`` term. The synthetic
-   edges are concatenated onto the projection AFTER both backbones (the
-   stat users' artificial degree profile isn't calibrated for SVN /
-   noise-corrected), and their IDs are returned on the result so the
-   caller can hand them to ``guided_label_propagation`` as ``seed_labels``
-   + ``exclude_from_output``. See README example 5 and
-   docs/architecture/glp.md ("Bipartite Graphs & Stat-User Augmentation")
-   for the design rationale.
 
 Three memory modes control inter-stage release AND within-call streaming:
 
@@ -55,15 +50,13 @@ import tempfile
 import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Union
 
 import polars as pl
 
 from guidedLP.common.edgelist import EdgeList
 from guidedLP.common.id_mapper import IDMapper
 from guidedLP.common.exceptions import ValidationError
-from guidedLP.common.seed_input import SeedInput
-from guidedLP.glp.utils import make_stat_user_edges
 from guidedLP.network.backboning import apply_backbone
 from guidedLP.network.construction import (
     build_edgelist_from_frame,
@@ -113,39 +106,28 @@ class CanonicalPipelineResult:
     ----------
     edgelist : EdgeList
         Final backboned projection. If ``content_seeds`` was provided,
-        this also contains the synthetic stat-user edges concatenated
-        with the real user-user edges.
+        the projection backbone ran on the projection union with the
+        caller's extra edges, so any of those edges that survived the
+        backbone are also present here.
     id_mapper : IDMapper
-        Mapper for ``edgelist``'s codes. Only covers nodes surviving the
-        projection backbone — much smaller than the bipartite input's
-        mapper. When stat-user augmentation ran, the synthetic stat-user
-        IDs (``stat_node_ids``) are also present in the mapper.
+        Mapper for ``edgelist``'s codes. Covers exactly the nodes
+        surviving the projection backbone — including any new nodes
+        introduced by ``content_seeds``.
     stage_stats : list[StageStats]
         Per-stage telemetry in execution order.
     intermediates : dict[str, Any], optional
         Only populated when ``keep_intermediates=True``. Keys:
         ``"bipartite"``, ``"bipartite_filtered"``, ``"projection"``,
-        each mapped to an ``(EdgeList, IDMapper)`` tuple. When stat-user
-        augmentation ran, ``"projection_backboned"`` (the pre-augmented
-        EdgeList) is also present.
-    stat_seeds : dict[str, str], optional
-        Stat-user seed dict (``__stat__{content}`` → label) produced by
-        :func:`guidedLP.glp.make_stat_user_edges`. Pass to
-        :func:`guidedLP.glp.guided_label_propagation` as ``seed_labels``.
-        ``None`` when ``content_seeds`` was not provided.
-    stat_node_ids : set[str], optional
-        Set of synthetic stat-user IDs that appear in ``edgelist``. Pass
-        to ``guided_label_propagation`` as ``exclude_from_output`` to drop
-        them from the final result. ``None`` when ``content_seeds`` was
-        not provided.
+        each mapped to an ``(EdgeList, IDMapper)`` tuple. When
+        ``content_seeds`` was attached, ``"projection_attached"`` (the
+        union of projection + caller's edges, pre-backbone) is also
+        present.
     """
 
     edgelist: EdgeList
     id_mapper: IDMapper
     stage_stats: List[StageStats]
     intermediates: Optional[Dict[str, Any]] = None
-    stat_seeds: Optional[Dict[str, str]] = None
-    stat_node_ids: Optional[Set[str]] = None
 
     @property
     def total_duration_s(self) -> float:
@@ -176,12 +158,11 @@ def run_canonical_pipeline(
     add_edge_weights: bool = True,
     remove_self_loops: bool = True,
     presort_temporal: bool = True,
+    # Stage 3.5 (optional): attach caller-supplied edges to the projection.
+    content_seeds: Optional[pl.DataFrame] = None,
     # Stage 4: projection backbone.
     projection_threshold: float = 1.0,
     projection_target_fraction: Optional[float] = None,
-    # Stage 5 (optional): stat-user augmentation.
-    content_seeds: Optional[SeedInput] = None,
-    stat_prefix: str = "__stat__",
     # Cross-stage protection.
     protected_nodes: Optional[List[Any]] = None,
     # Memory & I/O.
@@ -245,27 +226,25 @@ def run_canonical_pipeline(
         Set False only if you know the input EdgeList is already in
         this order (e.g. because you pre-sorted the raw frame and the
         intervening steps preserved row order).
+    content_seeds : pl.DataFrame, optional
+        Extra edges to attach onto the projection *before* the projection
+        backbone runs (Stage 3.5). Must have columns ``source_id``,
+        ``target_id``, ``weight`` (Float64). The caller is fully
+        responsible for the contents — IDs may reference existing nodes
+        in the projection or new ones (new IDs get added to the mapper);
+        no filtering, deduplication, or directional mirroring is applied.
+        Typical use is to inject synthetic label-anchor / stat-user
+        edges so GLP can propagate from labels that live on the
+        intermediate partition (see the
+        :meth:`guidedLP.common.EdgeList.attach` method and README
+        example 5). Because attachment happens before Stage 4, the
+        attached edges are subject to the noise-corrected backbone —
+        use ``protected_nodes`` (or pick weights / a permissive
+        ``projection_target_fraction``) if you need them to survive.
     projection_threshold, projection_target_fraction : float, optional
         ``apply_backbone(method="noise_corrected")`` parameters.
         ``projection_target_fraction`` is the recommended way to size
         the final backbone on directed projections.
-    content_seeds : SeedInput, optional
-        Labels living on the intermediate (content) partition — i.e.
-        ``intermediate_col``. When provided, enables the optional
-        Stage 5: each labeled content node is converted to a synthetic
-        "stat user" via :func:`guidedLP.glp.make_stat_user_edges`, whose
-        edges are concatenated with the projection. The returned
-        ``stat_seeds`` / ``stat_node_ids`` should be passed to
-        ``guided_label_propagation`` as ``seed_labels`` and
-        ``exclude_from_output`` respectively. When ``None``, Stage 5 is
-        skipped and ``stat_seeds`` / ``stat_node_ids`` on the result are
-        also ``None``. Accepts any of the four ``SeedInput`` shapes (see
-        :func:`guidedLP.common.normalize_seed_input`).
-    stat_prefix : str, default "__stat__"
-        Prefix used to generate stat-user IDs from content IDs. Pick a
-        value that cannot collide with any real user ID — a
-        ``ValidationError`` is raised on collision. Ignored when
-        ``content_seeds`` is None.
     protected_nodes : list, optional
         Original IDs to exempt from filtering in *both* backbone stages.
         Edges incident to a protected node are forced kept by stage 2
@@ -373,16 +352,10 @@ def run_canonical_pipeline(
         # the caller passed a DataFrame and we didn't need to rename it
         # (in which case the caller still expects to use it after the call).
         source_owned_by_us = False
-        # Materialize upfront when EITHER a weight rename OR stat-user
-        # augmentation needs an in-memory frame; the latter calls
-        # make_stat_user_edges directly on the source below.
-        needs_materialized_source = (
-            weight_col is not None or content_seeds is not None
-        )
-        if needs_materialized_source and not isinstance(source, pl.DataFrame):
-            source = _load_source_for_rename(source)
-            source_owned_by_us = True
         if weight_col is not None:
+            if not isinstance(source, pl.DataFrame):
+                source = _load_source_for_rename(source)
+                source_owned_by_us = True
             if weight_col not in source.columns:
                 raise ValidationError(
                     f"weight_col={weight_col!r} not found in source columns: "
@@ -393,30 +366,6 @@ def run_canonical_pipeline(
                 source_owned_by_us = True
             internal_weight = _INTERNAL_WEIGHT_COL
             passthrough.append(internal_weight)
-
-        # Stat-user augmentation (precompute): generate synthetic
-        # label-as-node edges from the raw bipartite NOW, while the source
-        # frame is alive. The result is a small frame in original IDs
-        # (one row per real user × seed-content engagement) that we hold
-        # onto until after Stage 4 then concat with the projection. See
-        # make_stat_user_edges for the rationale and the
-        # "Bipartite Graphs & Stat-User Augmentation" section of
-        # docs/architecture/glp.md.
-        stat_edges_df: Optional[pl.DataFrame] = None
-        stat_seeds: Optional[Dict[str, str]] = None
-        stat_node_ids: Optional[Set[str]] = None
-        if content_seeds is not None:
-            # The projection collapses intermediate_col into edges between
-            # projected_col nodes; stat users live in the projected (user)
-            # partition and anchor the intermediate (content) labels.
-            stat_edges_df, stat_seeds, stat_node_ids = make_stat_user_edges(
-                source,
-                content_seeds,
-                user_col=projected_col,
-                content_col=intermediate_col,
-                weight_col=internal_weight,
-                stat_prefix=stat_prefix,
-            )
         el_bp, mapper_bp = build_edgelist_from_frame(
             source,
             source_col=source_col,
@@ -540,6 +489,26 @@ def run_canonical_pipeline(
             if bp_ckpt_path is not None:
                 bp_ckpt_path.unlink(missing_ok=True)
 
+        # Stage 3.5 (optional): attach caller-supplied edges to the
+        # projection BEFORE the noise_corrected backbone runs. The
+        # end-user owns the contents of ``content_seeds`` (schema:
+        # source_id / target_id / weight). No filtering, deduplication,
+        # or directional mirroring is applied here — see
+        # :meth:`EdgeList.attach`.
+        if content_seeds is not None:
+            t0 = _time.perf_counter()
+            n_in_attach = el_proj.number_of_edges()
+            el_proj, mapper_proj = el_proj.attach(content_seeds, mapper_proj)
+            stats.append(StageStats(
+                name="attach_content_seeds",
+                duration_s=_time.perf_counter() - t0,
+                input_edges=n_in_attach,
+                output_edges=el_proj.number_of_edges(),
+                output_nodes=el_proj.n_nodes,
+            ))
+            if intermediates is not None:
+                intermediates["projection_attached"] = (el_proj, mapper_proj)
+
         # Stage 4: projection-side backbone.
         t0 = _time.perf_counter()
         n_in_4 = el_proj.number_of_edges()
@@ -564,112 +533,6 @@ def run_canonical_pipeline(
             del el_proj, mapper_proj
             maybe_free(memory_mode)
 
-        # Stage 5 (optional): stat-user augmentation. Concat the synthetic
-        # label-as-node edges (precomputed above) onto the projection so a
-        # downstream GLP run can propagate from content seeds via the
-        # (1-α)Y anchor on each stat user. Skipped when content_seeds is
-        # None.
-        if content_seeds is not None and stat_edges_df is not None:
-            t0 = _time.perf_counter()
-            n_in_5 = el_final.number_of_edges()
-
-            # Keep the pre-augmentation projection accessible when the
-            # caller asked for intermediates.
-            if intermediates is not None:
-                intermediates["projection_backboned"] = (el_final, mapper_final)
-
-            # Decode the final EdgeList to original IDs so it can be
-            # concatenated with stat_edges_df (which is already in
-            # original IDs).
-            src_codes = el_final.df["src"].to_list()
-            tgt_codes = el_final.df["tgt"].to_list()
-            weights = (
-                el_final.df["weight"].to_list()
-                if el_final.is_weighted()
-                else [1.0] * el_final.number_of_edges()
-            )
-            final_originals = pl.DataFrame(
-                {
-                    "source_id": mapper_final.get_original_batch(src_codes),
-                    "target_id": mapper_final.get_original_batch(tgt_codes),
-                    "weight": weights,
-                }
-            )
-
-            # Restrict stat-user edges to users that survived the
-            # projection backbone. Targeting a pruned user here would
-            # silently reintroduce it as an orphan via the re-encode
-            # below, polluting the final mapper with nodes the backbone
-            # explicitly removed.
-            surviving = [
-                mapper_final.has_original(u)
-                for u in stat_edges_df["target_id"].to_list()
-            ]
-            stat_edges_filtered = stat_edges_df.filter(pl.Series(surviving))
-            # Stat users whose every target was pruned have no edges to
-            # contribute — drop them from stat_seeds / stat_node_ids so
-            # the caller doesn't try to seed orphan nodes.
-            remaining_stat: Set[str] = set(
-                stat_edges_filtered["source_id"].to_list()
-            )
-            stat_seeds = {
-                k: v for k, v in stat_seeds.items() if k in remaining_stat
-            }
-            stat_node_ids = stat_node_ids & remaining_stat
-
-            # Mirror the synthetic edges when the projection is directed.
-            # The temporal projection emits citation-direction edges
-            # (later → earlier), but stat users sit outside that temporal
-            # model and we want their anchoring signal to reach real
-            # users regardless of the propagation direction GLP runs in.
-            if el_final.directed and stat_edges_filtered.height > 0:
-                reversed_stat = stat_edges_filtered.select(
-                    [
-                        pl.col("target_id").alias("source_id"),
-                        pl.col("source_id").alias("target_id"),
-                        pl.col("weight"),
-                    ]
-                )
-                stat_edges_filtered = pl.concat(
-                    [stat_edges_filtered, reversed_stat]
-                )
-
-            # Cast both frames' ID columns to Utf8 so the concat is
-            # dtype-safe even when the user's real IDs aren't strings —
-            # stat-user IDs are always strings (``f"{prefix}{content}"``).
-            # build_edgelist_from_frame assigns fresh codes either way,
-            # so downstream callers see consistent Utf8 originals via the
-            # returned id_mapper.
-            final_originals = final_originals.with_columns(
-                pl.col("source_id").cast(pl.Utf8),
-                pl.col("target_id").cast(pl.Utf8),
-            )
-            stat_edges_filtered = stat_edges_filtered.with_columns(
-                pl.col("source_id").cast(pl.Utf8),
-                pl.col("target_id").cast(pl.Utf8),
-            )
-            augmented = pl.concat([final_originals, stat_edges_filtered])
-
-            el_final, mapper_final = build_edgelist_from_frame(
-                augmented,
-                source_col="source_id",
-                target_col="target_id",
-                weight_col="weight",
-                directed=el_final.directed,
-                bipartite=False,
-                auto_weight=False,
-                remove_duplicates=False,
-                streaming=stream_backbones,
-                verbose=verbose,
-            )
-            stats.append(StageStats(
-                name="stat_user_augmentation",
-                duration_s=_time.perf_counter() - t0,
-                input_edges=n_in_5,
-                output_edges=el_final.number_of_edges(),
-                output_nodes=el_final.n_nodes,
-            ))
-
         if verbose:
             total = _time.perf_counter() - pipeline_start
             print(
@@ -684,8 +547,6 @@ def run_canonical_pipeline(
             id_mapper=mapper_final,
             stage_stats=stats,
             intermediates=intermediates,
-            stat_seeds=stat_seeds,
-            stat_node_ids=stat_node_ids,
         )
 
     finally:

@@ -14,11 +14,14 @@ typical node-ID strings.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Tuple
 
 import polars as pl
 
 from guidedLP.common.exceptions import ValidationError
+
+if TYPE_CHECKING:
+    from guidedLP.common.id_mapper import IDMapper
 
 
 _SUPPORTED_CODE_DTYPES = (pl.UInt32, pl.UInt64)
@@ -161,4 +164,127 @@ class EdgeList:
             f"<EdgeList: {self.number_of_edges():,} edges, "
             f"{self.number_of_nodes():,} nodes, "
             f"{kind}, {self.code_dtype}{weighted}>"
+        )
+
+    def attach(
+        self,
+        extra_df: pl.DataFrame,
+        id_mapper: "IDMapper",
+    ) -> Tuple["EdgeList", "IDMapper"]:
+        """Append extra edges (in original IDs) to this EdgeList.
+
+        Decodes self's edges back to original IDs, concatenates with
+        ``extra_df``, and re-encodes the union via
+        :func:`guidedLP.network.construction.build_edgelist_from_frame`
+        into a fresh ``(EdgeList, IDMapper)``. Any nodes in ``extra_df``
+        that aren't in ``id_mapper`` get codes in the returned mapper;
+        existing nodes get re-coded (codes are not guaranteed to be
+        stable across the call).
+
+        Caller is responsible for the contents of ``extra_df`` — no
+        filtering, deduplication, or directional mirroring is performed.
+        If you want bidirectional edges on a directed EdgeList, emit
+        both directions in the frame.
+
+        Parameters
+        ----------
+        extra_df : pl.DataFrame
+            Edges in original IDs. Must have columns ``source_id``,
+            ``target_id``, and ``weight``. ``weight`` must be
+            ``Float64`` when self is weighted.
+        id_mapper : IDMapper
+            The mapper paired with self. Used only to decode self's
+            existing codes back to original IDs; the returned mapper
+            is a fresh one covering the union.
+
+        Returns
+        -------
+        new_edgelist : EdgeList
+            Re-encoded EdgeList covering self's edges plus
+            ``extra_df``'s edges. ``directed``, ``bipartite``, and
+            ``code_dtype`` are inherited from self.
+        new_id_mapper : IDMapper
+            Fresh mapper for the union. Original-ID coverage equals
+            the union of ``id_mapper``'s entries and any new IDs
+            referenced by ``extra_df``.
+
+        Raises
+        ------
+        ValidationError
+            If ``extra_df`` is missing required columns; if its
+            ``weight`` column has a non-Float64 dtype when self is
+            weighted.
+
+        Notes
+        -----
+        Time Complexity: O(E_self + E_extra). One decode pass over
+        self, one Polars concat, one Utf8 → UInt32 re-encode.
+
+        Memory: peak is the sum of the decoded self frame, the
+        ``extra_df``, and the intermediate Utf8 frame inside
+        ``build_edgelist_from_frame``. Filter ``extra_df`` before
+        the call if you want to skip rows the re-encode would
+        otherwise materialize.
+        """
+        from guidedLP.network.construction import build_edgelist_from_frame
+
+        required = {"source_id", "target_id", "weight"}
+        missing = required - set(extra_df.columns)
+        if missing:
+            raise ValidationError(
+                f"extra_df is missing required columns: {sorted(missing)}. "
+                f"Got columns: {extra_df.columns}"
+            )
+        if self.is_weighted() and extra_df["weight"].dtype != pl.Float64:
+            raise ValidationError(
+                f"extra_df 'weight' column must be Float64 to match this "
+                f"weighted EdgeList; got {extra_df['weight'].dtype}."
+            )
+
+        src_codes = self.df["src"].to_list()
+        tgt_codes = self.df["tgt"].to_list()
+        weights = (
+            self.df["weight"].to_list()
+            if self.is_weighted()
+            else [1.0] * self.number_of_edges()
+        )
+        self_decoded = pl.DataFrame(
+            {
+                "source_id": id_mapper.get_original_batch(src_codes),
+                "target_id": id_mapper.get_original_batch(tgt_codes),
+                "weight": weights,
+            }
+        )
+
+        # Cast both frames' ID columns to Utf8 so the concat is
+        # dtype-safe even when self's originals aren't strings (e.g.
+        # int user IDs concatenated with str synthetic anchor IDs).
+        # The re-encode below assigns fresh integer codes anyway, so
+        # the downstream mapper's originals are consistently Utf8.
+        self_decoded = self_decoded.with_columns(
+            pl.col("source_id").cast(pl.Utf8),
+            pl.col("target_id").cast(pl.Utf8),
+        )
+        extra_cast = (
+            extra_df
+            .select(["source_id", "target_id", "weight"])
+            .with_columns(
+                pl.col("source_id").cast(pl.Utf8),
+                pl.col("target_id").cast(pl.Utf8),
+            )
+        )
+
+        combined = pl.concat([self_decoded, extra_cast])
+
+        return build_edgelist_from_frame(
+            combined,
+            source_col="source_id",
+            target_col="target_id",
+            weight_col="weight",
+            directed=self.directed,
+            bipartite=self.bipartite,
+            auto_weight=False,
+            remove_duplicates=False,
+            code_dtype=self.code_dtype,
+            verbose=False,
         )
