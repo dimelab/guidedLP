@@ -156,6 +156,7 @@ def run_canonical_pipeline(
     bipartite_min_node_retention: Optional[float] = None,
     # Stage 3: temporal projection.
     add_edge_weights: bool = True,
+    time_decay: bool = False,
     remove_self_loops: bool = True,
     presort_temporal: bool = True,
     # Stage 3.5 (optional): attach caller-supplied edges to the projection.
@@ -186,11 +187,12 @@ def run_canonical_pipeline(
     weight_col : str, optional
         Per-edge weight column on the raw input. When provided it is
         carried through to the temporal-projection stage (used in the
-        ``(w_i + w_j) / 2 * 1 / (1 + Δdays)`` formula) but the
-        bipartite-side backbone (Stage 2) still runs on raw row counts —
-        see Stage 1's implementation comment for why. Pre-aggregate the
-        input to one row per ``(source, target)`` pair if you need
-        weighted bipartite_svn.
+        ``(w_i + w_j) / 2`` formula, multiplied by ``1 / (1 + Δdays)``
+        when ``time_decay=True``) but the bipartite-side backbone
+        (Stage 2) still runs on raw row counts — see Stage 1's
+        implementation comment for why. Pre-aggregate the input to one
+        row per ``(source, target)`` pair if you need weighted
+        bipartite_svn.
     intermediate_col, projected_col : str, optional
         Which side of the bipartite to collapse vs preserve in the
         projection. Default: ``intermediate_col=target_col`` and
@@ -219,6 +221,12 @@ def run_canonical_pipeline(
         (see ``protected_nodes``) are exempt.
     add_edge_weights, remove_self_loops : bool
         Forwarded to :func:`temporal_bipartite_to_unipartite`.
+    time_decay : bool, default False
+        Forwarded to :func:`temporal_bipartite_to_unipartite`. When
+        True, projection edges are multiplied by ``1 / (1 + Δdays)``
+        where ``Δdays`` is the timestamp gap between the two sharers.
+        Default False — set to True to restore the historical decayed
+        weighting.
     presort_temporal : bool, default True
         If True (default), sort the bipartite by
         ``[intermediate_col, timestamp_col DESC]`` before the temporal
@@ -470,6 +478,7 @@ def run_canonical_pipeline(
             intermediate_col=intermediate_col,
             projected_col=projected_col,
             add_edge_weights=add_edge_weights,
+            time_decay=time_decay,
             remove_self_loops=remove_self_loops,
             output_format="edgelist",
             verbose=verbose,

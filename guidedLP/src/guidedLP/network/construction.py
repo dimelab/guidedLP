@@ -2711,6 +2711,7 @@ def temporal_bipartite_to_unipartite(
     projected_col: str = "source",
     remove_self_loops: bool = True,
     add_edge_weights: bool = True,
+    time_decay: bool = False,
     verbose: bool = True,
     *,
     id_mapper: Optional[IDMapper] = None,
@@ -2757,8 +2758,10 @@ def temporal_bipartite_to_unipartite(
         Passing ``timestamp_col=None`` is allowed when the caller has
         already arranged rows in the required latest-first order by some
         other key (e.g. a monotonic sequence number) — in that case the
-        function trusts row order entirely and the temporal-decay factor
-        drops out of the edge-weight formula (see ``add_edge_weights``).
+        function trusts row order entirely. The temporal-decay factor
+        (off by default; opt in via ``time_decay=True``) requires a
+        timestamp column and is silently skipped when ``timestamp_col``
+        is None.
 
     The algorithm:
 
@@ -2769,8 +2772,8 @@ def temporal_bipartite_to_unipartite(
        upper-triangular pairs ``(i, j)`` with ``i < j`` — i.e. the later
        sharer paired with each earlier sharer.
     3. Emits a directed edge ``source = later sharer → target = earlier
-       sharer`` for each pair, with the temporal-decay weight described
-       under ``add_edge_weights``.
+       sharer`` for each pair, with the weight described under
+       ``add_edge_weights`` and ``time_decay``.
 
     Parameters
     ----------
@@ -2787,14 +2790,13 @@ def temporal_bipartite_to_unipartite(
         Name of target node column in edgelist. For EdgeList input, the
         column is conceptually ``tgt``.
     timestamp_col : Optional[str], default None
-        Name of timestamp column. When provided, the temporal-decay
-        factor ``1 / (1 + Δdays)`` is included in the edge weight, and
-        the column must exist on the input (for EdgeList input,
-        typically via
+        Name of timestamp column. Required when ``time_decay=True``
+        (for EdgeList input, typically via
         ``build_edgelist_from_frame(..., passthrough_cols=[timestamp_col])``).
         When ``None`` (default), the function still trusts the caller's
         latest-first row order to determine edge direction, but the
-        decay term drops out of the weight (see ``add_edge_weights``).
+        decay term cannot be applied — i.e. ``time_decay`` is silently
+        ignored.
     weight_col : Optional[str], default None
         Name of weight column. If None, edges get unit weight.
     intermediate_col : str, default "target"
@@ -2806,13 +2808,24 @@ def temporal_bipartite_to_unipartite(
     remove_self_loops : bool, default True
         Whether to remove self-loops in the resulting unipartite graph
     add_edge_weights : bool, default True
-        Whether to calculate edge weights based on endpoint weights and
-        (when available) temporal decay. The formula degrades by which
-        inputs are present:
+        Whether to calculate edge weights from the endpoint weights.
+        The formula depends on ``time_decay`` and whether a timestamp
+        column is available:
 
-        - ``timestamp_col`` given → ``(w_later + w_earlier) / 2 * 1 / (1 + Δdays)``
-        - ``timestamp_col=None`` → ``(w_later + w_earlier) / 2`` (no decay term)
-        - ``add_edge_weights=False`` → every edge gets unit weight.
+        - ``add_edge_weights=True``, ``time_decay=False`` (default) → ``(w_later + w_earlier) / 2``
+        - ``add_edge_weights=True``, ``time_decay=True``, ``timestamp_col`` given → ``(w_later + w_earlier) / 2 * 1 / (1 + Δdays)``
+        - ``add_edge_weights=True``, ``time_decay=True``, ``timestamp_col=None`` → ``(w_later + w_earlier) / 2`` (decay silently skipped)
+        - ``add_edge_weights=False`` → every edge gets unit weight (``time_decay`` ignored).
+
+        When ``weight_col`` is None the endpoint weights are implicit
+        ``1.0`` so ``(w_later + w_earlier) / 2 = 1.0`` and the formula
+        reduces to the decay term (or ``1.0``).
+    time_decay : bool, default False
+        Multiply edge weights by ``1 / (1 + Δdays)`` where ``Δdays`` is
+        the absolute timestamp gap between the two sharers (in days,
+        second-truncated). Requires ``timestamp_col`` to be provided;
+        silently skipped otherwise. Default is False — set to True to
+        reproduce the historical decayed-weight behavior.
     verbose : bool, default True
         Print a one-line summary at the end.
     id_mapper : IDMapper, optional
@@ -3109,6 +3122,7 @@ def temporal_bipartite_to_unipartite(
                 weight_col=wt_col_actual,
                 add_edge_weights=add_edge_weights,
                 remove_self_loops=remove_self_loops,
+                time_decay=time_decay,
             )
 
             # Step 4b: Aggregate duplicate (source, target) pairs via
@@ -3268,6 +3282,7 @@ def _compute_temporal_projection_frame(
     weight_col: Optional[str],
     add_edge_weights: bool,
     remove_self_loops: bool,
+    time_decay: bool = False,
 ) -> pl.DataFrame:
     """Vectorized temporal-projection kernel used by :func:`temporal_bipartite_to_unipartite`.
 
@@ -3294,19 +3309,26 @@ def _compute_temporal_projection_frame(
         ``intermediate_col`` value MUST be contiguous in row order — the
         kernel uses ``np.diff`` to detect group boundaries.
     timestamp_col : Optional[str]
-        If non-None, the temporal-decay term ``1 / (1 + Δdays)`` is
-        included in the weight; if None, the term drops out and edge
-        direction is determined purely by row order.
+        If non-None AND ``time_decay`` is True, the temporal-decay term
+        ``1 / (1 + Δdays)`` is included in the weight. Otherwise the
+        decay term drops out; edge direction is still determined by
+        row order.
     add_edge_weights : bool
-        If True and ``timestamp_col`` is non-None, edge weight is
-        ``(w_i + w_j) / 2 * 1 / (1 + Δdays)``. If True and
-        ``timestamp_col`` is None, edge weight is ``(w_i + w_j) / 2``.
-        If False, every edge gets weight ``1.0``.
+        If True, edge weight averages the endpoint weights — i.e.
+        ``(w_i + w_j) / 2`` — and additionally multiplies by
+        ``1 / (1 + Δdays)`` when both ``time_decay`` is True and
+        ``timestamp_col`` is non-None. If False, every edge gets
+        weight ``1.0`` regardless of ``time_decay``.
     remove_self_loops : bool
         If True, drop edges where ``source == target``. The
         (intermediate, projected) dedup means within-group pairs always
         have distinct projected values, so this is defensive parity with
         the legacy kernel and almost never fires.
+    time_decay : bool, default False
+        Gate for the ``1 / (1 + Δdays)`` term. When True and
+        ``timestamp_col`` is non-None, the decay term multiplies the
+        endpoint-weight average; when False (default) or when no
+        timestamp is present, the decay term drops out.
 
     Returns
     -------
@@ -3393,8 +3415,12 @@ def _compute_temporal_projection_frame(
     source = node_arr[global_i]
     target = node_arr[global_j]
 
-    # 6. Edge weights — same three-branch logic as the previous kernel.
-    if add_edge_weights and ts_arr is not None:
+    # 6. Edge weights — three branches:
+    #    (a) add_edge_weights + time_decay + timestamps → mean * 1/(1+Δdays)
+    #    (b) add_edge_weights (no decay term applies)   → mean of endpoints
+    #    (c) not add_edge_weights                       → unit weights
+    apply_decay = add_edge_weights and time_decay and ts_arr is not None
+    if apply_decay:
         ts_i = ts_arr[global_i]
         ts_j = ts_arr[global_j]
         # Match Polars' `.dt.total_seconds().abs().cast(Float64) / 86400`:

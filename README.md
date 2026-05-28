@@ -457,37 +457,198 @@ labels = guided_label_propagation(
 
 See `docs/architecture/glp.md` ("Bipartite Graphs & Stat-User Augmentation") for the design rationale (why ordering matters, what the synthetic edges actually compute) and `bipartite_glp_notes.md` at the repo root for related literature (Co-HITS, BiRank, personalized PageRank with concentrated teleportation).
 
-### 6. Political Affiliation Analysis
+### 6. End-to-End Pipeline Wrapper
+
+For the canonical attribution workflow — raw input → bipartite EdgeList → bipartite-side backbone → temporal projection → projection-side backbone — `guidedLP.pipelines.run_canonical_pipeline` composes all four stages in a single call with explicit memory management between steps. Compared to calling the four functions by hand, the wrapper releases intermediates between stages so they don't co-exist in RAM, and optionally checkpoints to disk for memory-constrained runs.
 
 ```python
-# Analyze political leaning in social networks
-from guidedLP.glp.validation import train_test_split_validation
-from guidedLP.network.construction import build_graph_from_edgelist
+from guidedLP.pipelines import run_canonical_pipeline
 
-# Load political Twitter network
-political_edges = pl.read_csv("political_network.csv")
-graph, id_mapper = build_graph_from_edgelist(
-    political_edges, "follower", "following"
+result = run_canonical_pipeline(
+    source="shares.parquet",
+    source_col="user", target_col="item", timestamp_col="timestamp",
+    weight_col="weight",
+    intermediate_col="item", projected_col="user",
+    min_source_degree=25,
+    bipartite_alpha=0.01, bipartite_correction="fdr_bh",
+    add_edge_weights=True, time_decay=False, presort_temporal=True,
+    projection_target_fraction=0.2,
+    memory_mode="balanced",          # "fast" / "balanced" / "low"
+    verbose=True,
 )
 
-# Define known political accounts as seeds
-political_seeds = {
-    "progressive": ["@aoc", "@berniesanders", "@ewarren"],
-    "conservative": ["@realdonaldtrump", "@tedcruz", "@marcorubio"]
-}
-
-# Run validation to test accuracy
-accuracy, metrics = train_test_split_validation(
-    graph=graph,
-    seeds=political_seeds,
-    id_mapper=id_mapper,
-    test_size=0.2
-)
-
-print(f"Political classification accuracy: {accuracy:.3f}")
+backbone = result.edgelist
+mapper = result.id_mapper
+print(f"total: {result.total_duration_s:.1f}s | "
+      f"{backbone.number_of_edges():,} edges, {backbone.n_nodes:,} nodes")
 ```
 
-### 7. Temporal Network Analysis
+With `verbose=True` the pipeline prints a per-stage one-liner plus a final TOTAL with memory mode and edge/node counts:
+
+```
+[build_edgelist_from_frame] 15.29s | 27,893,278 input rows → 1,877,850 nodes, 23,280,338 edges (UInt32)
+[apply_backbone] 1.92s | method=bipartite_svn | EdgeList: 23,280,338 → 12,634,460 edges kept (54.3%)
+[temporal_bipartite_to_unipartite] 169.45s | 12,634,460 input rows → 191,864,084 projection edges
+[apply_backbone] 148.67s | method=noise_corrected | EdgeList: 191,864,084 → 38,372,817 edges kept (20.0%)
+[run_canonical_pipeline] TOTAL 335.50s | mode=balanced | final: 38,372,817 edges, 104,680 nodes
+```
+
+`result.stage_stats` exposes the same data programmatically as `StageStats(name, duration_s, input_edges, output_edges, output_nodes)`. With `keep_intermediates=True`, `result.intermediates` holds `(EdgeList, IDMapper)` snapshots after build, after `bipartite_svn`, and after the temporal projection.
+
+**Memory modes** — all three produce byte-identical output; they only differ in peak memory and wall-clock:
+
+| Mode | Inter-stage cleanup | Disk I/O | When to use |
+|---|---|---|---|
+| `"fast"` | none | none | plenty of RAM, want max speed |
+| `"balanced"` (default) | `del` + `gc.collect()` between stages | none | the 80% case — moderately lower peak, ~30% slower stages |
+| `"low"` | additionally checkpoints each EdgeList to parquet between stages | a few seconds | memory-constrained runs |
+
+Use the wrapper when running the canonical four-stage pipeline as-is. Skip it when your workflow deviates — extra steps, different projection method, additional joins/filters between stages — and call the lower-level functions directly. The wrapper also accepts a `content_seeds` DataFrame to attach stat-user anchor edges between projection and projection backbone (see Example 5).
+
+### 7. Evaluating GLP Quality with Held-Out Seeds
+
+`train_test_split_validation` is the standard "is my model good?" check for GLP. It holds out a fraction of your labelled seeds, trains GLP on the rest, and scores predictions on the held-out portion. The returned dict carries accuracy, per-label precision / recall / F1, a confusion matrix, and the sklearn classification report — everything needed for a results section.
+
+```python
+from guidedLP.network.construction import build_graph_from_edgelist
+from guidedLP.glp.validation import train_test_split_validation
+
+graph, id_mapper = build_graph_from_edgelist(
+    pl.read_csv("political_network.csv"),
+    source_col="follower", target_col="following",
+)
+
+# Seeds in any SeedInput shape. Label-keyed dict is convenient when you
+# collected accounts in lists per category.
+political_seeds = {
+    "progressive":  ["@aoc", "@berniesanders", "@ewarren",
+                     "@progressive_1", "@progressive_2", "@progressive_3"],
+    "conservative": ["@realdonaldtrump", "@tedcruz", "@marcorubio",
+                     "@conservative_1", "@conservative_2", "@conservative_3"],
+}
+
+# Stratified 20% holdout (default). Any guided_label_propagation kwarg can
+# be passed through — alpha, directional, weight_transform, etc.
+results = train_test_split_validation(
+    graph=graph, id_mapper=id_mapper,
+    seed_labels=political_seeds, labels=["progressive", "conservative"],
+    test_size=0.2,
+    stratify=True,            # preserve label proportions in the split
+    random_seed=42,
+    alpha=0.85,               # **glp_kwargs — threaded into GLP
+    directional=False,
+)
+
+print(f"Accuracy: {results['accuracy']:.3f}  Macro-F1: {results['macro_f1']:.3f}")
+print(results["classification_report"])   # sklearn-formatted per-label table
+print(results["confusion_matrix"])        # rows=true, cols=predicted (np.ndarray)
+```
+
+`results["test_predictions"]` is the raw GLP frame restricted to the held-out seeds — cross-reference against the input seed dict to drill into individual errors.
+
+**Custom test set instead of a random split.** When you have a separately-curated ground-truth set (e.g. hand-labelled accounts you specifically *don't* want in training), pass it via `test_seeds`. Overlapping IDs are pulled out of training; on label conflicts the test set's label wins (with a warning). `test_size`, `stratify`, and `random_seed` are ignored in this mode.
+
+```python
+known_holdout = {"@verified_left_1": "progressive", "@verified_right_1": "conservative"}
+results = train_test_split_validation(
+    graph=graph, id_mapper=id_mapper,
+    seed_labels=political_seeds,        # train on these
+    test_seeds=known_holdout,           # evaluate on these (curated ground truth)
+    labels=["progressive", "conservative"],
+)
+```
+
+**Small seed sets?** A single held-out split is noisy with only a handful of seeds per label. `cross_validate` runs K-fold over the seeds and returns mean ± std for each metric — same kwargs, more stable estimates:
+
+```python
+from guidedLP.glp.validation import cross_validate
+
+cv = cross_validate(
+    graph=graph, id_mapper=id_mapper,
+    seed_labels=political_seeds, labels=["progressive", "conservative"],
+    k_folds=5, stratify=True, random_seed=42,
+)
+print(f"5-fold CV: accuracy={cv['mean_accuracy']:.3f} ± {cv['std_accuracy']:.3f}, "
+      f"macro-F1={cv['mean_macro_f1']:.3f} ± {cv['std_macro_f1']:.3f}")
+```
+
+**Validate with ensembling instead of single-run GLP.** Both validators accept a `propagator` kwarg. Default is `guided_label_propagation`; pass `ensemble_label_propagation` to score each fold with a bagged, noise-resampled ensemble. Propagator-specific kwargs (`n_epochs`, `base_seed`, `enable_noise_category`, …) ride along through `**glp_kwargs`. For directional GLP, pick which pass to score with `directional_pass="out"` or `directional_pass="in"` — the validator raises if you don't pick (no implicit choice).
+
+### 8. Refining GLP Output
+
+Three controls layered on top of `guided_label_propagation`, each addressing a different failure mode of the default pipeline. Use them individually or compose them.
+
+**Edge-weight compression.** When a small fraction of edges have weights orders of magnitude larger than the rest (viral retweets, hub co-occurrences, runaway co-citations), those edges dominate the propagation regardless of `alpha`. The `weight_transform` parameter applies a per-edge callable when the transition matrix is built, so you can dampen weight outliers without rebuilding the graph or pre-normalizing upstream.
+
+```python
+from guidedLP.glp import (
+    guided_label_propagation,
+    tanh_transform, log1p_transform, winsorize_transform,
+)
+
+# Pick a transform that matches the shape of your weight distribution:
+# - log1p_transform()     : gentle, unbounded. Good first choice when weights span orders of magnitude.
+# - winsorize_transform(c): hard cap at threshold c. Use when you know which weight value is "too high."
+# - tanh_transform()      : S-curve saturation; mimics the historical stlp transform. Most aggressive.
+
+results = guided_label_propagation(
+    graph, id_mapper, seeds, labels,
+    weight_transform=log1p_transform(),
+)
+```
+
+Any positive-output callable works — `weight_transform=lambda w: math.log10(w + 1.0)` is fine. The only constraint is `f(w) > 0` for `w > 0` (a transform mapping positive weights to zero looks like graph isolates to the propagation engine).
+
+**Audience-composition pass.** Directional GLP (`directional=True`) returns a `(forward, backward)` tuple where the backward pass is a full propagation on `Aᵀ` from the original seeds — answering *"is node n upstream of a seed?"*. A semantically different question — *"what's the label profile of the nodes pointing at n?"* — requires a one-hop aggregation of the converged forward result along incoming edges. `audience_composition_pass` does exactly that:
+
+```python
+from guidedLP.glp import audience_composition_pass
+
+# Forward pass first (directional=False — audience pass consumes a single result, not the tuple).
+fwd = guided_label_propagation(graph, id_mapper, seeds, labels, directional=False)
+
+# Audience pass — single sparse matmul, no iteration.
+audience = audience_composition_pass(graph, id_mapper, fwd, labels)
+# audience["left_prob"] reads as the in-degree-weighted average of forward-pass
+# left_prob across n's in-neighbors — "what fraction of accounts pointing at n
+# were forward-labeled left?"
+```
+
+Use for audience studies, reception analysis, or recommender-system diagnostics. Skip on undirected graphs (the pass raises) or when you specifically want the upstream-reachability question the `Aᵀ` pass already answers. If the forward pass used a `weight_transform`, pass the same one to `audience_composition_pass`. Nodes with zero in-degree fall back to a uniform distribution.
+
+**Stochastic ensembling.** When `enable_noise_category=True`, the noise seeds are sampled randomly from non-seed nodes — a single GLP run is sensitive to which nodes happen to be chosen. `ensemble_label_propagation` runs GLP `n_epochs` times with different noise samples and averages the result:
+
+```python
+from guidedLP.glp import ensemble_label_propagation
+
+result = ensemble_label_propagation(
+    graph, id_mapper, seeds, labels,
+    n_epochs=20,
+    base_seed=42,                  # per-epoch seed = base_seed + epoch_index
+    enable_noise_category=True,    # required — otherwise ensembling is a no-op
+    noise_ratio=0.3,
+    return_variance=True,          # adds {label}_prob_std columns for confidence intervals
+)
+```
+
+Same return shape as `guided_label_propagation` (single DataFrame for undirected / `directional=False`; `(out_df, in_df)` tuple for directed + `directional=True`). Probability columns are averaged across epochs; with `return_variance=True` each `{label}_prob` is paired with `{label}_prob_std` (sample std with Bessel's correction). `dominant_label` and `confidence` are recomputed from averaged probabilities, not voted across epochs — averaging gives the variance reduction; voting would lose it. A node can have a different dominant label in the ensemble than in any single epoch; this is expected. `is_seed` reflects only user-supplied seeds, not per-epoch noise samples.
+
+**Composing the three.** The controls are independent and combine cleanly:
+
+```python
+forward_ensemble = ensemble_label_propagation(
+    graph, id_mapper, seeds, labels,
+    n_epochs=20, directional=False,
+    weight_transform=log1p_transform(),
+    enable_noise_category=True, noise_ratio=0.3,
+)
+audience = audience_composition_pass(
+    graph, id_mapper, forward_ensemble, labels + ["noise"],
+    weight_transform=log1p_transform(),
+)
+```
+
+### 9. Temporal Network Analysis
 
 ```python
 # Track community evolution over time
