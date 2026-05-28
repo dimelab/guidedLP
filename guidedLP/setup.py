@@ -53,6 +53,16 @@ setup(
             "matplotlib>=3.6",
             "plotly>=5.0",
         ],
+        # Optional dependencies for the preprocessing.text_extraction module:
+        # language detection, stop-word lists, stemming, lemmatization.
+        # Required only when enabling the corresponding kwargs on extract_keywords
+        # (stop_words=, stem=, lemmatize=, or auto-language-detection paths).
+        "nlp": [
+            "langdetect>=1.0.9",
+            "stopwordsiso>=0.6.1",
+            "snowballstemmer>=2.2.0",
+            "simplemma>=1.0.0",
+        ],
     },
     classifiers=[
         "Development Status :: 3 - Alpha",
