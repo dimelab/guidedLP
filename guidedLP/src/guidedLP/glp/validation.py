@@ -590,9 +590,18 @@ def _calculate_validation_metrics(
         true_labels, predicted_labels, labels=all_labels, average=None, zero_division=0
     )
 
-    # Macro averages
+    # Macro averages. CRITICAL: pass labels=all_labels to match the
+    # per-label, confusion-matrix, and classification_report calls. Without
+    # it, sklearn defaults to the union of unique values across
+    # true ∪ predicted, which silently includes any label present only in
+    # predictions (e.g. "noise" when enable_noise_category=True but no
+    # test seed is labelled "noise") and adds a 0-F1 phantom class that
+    # drags macro_f1 / macro_precision / macro_recall down. Keeping
+    # labels=all_labels keeps every metric in this dict computed over the
+    # same label set the caller asked us to evaluate.
     macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
-        true_labels, predicted_labels, average='macro', zero_division=0
+        true_labels, predicted_labels, labels=all_labels,
+        average='macro', zero_division=0,
     )
 
     # Confusion matrix
