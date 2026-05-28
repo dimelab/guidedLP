@@ -190,8 +190,10 @@ class EdgeList:
         ----------
         extra_df : pl.DataFrame
             Edges in original IDs. Must have columns ``source_id``,
-            ``target_id``, and ``weight``. ``weight`` must be
-            ``Float64`` when self is weighted.
+            ``target_id``, and ``weight``. When self is weighted,
+            ``weight`` must be a numeric dtype — Float64 is used as-is,
+            other numeric dtypes (Int*, UInt*, Float32) are auto-cast
+            to Float64.
         id_mapper : IDMapper
             The mapper paired with self. Used only to decode self's
             existing codes back to original IDs; the returned mapper
@@ -212,8 +214,8 @@ class EdgeList:
         ------
         ValidationError
             If ``extra_df`` is missing required columns; if its
-            ``weight`` column has a non-Float64 dtype when self is
-            weighted.
+            ``weight`` column has a non-numeric dtype when self is
+            weighted (numeric non-Float64 dtypes are auto-cast).
 
         Notes
         -----
@@ -235,11 +237,19 @@ class EdgeList:
                 f"extra_df is missing required columns: {sorted(missing)}. "
                 f"Got columns: {extra_df.columns}"
             )
-        if self.is_weighted() and extra_df["weight"].dtype != pl.Float64:
-            raise ValidationError(
-                f"extra_df 'weight' column must be Float64 to match this "
-                f"weighted EdgeList; got {extra_df['weight'].dtype}."
-            )
+        if self.is_weighted():
+            wt_dtype = extra_df["weight"].dtype
+            if wt_dtype != pl.Float64:
+                if wt_dtype.is_numeric():
+                    extra_df = extra_df.with_columns(
+                        pl.col("weight").cast(pl.Float64)
+                    )
+                else:
+                    raise ValidationError(
+                        f"extra_df 'weight' column must be a numeric dtype "
+                        f"castable to Float64 to match this weighted "
+                        f"EdgeList; got {wt_dtype}."
+                    )
 
         src_codes = self.df["src"].to_list()
         tgt_codes = self.df["tgt"].to_list()
