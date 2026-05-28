@@ -58,6 +58,11 @@ class GLPGridSearch:
     and stores per-cell ``macro_f1``, ``accuracy``, and noise-aware error
     metrics in a polars DataFrame.
 
+    Pass ``test_seeds`` to swap the random split for a fixed test set —
+    the ``test_size`` axis then collapses to a single cell, and the
+    result frame records ``test_size`` as NaN. See the ``test_seeds``
+    parameter below.
+
     The default propagator is :func:`ensemble_label_propagation` with
     ``enable_noise_category=True`` so the ``"noise"`` category is available;
     set ``enable_noise_category=False`` to fall back to a single
@@ -72,8 +77,9 @@ class GLPGridSearch:
     id_mapper : IDMapper
         Original-to-internal node ID mapping.
     seed_labels : SeedInput
-        Full labelled seed set. Split into train/test inside each cell. Accepts
-        dict, polars.DataFrame, or pandas.DataFrame.
+        Full labelled seed set. Split into train/test inside each cell
+        (or used as the training pool when ``test_seeds`` is set).
+        Accepts dict, polars.DataFrame, or pandas.DataFrame.
     labels : List[str]
         Real-class labels. Do NOT include ``"noise"`` — it is auto-added when
         ``enable_noise_category=True``.
@@ -82,7 +88,18 @@ class GLPGridSearch:
     alpha_grid : Optional[List[float]], default [0.85]
         Propagation alpha values to try; each must be in ``[0, 1]``.
     test_size_grid : Optional[List[float]], default [0.2]
-        Test-fraction values to try; each must be in ``(0, 1)``.
+        Test-fraction values to try; each must be in ``(0, 1)``. Mutually
+        exclusive with ``test_seeds`` — passing both raises
+        ``ConfigurationError``.
+    test_seeds : Optional[SeedInput], default None
+        Fixed test set forwarded to :func:`train_test_split_validation`.
+        When provided, the train/test split is no longer random — the
+        ``test_size`` axis collapses to a single cell and ``stratify``
+        is ignored. ``random_seed`` / ``n_repeats`` still affect noise
+        sampling (when ``enable_noise_category=True``) and the ensemble's
+        per-epoch resampling (when ``n_epochs > 1``), but produce
+        identical rows otherwise. The result frame records ``test_size``
+        as NaN for these cells.
     distance_prior_grid : Optional[List[bool]], default [False]
         Whether to enable the per-class geodesic distance prior (see
         :func:`guided_label_propagation`'s ``distance_prior``). Pass
@@ -180,6 +197,7 @@ class GLPGridSearch:
         n_epochs_grid: Optional[List[int]] = None,
         alpha_grid: Optional[List[float]] = None,
         test_size_grid: Optional[List[float]] = None,
+        test_seeds: Optional[SeedInput] = None,
         distance_prior_grid: Optional[List[bool]] = None,
         distance_prior_exponent_grid: Optional[List[float]] = None,
         noise_ratio_grid: Optional[List[float]] = None,
@@ -206,9 +224,23 @@ class GLPGridSearch:
         self.alpha_grid = (
             list(alpha_grid) if alpha_grid is not None else list(self.DEFAULT_ALPHA)
         )
-        self.test_size_grid = (
-            list(test_size_grid) if test_size_grid is not None else list(self.DEFAULT_TEST_SIZE)
-        )
+        if test_seeds is not None:
+            if test_size_grid is not None:
+                raise ConfigurationError(
+                    "test_size_grid and test_seeds are mutually exclusive: "
+                    "with test_seeds the test set is fixed, so sweeping "
+                    "test_size is meaningless. Omit test_size_grid.",
+                    parameter="test_size_grid",
+                )
+            # Sentinel: collapses the test_size axis to a single cell.
+            # The actual value is unused (the validator gets test_seeds
+            # instead of test_size); recorded as NaN in the result frame.
+            self.test_size_grid = [float("nan")]
+        else:
+            self.test_size_grid = (
+                list(test_size_grid) if test_size_grid is not None else list(self.DEFAULT_TEST_SIZE)
+            )
+        self.test_seeds = test_seeds
 
         # `distance_prior` can also arrive via **glp_kwargs from older calls;
         # the explicit grid wins, but if the grid is omitted we honour the
@@ -296,13 +328,16 @@ class GLPGridSearch:
             raise ConfigurationError(
                 "test_size_grid cannot be empty", parameter="test_size_grid"
             )
-        for t in self.test_size_grid:
-            if not 0.0 < float(t) < 1.0:
-                raise ConfigurationError(
-                    f"test_size values must be in (0, 1), got {t}",
-                    parameter="test_size_grid",
-                    value=t,
-                )
+        # Skip the range check when test_seeds is set: the sentinel NaN
+        # value collapses the axis and is never passed to the validator.
+        if self.test_seeds is None:
+            for t in self.test_size_grid:
+                if not 0.0 < float(t) < 1.0:
+                    raise ConfigurationError(
+                        f"test_size values must be in (0, 1), got {t}",
+                        parameter="test_size_grid",
+                        value=t,
+                    )
         if not self.distance_prior_grid:
             raise ConfigurationError(
                 "distance_prior_grid cannot be empty",
@@ -461,22 +496,30 @@ class GLPGridSearch:
             if cell_seed is not None:
                 propagator = _bind_random_seed(base_propagator, cell_seed)
 
+        validator_kwargs: Dict[str, Any] = dict(
+            graph=self.graph,
+            id_mapper=self.id_mapper,
+            seed_labels=self.seed_labels,
+            labels=self.labels,
+            stratify=self.stratify,
+            random_seed=cell_seed,
+            seed_node_col=self.seed_node_col,
+            seed_label_col=self.seed_label_col,
+            propagator=propagator,
+            directional_pass=self.directional_pass,
+            **propagator_kwargs,
+        )
+        if self.test_seeds is not None:
+            # Fixed test set: validator ignores test_size / stratify /
+            # random_seed for splitting, but random_seed still propagates
+            # through propagator_kwargs to drive noise sampling.
+            validator_kwargs["test_seeds"] = self.test_seeds
+        else:
+            validator_kwargs["test_size"] = test_size
+
         t0 = time.perf_counter()
         try:
-            results = train_test_split_validation(
-                graph=self.graph,
-                id_mapper=self.id_mapper,
-                seed_labels=self.seed_labels,
-                labels=self.labels,
-                test_size=test_size,
-                stratify=self.stratify,
-                random_seed=cell_seed,
-                seed_node_col=self.seed_node_col,
-                seed_label_col=self.seed_label_col,
-                propagator=propagator,
-                directional_pass=self.directional_pass,
-                **propagator_kwargs,
-            )
+            results = train_test_split_validation(**validator_kwargs)
         except (ConvergenceError, ComputationError) as exc:
             # Record the cell as a failed run rather than crashing the whole
             # grid. Metrics become NaN/None; the `error` column carries the
