@@ -94,6 +94,113 @@ results = guided_label_propagation(
 print(f"Classified {len(results)} nodes with community probabilities")
 ```
 
+## Preprocessing: Raw Posts → Edge Lists
+
+When the input is a `[sender, post, datetime]` post table (e.g. a social-media corpus) rather than a pre-built edge list, the `preprocessing` module turns that text column into the bipartite edge-list shape `build_graph_from_edgelist` expects. The three extractors share the same `[sender, content(, datetime)]` output schema, so they all drop straight into graph construction:
+
+- **`extract_urls`** — one row per URL in `post`
+- **`extract_domains`** — one row per URL, reduced to its host
+- **`extract_keywords`** — words / tokens per sender, with optional NLP preprocessing
+
+All three run as a single vectorized pass over the Polars column (Rust regex engine, no Python row loops), preserve original sender IDs end-to-end, and explode multi-match posts into one row per match. Posts with no matches contribute no rows. `datetime_col=None` drops the timestamp column if you don't need it.
+
+```python
+import polars as pl
+from guidedLP.preprocessing import extract_urls, extract_domains, extract_keywords
+
+posts = pl.DataFrame({
+    "sender": ["alice", "alice", "bob", "carol", "dave", "eve"],
+    "post": [
+        "Big read: https://nytimes.com/article?utm_source=twitter&fbclid=abc",
+        "Same story: https://nytimes.com/article?utm_source=facebook",
+        "no links here — just opinions on climate policy",
+        "Watching https://youtu.be/abc123?si=tracker",
+        "Same vid: https://www.youtube.com/watch?v=abc123&t=10",
+        "HTTPS://EXAMPLE.com/News and (https://en.wikipedia.org/wiki/Foo).",
+    ],
+    "datetime": ["2024-01-01", "2024-01-02", "2024-01-03",
+                 "2024-01-04", "2024-01-05", "2024-01-06"],
+})
+```
+
+### URL and domain extraction with normalization
+
+By default both URL extractors **normalize** each match before returning it. The normalization step lowercases scheme + host (preserving path case, which is case-sensitive in HTTP), strips well-known tracking parameters (`utm_*`, `fbclid`, `gclid`, `mc_cid`, `igshid`, etc.), collapses `youtu.be/<id>` and `youtube.com/watch?...&v=<id>` to a canonical `https://youtube.com/watch?v=<id>`, cleans up HTML-escaped `amp;`, and strips trailing sentence punctuation. This is the right default for graph construction: the same article shared with two different `utm_source=` codes would otherwise become two distinct URL nodes.
+
+```python
+urls = extract_urls(posts)
+# Columns: [sender, datetime, url] — one row per URL.
+# Alice's two nytimes URLs collapse to "https://nytimes.com/article".
+# Carol's and Dave's YouTube links collapse to "https://youtube.com/watch?v=abc123".
+# Eve's "HTTPS://EXAMPLE.com/News" becomes "https://example.com/News" (path case preserved).
+
+domains = extract_domains(posts)
+# Columns: [sender, datetime, domain] — host only, lowercased, leading "www." stripped.
+# Both YouTube variants now share domain="youtube.com".
+```
+
+To keep the raw extracted URLs, pass `normalize=False`. To keep a leading `www.`, pass `strip_www=False` to `extract_domains`. The tracking-parameter list and per-step rules are documented in the `_normalize_url_expr` helper in `guidedLP/preprocessing/text_extraction.py`; the list is intentionally curated to exclude ambiguous single-letter and very generic names (`r`, `type`, `ref`, `src`, `feature`, …) that could be meaningful elsewhere.
+
+### Keyword extraction with optional NLP preprocessing
+
+`extract_keywords` defaults to *every word, aggregated per sender* — collapsing the raw N_posts × words_per_post mention count down to N_senders × vocab_size by emitting `[sender, keyword, mentions, first_seen]`. This is the memory-bounded form most downstream graph constructions want; for 10M posts × ~80 unique words per post, the difference between aggregated and long output is 2–4 orders of magnitude.
+
+```python
+# Default: all words, aggregated, lowercase, Unicode-aware tokenization.
+words = extract_keywords(posts)
+# Columns: [sender, keyword, mentions, first_seen]
+
+# Filter to a fixed vocabulary — useful when you have a topic dictionary.
+topics = extract_keywords(posts, keywords=["climate", "policy", "vaccine"])
+
+# Add NLP preprocessing — requires `pip install "guidedLP[nlp]"`.
+# `True` triggers auto-detection from a random post sample; pass an explicit
+# ISO 639-1 code ("en", "da", …) to skip detection.
+processed = extract_keywords(
+    posts,
+    stop_words=True,      # True | "en" | iterable of words | False (default)
+    stem=True,            # True | "en" | False — Snowball stemmer
+    lemmatize=False,      # True | "en" | False — simplemma lemmatizer
+    min_word_length=3,    # drop one- and two-character tokens
+)
+
+# One row per mention (no aggregation) — useful for temporal analysis but the
+# row count is total mentions, so use on small corpora or via `output="lazy"`.
+mentions = extract_keywords(posts, output="long")
+
+# Lazy mode returns a LazyFrame so you can stream straight to disk:
+extract_keywords(posts, output="lazy").sink_parquet("words.parquet")
+```
+
+When NLP preprocessing is on, the user-supplied `keywords=` list is also stemmed/lemmatized before comparison, so `keywords=["climate"]` with `stem=True` still matches the stemmed form (`"climat"`) of words like *climate*, *climates*, *climatic* in the corpus.
+
+### Hand-off to graph construction
+
+The output of any extractor drops straight into `build_graph_from_edgelist` as a bipartite edge list — senders on one side, content (URL / domain / keyword) on the other. Project to either partition to run GLP downstream, or feed the bipartite directly through stat-user augmentation (Example 5) when labels live on the content side.
+
+```python
+from guidedLP.network import build_graph_from_edgelist, project_bipartite
+
+# sender → domain bipartite edges
+edges = extract_domains(posts)
+
+bipartite, full_mapper = build_graph_from_edgelist(
+    edges,
+    source_col="sender", target_col="domain",
+    bipartite=True,
+)
+
+# Project onto the user partition: two senders are linked if they shared
+# a domain in common. Jaccard normalizes so power users don't dominate.
+user_graph, user_mapper = project_bipartite(
+    bipartite, full_mapper, projection_mode="source", weight_method="jaccard",
+)
+# user_graph is now ready for guided_label_propagation(...). See Examples 1–5
+# for backboning, filtering, and projection variants that compose with this.
+```
+
+For real-world corpora, the typical chain is: `extract_domains` → `filter_graph(min_source_degree=…)` to drop low-activity senders → `apply_backbone(method="bipartite_svn")` to drop generic high-frequency domains → `project_bipartite` → unipartite backbone → GLP. Example 4 walks through that pipeline in its frame-native form (no graph until the end).
+
 ## Graph, DataFrame, or EdgeList: pick your shape
 
 `apply_backbone`, `filter_graph`, and `project_bipartite` all accept **either** a NetworkIt graph, a Polars edge frame (columns `source_id`, `target_id`, `weight`), or a coded **EdgeList**. The output type defaults to matching the input but can be forced with `output_format="graph"`, `output_format="dataframe"`, or `output_format="edgelist"`.

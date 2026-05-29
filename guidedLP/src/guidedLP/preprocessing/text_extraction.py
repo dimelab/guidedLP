@@ -14,6 +14,10 @@ content elements they shared.
   which is typically 2–4 orders of magnitude smaller. Pass ``output="long"``
   to keep one row per mention, or ``output="lazy"`` to get a ``LazyFrame`` you
   can ``sink_parquet`` straight to disk without materializing.
+  Set ``method="rake"`` to switch from "every word" tokenization to RAKE
+  (Rapid Automatic Keyword Extraction) — phrases are scored across the whole
+  corpus and each sender keeps their top ``top_n`` highest-scoring phrases
+  (unigrams up to ``max_phrase_length``-grams).
 
 Input row order is preserved (in long mode); original IDs in the sender column
 are passed through untouched so the result drops straight into
@@ -68,6 +72,7 @@ _TRAILING_PUNCT = ".,;:!?)]}>\"'`"
 _WORD_PATTERN = r"\b\w+\b"
 
 _VALID_OUTPUT_MODES = frozenset({"aggregated", "long", "lazy"})
+_VALID_METHODS = frozenset({"all", "rake"})
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +592,10 @@ def extract_keywords(
     first_seen_col: str = "first_seen",
     # Matching
     case_sensitive: bool = False,
+    # Extraction method
+    method: str = "all",
+    top_n: int = 50,
+    max_phrase_length: int = 3,
     # NLP preprocessing (all default to off — opting in requires [nlp] extras)
     stop_words: Union[bool, str, Iterable[str], None] = False,
     stem: Union[bool, str, None] = False,
@@ -643,6 +652,36 @@ def extract_keywords(
         ``keywords`` / ``stop_words`` is case-insensitive. If True, original
         case is preserved end-to-end (and you'll need to supply ``stop_words``
         / ``keywords`` in matching case).
+    method : {"all", "rake"}, default "all"
+        Extraction strategy.
+
+        - ``"all"`` (default) — tokenize every word in every post; the result
+          is the full vocabulary (optionally filtered by ``keywords=``).
+        - ``"rake"`` — run RAKE (Rapid Automatic Keyword Extraction) over the
+          whole corpus to score multi-word keyphrases, then keep each sender's
+          top ``top_n`` highest-scoring phrases. Output is always aggregated;
+          ``output="long"``/``"lazy"`` and explicit ``keywords=`` are not
+          supported in this mode. Requires a non-empty ``stop_words`` (RAKE
+          splits phrases at stop words, so passing ``stop_words=False`` would
+          make every post a single phrase). Pure-Python implementation — no
+          extra dependency beyond what ``stop_words=`` already needs.
+    top_n : int, default 50
+        ``method="rake"`` only: number of top-scoring phrases to keep per
+        sender. Senders with fewer distinct candidate phrases keep all they
+        have (no padding).
+    max_phrase_length : int, default 3
+        ``method="rake"`` only: preferred maximum number of words per output
+        phrase. Defaults to 3 = unigrams + bigrams + trigrams. Set to 1 to
+        prefer unigrams, 2 for unigrams + bigrams. This is a *soft* cap, not
+        a hard filter: when ranking each sender's top-``top_n`` phrases,
+        phrases meeting the length cap sort before longer phrases, but if a
+        sender doesn't have ``top_n`` conforming phrases the remainder is
+        filled in from their longer phrases. This guarantees every sender
+        with any extractable content gets at least one keyphrase edge
+        (important when the output feeds bipartite graph construction).
+        Longer phrases are also always used to compute the corpus-level word
+        scores, so e.g. "climate" in "global climate crisis" still accrues
+        degree from the 3-word phrase even at ``max_phrase_length=1``.
     stop_words : bool | str | Iterable[str] | None, default False
         Stop-word filtering applied after tokenization.
 
@@ -692,7 +731,10 @@ def extract_keywords(
     ------
     ValidationError
         Missing columns, wrong post dtype, invalid ``output`` mode, multi-word
-        keyword, or invalid stem/lemma argument shape.
+        keyword, invalid stem/lemma argument shape, unknown ``method``, or any
+        of the RAKE-mode incompatibilities (``output != "aggregated"``,
+        ``keywords`` non-None, missing ``stop_words``, ``top_n < 1``,
+        ``max_phrase_length < 1``).
     ImportError
         If ``stop_words``/``stem``/``lemmatize``/auto-language is requested
         but the corresponding ``[nlp]`` package isn't installed. The error
@@ -700,11 +742,18 @@ def extract_keywords(
 
     Complexity
     ----------
-    Tokenization + filtering is O(N · L) where N is the number of posts and L
-    is the average post length. Aggregation adds an O(M log M) ``group_by``
-    step where M is the post-filter row count. Stemming/lemmatization adds an
-    O(V) Python-level pass over the (post-aggregation) unique vocabulary V —
-    so it's cheap relative to tokenization.
+    ``method="all"``: tokenization + filtering is O(N · L) where N is the
+    number of posts and L is the average post length. Aggregation adds an
+    O(M log M) ``group_by`` step where M is the post-filter row count.
+    Stemming/lemmatization adds an O(V) Python-level pass over the
+    (post-aggregation) unique vocabulary V — cheap relative to tokenization.
+
+    ``method="rake"`` adds a Python-level per-post phrase-extraction UDF
+    (O(N · L) but unvectorized — slower wall-clock per row than the all-words
+    regex pass) plus an O(P) word-stats sweep over the P unique candidate
+    phrases. Per-sender top-N is an O(M log M) sort + group_by + head. RAKE is
+    typically a few × slower than the all-words path on the same corpus; budget
+    accordingly for >10M posts.
 
     Examples
     --------
@@ -730,6 +779,13 @@ def extract_keywords(
     Filter to a vocabulary:
 
     >>> extract_keywords(df, keywords=["climate", "vaccine"]).sort(["sender"])  # doctest: +SKIP
+
+    RAKE — top-N corpus-scored keyphrases (up to trigrams) per sender:
+
+    >>> extract_keywords(                                           # doctest: +SKIP
+    ...     df, method="rake", top_n=5, max_phrase_length=3,
+    ...     stop_words=True,  # required for RAKE; "True" auto-detects language
+    ... )
     """
     _validate_input(df, sender_col, post_col, datetime_col)
 
@@ -739,6 +795,50 @@ def extract_keywords(
             field="output",
             value=output,
         )
+
+    if method not in _VALID_METHODS:
+        raise ValidationError(
+            f"method must be one of {sorted(_VALID_METHODS)}, got {method!r}",
+            field="method",
+            value=method,
+        )
+
+    if method == "rake":
+        if output != "aggregated":
+            raise ValidationError(
+                "method='rake' only supports output='aggregated' because the "
+                "top-N-per-sender selection requires materializing the score "
+                "table. Use output='aggregated' (default) for RAKE.",
+                field="output",
+                value=output,
+            )
+        if keywords is not None:
+            raise ValidationError(
+                "method='rake' is incompatible with an explicit keywords= "
+                "filter — RAKE *derives* the vocabulary. Drop keywords= or "
+                "use method='all'.",
+                field="keywords",
+            )
+        if stop_words is False or stop_words is None:
+            raise ValidationError(
+                "method='rake' requires a stop-word list (phrases are split "
+                "at stop words). Pass stop_words=True for auto-detection, a "
+                "language code like stop_words='en', or a custom iterable.",
+                field="stop_words",
+            )
+        if top_n < 1:
+            raise ValidationError(
+                f"top_n must be >= 1 for method='rake', got {top_n}",
+                field="top_n",
+                value=top_n,
+            )
+        if max_phrase_length < 1:
+            raise ValidationError(
+                "max_phrase_length must be >= 1 for method='rake', got "
+                f"{max_phrase_length}",
+                field="max_phrase_length",
+                value=max_phrase_length,
+            )
 
     # ---- Resolve language (auto-detect if any preprocessing asks for it) ---
     needs_auto = any(
@@ -782,6 +882,25 @@ def extract_keywords(
             "those steps force materialization. Use output='aggregated' "
             "(default) or output='long'.",
             field="output",
+        )
+
+    # ---- Dispatch on method ------------------------------------------------
+    if method == "rake":
+        return _extract_keywords_rake(
+            df,
+            sender_col=sender_col,
+            post_col=post_col,
+            datetime_col=datetime_col,
+            keyword_col=keyword_col,
+            count_col=count_col,
+            first_seen_col=first_seen_col,
+            case_sensitive=case_sensitive,
+            top_n=top_n,
+            max_phrase_length=max_phrase_length,
+            min_word_length=min_word_length,
+            stop_set=stop_set,
+            stemmer=stemmer,
+            lemmatizer=lemmatizer,
         )
 
     # ---- Build the lazy tokenization pipeline ------------------------------
@@ -872,5 +991,125 @@ def extract_keywords(
             keywords, case_sensitive, stemmer, lemmatizer
         )
         aggregated = aggregated.filter(pl.col(keyword_col).is_in(list(kw_set)))
+
+    return aggregated
+
+
+# ---------------------------------------------------------------------------
+# RAKE path
+# ---------------------------------------------------------------------------
+
+
+def _extract_keywords_rake(
+    df: pl.DataFrame,
+    *,
+    sender_col: str,
+    post_col: str,
+    datetime_col: Optional[str],
+    keyword_col: str,
+    count_col: str,
+    first_seen_col: str,
+    case_sensitive: bool,
+    top_n: int,
+    max_phrase_length: int,
+    min_word_length: int,
+    stop_set: FrozenSet[str],
+    stemmer: Optional[Callable[[str], str]],
+    lemmatizer: Optional[Callable[[str], str]],
+) -> pl.DataFrame:
+    """
+    RAKE branch of :func:`extract_keywords`.
+
+    See the RAKE section of ``extract_keywords``'s docstring and
+    ``guidedLP.preprocessing._rake`` for algorithm details. This wrapper:
+
+    1. Builds a per-post phrase extractor and applies it to ``post_col``.
+    2. Computes corpus-level RAKE scores for each unique phrase.
+    3. Aggregates to ``(sender, phrase)`` with mention counts and
+       ``first_seen``.
+    4. Keeps each sender's top ``top_n`` phrases (ranked by global score;
+       per-sender mention count is the tiebreaker so deterministic ordering
+       survives equal-score phrases).
+
+    Returns a DataFrame with the same column shape as the ``method="all"``
+    aggregated path: ``[sender_col, keyword_col, count_col, first_seen_col?]``.
+    """
+    from guidedLP.preprocessing._rake import (
+        attach_phrase_scores,
+        make_phrase_extractor,
+    )
+
+    extractor = make_phrase_extractor(
+        stop_set=stop_set,
+        min_word_length=min_word_length,
+        case_sensitive=case_sensitive,
+        stemmer=stemmer,
+        lemmatizer=lemmatizer,
+    )
+
+    carry = _carry_cols(sender_col, datetime_col)
+    phrased = (
+        df.select(
+            carry
+            + [
+                pl.col(post_col)
+                .map_elements(extractor, return_dtype=pl.List(pl.Utf8))
+                .alias(keyword_col)
+            ]
+        )
+        .explode(keyword_col)
+        .filter(
+            pl.col(keyword_col).is_not_null() & (pl.col(keyword_col) != "")
+        )
+    )
+
+    if phrased.height == 0:
+        # No candidate phrases anywhere — return an empty frame with the
+        # correct schema so downstream code doesn't crash on a missing column.
+        cols = [pl.Series(sender_col, [], dtype=df.schema[sender_col]),
+                pl.Series(keyword_col, [], dtype=pl.Utf8),
+                pl.Series(count_col, [], dtype=pl.UInt32)]
+        if datetime_col is not None:
+            cols.append(
+                pl.Series(first_seen_col, [], dtype=df.schema[datetime_col])
+            )
+        return pl.DataFrame(cols)
+
+    score_col = "_glp_rake_score"
+    phrased = attach_phrase_scores(phrased, keyword_col, score_col)
+
+    agg_exprs: List[pl.Expr] = [
+        pl.len().alias(count_col),
+        pl.col(score_col).first().alias(score_col),
+    ]
+    if datetime_col is not None:
+        agg_exprs.append(pl.col(datetime_col).min().alias(first_seen_col))
+
+    aggregated = phrased.group_by([sender_col, keyword_col]).agg(agg_exprs)
+
+    # max_phrase_length is treated as a soft preference, not a hard cap:
+    # phrases of acceptable length sort first, longer phrases backfill if a
+    # sender doesn't have ``top_n`` short candidates. This guarantees that
+    # any sender who posted at least one content word gets at least one
+    # keyphrase edge — the explicit no-empty-senders requirement.
+    meets_col = "_glp_meets_length"
+    aggregated = aggregated.with_columns(
+        (pl.col(keyword_col).str.count_matches(r"\S+") <= max_phrase_length)
+        .alias(meets_col)
+    )
+
+    # Sort order per sender:
+    #   1. meets_length (True before False — keeps the uni/bi/tri preference)
+    #   2. score (descending — RAKE informativeness)
+    #   3. count (descending — frequent ties before rare ones)
+    #   4. keyword (ascending — deterministic alphabetic tiebreaker)
+    sort_cols = [sender_col, meets_col, score_col, count_col, keyword_col]
+    descending = [False, True, True, True, False]
+    aggregated = (
+        aggregated.sort(sort_cols, descending=descending)
+        .group_by(sender_col, maintain_order=True)
+        .head(top_n)
+        .drop([score_col, meets_col])
+    )
 
     return aggregated

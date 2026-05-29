@@ -63,6 +63,13 @@ setup(
             "snowballstemmer>=2.2.0",
             "simplemma>=1.0.0",
         ],
+        # Optional dependencies for preprocessing.embedding_extraction. Required
+        # only when calling extract_embedding_features() without a pre-supplied
+        # embedding_col= (the from-scratch encoding path). Pulls in torch via
+        # sentence-transformers — heavy install, hence opt-in.
+        "embeddings": [
+            "sentence-transformers>=2.2.0",
+        ],
     },
     classifiers=[
         "Development Status :: 3 - Alpha",
