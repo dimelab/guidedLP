@@ -17,7 +17,9 @@ content elements they shared.
   Set ``method="rake"`` to switch from "every word" tokenization to RAKE
   (Rapid Automatic Keyword Extraction) — phrases are scored across the whole
   corpus and each sender keeps their top ``top_n`` highest-scoring phrases
-  (unigrams up to ``max_phrase_length``-grams).
+  (unigrams up to ``max_phrase_length``-grams). Pass ``top_n`` as a
+  ``(low, high)`` tuple to use an elastic cap that scales with each sender's
+  post count — heavier posters keep more keyphrases than lighter ones.
 
 Input row order is preserved (in long mode); original IDs in the sender column
 are passed through untouched so the result drops straight into
@@ -35,7 +37,7 @@ to be installed: ``pip install 'guidedLP[nlp]'``. Without it, the basic
 
 from __future__ import annotations
 
-from typing import Callable, FrozenSet, Iterable, List, Optional, Sequence, Union
+from typing import Callable, FrozenSet, Iterable, List, Optional, Sequence, Tuple, Union
 
 import polars as pl
 
@@ -594,7 +596,7 @@ def extract_keywords(
     case_sensitive: bool = False,
     # Extraction method
     method: str = "all",
-    top_n: int = 50,
+    top_n: Union[int, Tuple[int, int]] = 50,
     max_phrase_length: int = 3,
     # NLP preprocessing (all default to off — opting in requires [nlp] extras)
     stop_words: Union[bool, str, Iterable[str], None] = False,
@@ -665,10 +667,19 @@ def extract_keywords(
           splits phrases at stop words, so passing ``stop_words=False`` would
           make every post a single phrase). Pure-Python implementation — no
           extra dependency beyond what ``stop_words=`` already needs.
-    top_n : int, default 50
+    top_n : int or tuple[int, int], default 50
         ``method="rake"`` only: number of top-scoring phrases to keep per
         sender. Senders with fewer distinct candidate phrases keep all they
         have (no padding).
+
+        Pass a ``(low, high)`` tuple for an **elastic** cap that scales with
+        each sender's posting volume: senders are ranked by post count, and
+        their cap is linearly interpolated by percentile rank from ``low``
+        (lowest-posting sender) to ``high`` (highest-posting sender). Ties
+        in post count receive the same cap (average rank). With a single
+        sender or when all senders tie at the same post count, every sender
+        gets ``high`` and the midpoint respectively. Tuple must satisfy
+        ``1 <= low <= high``.
     max_phrase_length : int, default 3
         ``method="rake"`` only: preferred maximum number of words per output
         phrase. Defaults to 3 = unigrams + bigrams + trigrams. Set to 1 to
@@ -733,7 +744,8 @@ def extract_keywords(
         Missing columns, wrong post dtype, invalid ``output`` mode, multi-word
         keyword, invalid stem/lemma argument shape, unknown ``method``, or any
         of the RAKE-mode incompatibilities (``output != "aggregated"``,
-        ``keywords`` non-None, missing ``stop_words``, ``top_n < 1``,
+        ``keywords`` non-None, missing ``stop_words``, ``top_n < 1``, elastic
+        ``top_n`` tuple with wrong arity or ``low > high``,
         ``max_phrase_length < 1``).
     ImportError
         If ``stop_words``/``stem``/``lemmatize``/auto-language is requested
@@ -826,7 +838,35 @@ def extract_keywords(
                 "language code like stop_words='en', or a custom iterable.",
                 field="stop_words",
             )
-        if top_n < 1:
+        if isinstance(top_n, tuple):
+            if len(top_n) != 2 or not all(isinstance(v, int) for v in top_n):
+                raise ValidationError(
+                    "elastic top_n must be a (low, high) tuple of two ints, "
+                    f"got {top_n!r}",
+                    field="top_n",
+                    value=top_n,
+                )
+            low, high = top_n
+            if low < 1 or high < 1:
+                raise ValidationError(
+                    f"elastic top_n bounds must be >= 1, got {top_n!r}",
+                    field="top_n",
+                    value=top_n,
+                )
+            if low > high:
+                raise ValidationError(
+                    f"elastic top_n low must be <= high, got {top_n!r}",
+                    field="top_n",
+                    value=top_n,
+                )
+        elif isinstance(top_n, bool) or not isinstance(top_n, int):
+            raise ValidationError(
+                "top_n must be an int or a (low, high) tuple of ints, got "
+                f"{type(top_n).__name__}",
+                field="top_n",
+                value=top_n,
+            )
+        elif top_n < 1:
             raise ValidationError(
                 f"top_n must be >= 1 for method='rake', got {top_n}",
                 field="top_n",
@@ -1010,7 +1050,7 @@ def _extract_keywords_rake(
     count_col: str,
     first_seen_col: str,
     case_sensitive: bool,
-    top_n: int,
+    top_n: Union[int, Tuple[int, int]],
     max_phrase_length: int,
     min_word_length: int,
     stop_set: FrozenSet[str],
@@ -1105,11 +1145,91 @@ def _extract_keywords_rake(
     #   4. keyword (ascending — deterministic alphabetic tiebreaker)
     sort_cols = [sender_col, meets_col, score_col, count_col, keyword_col]
     descending = [False, True, True, True, False]
-    aggregated = (
-        aggregated.sort(sort_cols, descending=descending)
-        .group_by(sender_col, maintain_order=True)
-        .head(top_n)
-        .drop([score_col, meets_col])
-    )
+    aggregated = aggregated.sort(sort_cols, descending=descending)
+
+    if isinstance(top_n, tuple):
+        # Elastic per-sender cap. We compute each sender's post count from the
+        # *original* df (not the phrase frame) so the ranking reflects how
+        # prolific the sender is in raw posting terms, even if many of their
+        # posts have no extractable RAKE phrases.
+        cap_col = "_glp_top_n_cap"
+        rank_col = "_glp_rank_in_sender"
+        sender_caps = _elastic_sender_caps(
+            df,
+            sender_col=sender_col,
+            low=top_n[0],
+            high=top_n[1],
+            cap_col=cap_col,
+        )
+        aggregated = (
+            aggregated.join(sender_caps, on=sender_col, how="left")
+            # Within each sender's already-sorted block, the cumulative count
+            # of (the always-non-null) sender column is a 1-indexed rank.
+            .with_columns(
+                pl.col(sender_col).cum_count().over(sender_col).alias(rank_col)
+            )
+            .filter(pl.col(rank_col) <= pl.col(cap_col))
+            .drop([score_col, meets_col, cap_col, rank_col])
+        )
+    else:
+        aggregated = (
+            aggregated.group_by(sender_col, maintain_order=True)
+            .head(top_n)
+            .drop([score_col, meets_col])
+        )
 
     return aggregated
+
+
+def _elastic_sender_caps(
+    df: pl.DataFrame,
+    *,
+    sender_col: str,
+    low: int,
+    high: int,
+    cap_col: str,
+) -> pl.DataFrame:
+    """
+    Compute per-sender elastic top_n caps from post count percentile rank.
+
+    Returns a 2-column DataFrame ``[sender_col, cap_col]`` where ``cap_col``
+    is a UInt32 of the sender's elastic cap. The cap is linearly interpolated
+    by ``(rank - 1) / (n - 1)`` from ``low`` (rank 1) to ``high`` (rank n),
+    with ties resolved by average rank so tied senders get identical caps.
+    Edge cases:
+
+    - ``n == 1`` (single sender): cap is ``high``. The single sender trivially
+      occupies the top of the rank scale.
+    - All senders tied at the same post count: average rank is ``(n + 1) / 2``,
+      so percentile is ``0.5`` and every sender gets the midpoint cap. This
+      is the principled choice — there is no signal to spread them on.
+    """
+    sender_counts = df.group_by(sender_col).agg(
+        pl.len().alias("_glp_post_count")
+    )
+    n_senders = sender_counts.height
+
+    if n_senders == 1:
+        return sender_counts.with_columns(
+            pl.lit(high, dtype=pl.UInt32).alias(cap_col)
+        ).select([sender_col, cap_col])
+
+    return (
+        sender_counts.with_columns(
+            pl.col("_glp_post_count")
+            .rank(method="average")
+            .alias("_glp_pct_rank")
+        )
+        .with_columns(
+            (
+                low
+                + (high - low)
+                * (pl.col("_glp_pct_rank") - 1.0)
+                / (n_senders - 1)
+            )
+            .round()
+            .cast(pl.UInt32)
+            .alias(cap_col)
+        )
+        .select([sender_col, cap_col])
+    )
