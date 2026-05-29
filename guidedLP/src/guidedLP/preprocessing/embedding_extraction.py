@@ -325,6 +325,54 @@ def _load_embeddings_cache(
     return arr.astype(np.float64, copy=False)
 
 
+def _save_aggregated_cache(path: Path, aggregated: np.ndarray) -> None:
+    """Write the per-sender aggregated embeddings to ``path`` as ``.npy``.
+
+    Shape on disk is ``(n_unique_senders, D)`` — for a corpus with many posts
+    per sender this is typically 10–100× smaller than the per-post cache the
+    legacy ``aggregate_inline=False`` path produces.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, aggregated)
+
+
+def _load_aggregated_cache(path: Path, expected_n_senders: int) -> np.ndarray:
+    """Load a previously-saved per-sender aggregated matrix.
+
+    The cache is row-aligned with ``np.unique(senders)`` (which sorts), so as
+    long as the input column has the same set of unique senders, row ``i`` of
+    the cache corresponds to ``unique[i]``. We only validate the row count —
+    a stronger sender-identity check would require storing the sender list
+    alongside, which would change the file format. If the count happens to
+    match but the senders themselves are different, the result will be
+    silently wrong — pass ``create_new=True`` whenever the input corpus
+    changes meaningfully.
+    """
+    arr = np.load(path)
+    if arr.ndim != 2:
+        raise ValidationError(
+            f"Aggregated cache at '{path}' must be 2-D, got shape {arr.shape}. "
+            "Pass create_new=True to regenerate.",
+            field="save_path",
+            value=str(path),
+        )
+    if arr.shape[0] != expected_n_senders:
+        raise ValidationError(
+            f"Aggregated cache at '{path}' has {arr.shape[0]} senders but the "
+            f"input has {expected_n_senders} unique senders after null "
+            "filtering. The cache is keyed by sender, so this almost certainly "
+            "means a different corpus was passed. Pass create_new=True to "
+            "regenerate.",
+            field="save_path",
+            value=str(path),
+            details={
+                "cached_senders": int(arr.shape[0]),
+                "input_senders": int(expected_n_senders),
+            },
+        )
+    return arr.astype(np.float64, copy=False)
+
+
 # ---------------------------------------------------------------------------
 # Per-sender aggregation
 # ---------------------------------------------------------------------------
@@ -389,6 +437,96 @@ def _aggregate_per_sender(
     return unique, out
 
 
+def _encode_and_aggregate(
+    posts: list,
+    senders: np.ndarray,
+    model: Union[str, Any],
+    batch_size: int,
+    chunk_size: Optional[int],
+    show_progress: bool,
+    device: Optional[str],
+    aggregation: str,
+    normalize: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Encode ``posts`` and accumulate them into a per-sender output on the fly.
+
+    The per-post ``(N_posts, D)`` embedding matrix is never materialized — each
+    chunk is encoded, optionally L2-normalized, and folded straight into the
+    ``(n_unique, D)`` accumulator. Peak RAM is bounded by
+    ``(n_unique + chunk_size) × D`` rather than ``N_posts × D`` and no disk is
+    needed for an intermediate per-post file.
+
+    Sender order does not matter — ``np.add.at`` / ``np.maximum.at`` route each
+    row of the chunk to the correct accumulator row via ``inverse[start:end]``,
+    so the input can be in any order. Sorting by sender would not change the
+    result.
+
+    Returns ``(unique_senders, aggregated)`` where ``unique_senders`` is the
+    sorted unique value of ``senders`` and ``aggregated`` has shape
+    ``(n_unique, D)``.
+    """
+    if aggregation not in _VALID_AGGREGATIONS:
+        raise ValidationError(
+            f"aggregation must be one of {sorted(_VALID_AGGREGATIONS)}, "
+            f"got {aggregation!r}",
+            field="aggregation",
+            value=aggregation,
+        )
+
+    encoder = _resolve_encoder(model, device)
+    n = len(posts)
+    unique, inverse = np.unique(senders, return_inverse=True)
+    n_unique = len(unique)
+    # Falsy chunk_size (None or 0) collapses to one pass over the whole array.
+    # `max(n, 1)` keeps `range(0, 0, cs)` legal when there is no data at all.
+    cs = chunk_size if chunk_size else max(n, 1)
+
+    def _encode_batch(batch: list) -> np.ndarray:
+        raw = encoder.encode(
+            batch,
+            batch_size=batch_size,
+            show_progress_bar=show_progress,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+        )
+        return np.asarray(raw, dtype=np.float64)
+
+    # Encode the first chunk eagerly to probe D before allocating the
+    # accumulator. After the probe, the loop handles the remaining range.
+    first_end = min(cs, n)
+    first = _encode_batch(posts[:first_end])
+    if normalize:
+        first = _l2_normalize_rows(first)
+    dim = first.shape[1]
+
+    if aggregation == "max":
+        out = np.full((n_unique, dim), -np.inf, dtype=np.float64)
+    else:
+        out = np.zeros((n_unique, dim), dtype=np.float64)
+
+    if aggregation == "max":
+        np.maximum.at(out, inverse[:first_end], first)
+    else:
+        np.add.at(out, inverse[:first_end], first)
+    del first
+
+    for start in range(cs, n, cs):
+        end = min(start + cs, n)
+        chunk = _encode_batch(posts[start:end])
+        if normalize:
+            chunk = _l2_normalize_rows(chunk)
+        if aggregation == "max":
+            np.maximum.at(out, inverse[start:end], chunk)
+        else:
+            np.add.at(out, inverse[start:end], chunk)
+
+    if aggregation == "mean":
+        counts = np.bincount(inverse, minlength=n_unique).astype(np.float64)
+        return unique, out / counts[:, None]
+    return unique, out
+
+
 def _apply_weight_transform(
     weights: np.ndarray,
     transform: str,
@@ -434,6 +572,7 @@ def extract_embedding_features(
     # On-disk cache for the from-scratch path
     save_path: Optional[Union[str, Path]] = None,
     create_new: bool = False,
+    aggregate_inline: bool = True,
     # Memory control
     chunk_size: Optional[int] = None,
     # Aggregation per sender
@@ -496,45 +635,72 @@ def extract_embedding_features(
         consulted when ``model`` is passed as a string. ``None`` lets
         sentence-transformers auto-select.
     normalize_embeddings : bool, default True
-        L2-normalize every per-post vector before aggregation. Applied
-        identically in both paths (and identically whether the embeddings came
-        from the model or from disk cache), so the on-disk cache stays
-        normalize-agnostic — flipping this flag between runs does **not**
-        require ``create_new=True``. Setting this False with
-        ``weight_transform="shift"`` (default) is a configuration error in
-        spirit — the shift amount assumes bounded ``[-1, 1]`` components,
-        which is only true for L2-normalized vectors.
+        L2-normalize every per-post vector before aggregation. With
+        ``aggregate_inline=False`` (legacy path), the on-disk cache stores raw
+        un-normalized model outputs and normalization is applied on load, so
+        the cache stays normalize-agnostic — flipping this flag between runs
+        does **not** require ``create_new=True``. With ``aggregate_inline=True``
+        (default), normalization is folded into the aggregation pass and baked
+        into the cache, so toggling this flag **does** require
+        ``create_new=True``. Setting this False with ``weight_transform="shift"``
+        (default) is a configuration error in spirit — the shift amount
+        assumes bounded ``[-1, 1]`` components, which is only true for
+        L2-normalized vectors.
     save_path : str or pathlib.Path, optional
-        If set, the per-post raw embedding matrix is cached on disk at this
-        path (as ``.npy``; the ``.npy`` suffix is appended if missing). On
-        subsequent calls with ``create_new=False`` (default) and the file
-        present, encoding is skipped and the cached matrix is loaded — a
-        large win when iterating on aggregation / sparsification / transform
-        choices, since model inference is by far the most expensive step.
-        Only meaningful for the from-scratch path: passing ``save_path``
-        together with ``embedding_col`` raises ``ValidationError``. The cache
-        is row-aligned with the post table (after null filtering), so feeding
-        in a different corpus must be paired with ``create_new=True``.
+        If set, model outputs are cached on disk at this path (as ``.npy``;
+        the ``.npy`` suffix is appended if missing). On subsequent calls with
+        ``create_new=False`` (default) and the file present, encoding is
+        skipped — a large win when iterating on downstream choices, since
+        model inference is by far the most expensive step. Only meaningful
+        for the from-scratch path: passing ``save_path`` together with
+        ``embedding_col`` raises ``ValidationError``.
+
+        The cache contents depend on ``aggregate_inline``:
+
+        - ``aggregate_inline=True`` (default) — stores the per-sender
+          aggregated matrix of shape ``(n_unique_senders, D)``. The cache is
+          keyed by sender, so it bakes in ``aggregation`` and
+          ``normalize_embeddings``; changing either requires
+          ``create_new=True``. Typically 10–100× smaller than the legacy form.
+        - ``aggregate_inline=False`` — stores the raw per-post matrix of shape
+          ``(N_posts, D)``. The cache stays normalize- and aggregation-
+          agnostic, so those settings can be iterated on without re-encoding.
+
+        Either way, feeding in a different corpus must be paired with
+        ``create_new=True``.
     create_new : bool, default False
         Force re-encoding even if ``save_path`` points at an existing cache,
         and overwrite the file with the freshly-encoded matrix. Has no effect
         when ``save_path`` is ``None``.
+    aggregate_inline : bool, default True
+        Fold per-sender aggregation into the encoding pass so the per-post
+        ``(N_posts, D)`` matrix is never materialized in RAM or on disk. The
+        cache (if ``save_path`` is set) stores only the
+        ``(n_unique_senders, D)`` aggregated matrix.
+
+        Set to ``False`` to restore the legacy behavior: encode all posts,
+        cache the raw per-post matrix on disk, then aggregate. Useful when
+        you want to iterate on ``aggregation`` / ``normalize_embeddings``
+        without re-running model inference — that path keeps the cache
+        normalize- and aggregation-agnostic at the cost of a much larger file.
     chunk_size : int, optional
         Cap on rows held in RAM at once during encoding and aggregation. Set
-        this when the per-post embedding matrix would not fit in memory:
-        peak RAM drops from ``~N_posts × D × 8 bytes`` to
-        ``~chunk_size × D × 8 bytes``. Distinct from ``batch_size``, which
-        controls the model's per-forward-pass batch (a throughput knob, not a
-        memory knob — ``encoder.encode`` still accumulates the full output in
-        RAM regardless of ``batch_size``).
+        this when the per-post embedding matrix would not fit in memory.
 
-        On the from-scratch path, ``chunk_size`` **requires** ``save_path``:
-        chunks are streamed to a memory-mapped ``.npy`` file as they are
-        encoded, then aggregation reopens that file via ``mmap_mode='r'`` and
-        reads it back in chunks. On the pre-embedded path, ``chunk_size`` only
-        affects the aggregation pass — the input ``embedding_col`` is still
-        materialized in RAM by polars, so the savings come from skipping the
-        full-array L2-normalization copy.
+        With ``aggregate_inline=True`` (default), peak RAM during encoding is
+        ``~(chunk_size + n_unique_senders) × D × 8 bytes`` and no intermediate
+        disk file is needed — ``save_path`` is optional even when chunking.
+
+        With ``aggregate_inline=False``, chunked encoding streams each chunk
+        to a memory-mapped ``.npy`` file, so ``save_path`` is **required**;
+        aggregation then reopens that file via ``mmap_mode='r'`` and reads it
+        back in chunks. On the pre-embedded path, ``chunk_size`` only affects
+        the aggregation pass — the input ``embedding_col`` is still
+        materialized in RAM by polars.
+
+        Distinct from ``batch_size``, which controls the model's per-forward-
+        pass batch (a throughput knob, not a memory knob — ``encoder.encode``
+        still accumulates the full output in RAM regardless of ``batch_size``).
 
         Numerics are bit-identical to ``chunk_size=None`` (same accumulation
         order). Default ``None`` keeps the original single-pass behavior.
@@ -641,11 +807,22 @@ def extract_embedding_features(
             value=chunk_size,
         )
 
-    if chunk_size is not None and embedding_col is None and save_path is None:
+    # chunk_size + save_path requirement only applies to the legacy per-post
+    # cache (aggregate_inline=False): that path needs a file to memmap.
+    # aggregate_inline=True accumulates into the per-sender array on the fly,
+    # so no intermediate disk file is needed regardless of chunk_size.
+    if (
+        chunk_size is not None
+        and embedding_col is None
+        and save_path is None
+        and not aggregate_inline
+    ):
         raise ValidationError(
-            "chunk_size requires save_path on the from-scratch path: chunked "
-            "encoding streams each chunk to a memory-mapped .npy file, so a "
-            "path to write it is mandatory.",
+            "chunk_size requires save_path on the from-scratch path when "
+            "aggregate_inline=False: chunked encoding streams each chunk to a "
+            "memory-mapped .npy file, so a path to write it is mandatory. "
+            "With aggregate_inline=True (default), chunks are aggregated into "
+            "a small per-sender accumulator and disk caching is optional.",
             field="chunk_size",
         )
 
@@ -660,10 +837,58 @@ def extract_embedding_features(
             empty_schema[first_seen_col] = df.schema[datetime_col]
         return pl.DataFrame(schema=empty_schema)
 
-    # ---- Acquire embeddings (raw, pre-normalization) ----------------------
+    # ---- Acquire (and aggregate) embeddings -------------------------------
+    senders = df_work.get_column(sender_col).to_numpy()
+
     if embedding_col is not None:
+        # Pre-embedded path: no encoding to cache. Read embeddings, then
+        # aggregate them per sender. aggregate_inline has no effect here.
         embeddings = _embeddings_from_column(df_work, embedding_col)
+        unique_senders, aggregated = _aggregate_per_sender(
+            senders,
+            embeddings,
+            aggregation,
+            normalize=normalize_embeddings,
+            chunk_size=chunk_size,
+        )
+    elif aggregate_inline:
+        # NEW DEFAULT: fold encoding and per-sender aggregation into one pass.
+        # The on-disk cache stores only the (n_unique_senders, D) aggregated
+        # matrix — typically 10–100× smaller than the per-post cache produced
+        # by the legacy path. The cache is keyed by sender, so it bakes in the
+        # current `aggregation` and `normalize_embeddings` choices; changing
+        # either requires create_new=True.
+        cache_p = _cache_path(save_path) if save_path is not None else None
+        cache_hit = (
+            cache_p is not None and not create_new and cache_p.exists()
+        )
+
+        if cache_hit:
+            unique_senders = np.unique(senders)
+            aggregated = _load_aggregated_cache(
+                cache_p, len(unique_senders)
+            )
+        else:
+            posts = df_work.get_column(post_col).to_list()
+            unique_senders, aggregated = _encode_and_aggregate(
+                posts,
+                senders,
+                model=model,
+                batch_size=batch_size,
+                chunk_size=chunk_size,
+                show_progress=show_progress,
+                device=device,
+                aggregation=aggregation,
+                normalize=normalize_embeddings,
+            )
+            if cache_p is not None:
+                _save_aggregated_cache(cache_p, aggregated)
     else:
+        # LEGACY: cache per-post embeddings on disk so downstream choices
+        # (aggregation, normalization, weight transform) can be iterated on
+        # without re-running model inference. The on-disk file holds the raw
+        # un-normalized model outputs, keeping the cache normalize- and
+        # aggregation-agnostic.
         cache_p = _cache_path(save_path) if save_path is not None else None
         cache_hit = (
             cache_p is not None and not create_new and cache_p.exists()
@@ -704,18 +929,13 @@ def extract_embedding_features(
         elif cache_hit:
             embeddings = _load_embeddings_cache(cache_p, df_work.height)
 
-    # ---- Aggregate per sender ---------------------------------------------
-    # Normalization is folded into _aggregate_per_sender so the chunked path
-    # never materializes a full normalized copy. With chunk_size=None the
-    # function runs a single pass and reproduces the prior numerics exactly.
-    senders = df_work.get_column(sender_col).to_numpy()
-    unique_senders, aggregated = _aggregate_per_sender(
-        senders,
-        embeddings,
-        aggregation,
-        normalize=normalize_embeddings,
-        chunk_size=chunk_size,
-    )
+        unique_senders, aggregated = _aggregate_per_sender(
+            senders,
+            embeddings,
+            aggregation,
+            normalize=normalize_embeddings,
+            chunk_size=chunk_size,
+        )
     aggregated = _apply_weight_transform(
         aggregated, weight_transform, shift_amount
     )
