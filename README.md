@@ -175,6 +175,29 @@ extract_keywords(posts, output="lazy").sink_parquet("words.parquet")
 
 When NLP preprocessing is on, the user-supplied `keywords=` list is also stemmed/lemmatized before comparison, so `keywords=["climate"]` with `stem=True` still matches the stemmed form (`"climat"`) of words like *climate*, *climates*, *climatic* in the corpus.
 
+**RAKE keyphrase mode.** Pass `method="rake"` to switch from "every word" tokenization to RAKE (Rapid Automatic Keyword Extraction). Phrases — sequences of content words bounded by stop words or punctuation — are scored across the whole corpus by their word-cooccurrence informativeness (`degree / freq` per word, summed per phrase), and each sender keeps their `top_n` highest-scoring phrases. The output schema is identical to the default — `[sender, keyword, mentions, first_seen]` — so it drops into graph construction unchanged; the only difference is that `keyword` values are now multi-word phrases like `"climate change"` or `"public health policy"` instead of single words.
+
+```python
+# Top-50 RAKE keyphrases (uni/bi/tri-grams) per sender, scored corpus-wide.
+phrases = extract_keywords(
+    posts,
+    method="rake",
+    top_n=50,                 # phrases kept per sender
+    max_phrase_length=3,      # 1 = unigrams, 2 = uni+bi, 3 = uni+bi+tri
+    stop_words=True,          # required for RAKE — phrases split at stop words
+)
+# Columns: [sender, keyword, mentions, first_seen]
+# Example rows: ("alice", "urgent climate action", 1, "2024-01-01"),
+#               ("bob",   "public health policy",  1, "2024-01-05"),
+
+# Smaller vocabulary, longer phrases allowed:
+phrases = extract_keywords(
+    posts, method="rake", top_n=10, max_phrase_length=4, stop_words="en",
+)
+```
+
+`stop_words` is mandatory in RAKE mode (without a stop-word list every post becomes a single phrase) — pass `True` for auto-detection, an ISO 639-1 code, or a custom list. `max_phrase_length` is a **soft cap**: phrases meeting the length sort first, but if a sender doesn't have `top_n` short candidates the remainder is filled in from their longer phrases, so every sender with any extractable content gets at least one keyphrase edge. Longer phrases are also always used to compute the corpus-level word stats, so e.g. *climate* in *"global climate crisis"* still accrues informativeness even at `max_phrase_length=1`. `stem=` and `lemmatize=` work in RAKE mode and apply per-token, so *climate* and *climates* canonicalize before scoring. The RAKE path is pure Python (no extra dependency beyond what `stop_words=` already needs) but its per-post phrase-extraction UDF is a few × slower than the default regex path — budget accordingly for >10M posts.
+
 ### Semantic embedding features
 
 `extract_embedding_features` is the "what *kind of content* does this sender post, semantically?" counterpart to the literal-text extractors. Each post is mapped to a fixed-dimensional embedding vector, those vectors are mean-pooled per sender, and the resulting per-sender vector is exploded into one edge per dimension (`dim_0`, `dim_1`, …). The output schema is `[sender, feature, weight(, first_seen)]` — the same shape the other extractors produce, just with continuous-valued weights instead of mention counts. Two senders who post about the same topics end up with high weights on the same `dim_*` features, so a bipartite projection of senders → dimensions yields a semantic similarity graph.
