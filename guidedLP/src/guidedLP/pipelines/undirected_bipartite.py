@@ -121,6 +121,7 @@ def run_undirected_bipartite_pipeline(
     # Stage 1: build_edgelist.
     min_source_degree: Optional[int] = None,
     min_target_degree: Optional[int] = None,
+    weight_col: Optional[str] = None,
     auto_weight: bool = False,
     bipartite_overlap: str = "drop",
     # Stage 2: bipartite backbone.
@@ -148,9 +149,11 @@ def run_undirected_bipartite_pipeline(
     source : str | Path | pl.DataFrame
         Raw input. File paths (``.csv``, ``.parquet``) are read via
         :func:`build_edgelist_from_frame`; a DataFrame is consumed
-        directly. Unlike the canonical pipeline, no timestamp or
-        per-edge weight column is required — this pipeline does not
-        carry passthrough columns through Stage 1.
+        directly. Unlike the canonical pipeline, no timestamp column is
+        required — this pipeline does not carry timestamp passthrough
+        through Stage 1. A per-edge ``weight_col`` is optional (see
+        below); when supplied, it feeds the bipartite_svn backbone at
+        Stage 2 but is overwritten by topological weights in Stage 3.
     source_col, target_col : str
         Column names for the bipartite endpoints. The conventional
         choice is ``source_col`` = user-side and ``target_col`` =
@@ -170,10 +173,21 @@ def run_undirected_bipartite_pipeline(
         :func:`project_bipartite`.
     min_source_degree, min_target_degree : int, optional
         Degree filters applied during the build step.
+    weight_col : str, optional
+        Name of a per-row weight column on the input. When set, Stage 1
+        forwards it to :func:`build_edgelist_from_frame` with
+        ``auto_weight=False`` and ``remove_duplicates=True``: duplicate
+        ``(source, target)`` rows are collapsed keeping the
+        **first occurrence's weight** (no summation — pre-aggregate
+        upstream if you want sum semantics). The resulting weights feed
+        Stage 2's weighted bipartite_svn. Stage 3
+        (:func:`project_bipartite`) ignores edge weights and computes
+        its own topological weight, so this only affects Stage 2.
+        Mutually exclusive with ``auto_weight=True``.
     auto_weight : bool, default False
         If True, count duplicate ``(source, target)`` rows to set the
         bipartite edge weight. The resulting weights feed Stage 2's
-        weighted bipartite_svn.
+        weighted bipartite_svn. Mutually exclusive with ``weight_col``.
     bipartite_overlap : str, default "drop"
         Overlap-resolution policy when nodes appear on both sides of
         the bipartite. ``"drop"`` removes the offending nodes; see
@@ -248,6 +262,12 @@ def run_undirected_bipartite_pipeline(
         raise ValidationError(
             f"memory_mode must be 'fast', 'balanced', or 'low'; got {memory_mode!r}"
         )
+    if weight_col is not None and auto_weight:
+        raise ValidationError(
+            "weight_col and auto_weight=True are mutually exclusive; "
+            "use weight_col to read weights from an input column, or "
+            "auto_weight to count duplicate (source, target) rows."
+        )
 
     created_tempdir = False
     if memory_mode == "low":
@@ -269,21 +289,25 @@ def run_undirected_bipartite_pipeline(
     stream_backbones = memory_mode != "fast"
 
     try:
-        # Stage 1: build the bipartite EdgeList. No timestamp or
-        # per-edge weight passthrough — project_bipartite computes its
-        # own topological weights and doesn't read either.
+        # Stage 1: build the bipartite EdgeList. No timestamp
+        # passthrough; project_bipartite (Stage 3) overwrites edge
+        # weights with its own topological score, so weights here only
+        # affect the bipartite_svn backbone at Stage 2. When weight_col
+        # is set, we pair it with remove_duplicates=True (keep-first on
+        # (src, tgt)); the alternative weight-sum branch is incompatible
+        # with the auto_weight kwarg's contract and is not exposed here.
         t0 = _time.perf_counter()
         el_bp, mapper_bp = build_edgelist_from_frame(
             source,
             source_col=source_col,
             target_col=target_col,
-            weight_col=None,
+            weight_col=weight_col,
             bipartite=True,
             bipartite_overlap=bipartite_overlap,
             min_source_degree=min_source_degree,
             min_target_degree=min_target_degree,
             auto_weight=auto_weight,
-            remove_duplicates=False,
+            remove_duplicates=weight_col is not None,
             streaming=stream_backbones,
             verbose=verbose,
         )

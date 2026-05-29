@@ -16,10 +16,14 @@ content elements they shared.
   can ``sink_parquet`` straight to disk without materializing.
   Set ``method="rake"`` to switch from "every word" tokenization to RAKE
   (Rapid Automatic Keyword Extraction) — phrases are scored across the whole
-  corpus and each sender keeps their top ``top_n`` highest-scoring phrases
-  (unigrams up to ``max_phrase_length``-grams). Pass ``top_n`` as a
-  ``(low, high)`` tuple to use an elastic cap that scales with each sender's
-  post count — heavier posters keep more keyphrases than lighter ones.
+  corpus and each sender keeps their top ``top_n`` highest-scoring phrases.
+  Note that ``max_phrase_length`` is a **soft cap**: phrases of acceptable
+  length are preferred, but longer phrases backfill if a sender doesn't have
+  ``top_n`` short candidates (so no sender drops out of the bipartite edge
+  list). Filter the output yourself if you need a hard length cap. Pass
+  ``top_n`` as a ``(low, high)`` tuple to use an elastic cap that scales with
+  each sender's post count — heavier posters keep more keyphrases than
+  lighter ones.
 
 Input row order is preserved (in long mode); original IDs in the sender column
 are passed through untouched so the result drops straight into
@@ -272,32 +276,6 @@ def _carry_cols(sender_col: str, datetime_col: Optional[str]) -> List[str]:
     return cols
 
 
-def _extract_long(
-    df: pl.DataFrame,
-    sender_col: str,
-    post_col: str,
-    datetime_col: Optional[str],
-    pattern: str,
-    out_col: str,
-) -> pl.DataFrame:
-    """
-    Apply ``pattern`` to ``post_col`` and explode matches into one row per match.
-
-    Returns a DataFrame with columns ``[sender_col, out_col(, datetime_col)]`` —
-    posts with no matches are dropped. This is the common kernel used by all
-    three public extractors.
-    """
-    carry = _carry_cols(sender_col, datetime_col)
-    return (
-        df.select(
-            carry
-            + [pl.col(post_col).str.extract_all(pattern).alias(out_col)]
-        )
-        .explode(out_col)
-        .filter(pl.col(out_col).is_not_null())
-    )
-
-
 # ---------------------------------------------------------------------------
 # Public extractors
 # ---------------------------------------------------------------------------
@@ -353,8 +331,13 @@ def extract_urls(
     -------
     pl.DataFrame
         Long-form edge list with columns ``[sender_col, url_col(, datetime_col)]``,
-        one row per extracted URL. Input row order is preserved; URLs from the
-        same post appear consecutively in the order they occurred in the text.
+        one row per distinct URL per post. Input row order is preserved; URLs
+        from the same post appear consecutively in first-occurrence order.
+        Duplicate URLs within the same post are dropped *after* the
+        standardization step, so two raw URLs that differ only in their
+        tracking codes (e.g. ``?utm_source=twitter`` vs ``?utm_source=facebook``)
+        or in trailing punctuation collapse into a single edge. Duplicates
+        across different posts are preserved (one row per post-URL pair).
 
     Raises
     ------
@@ -367,6 +350,7 @@ def extract_urls(
     length — a single vectorized pass over ``post_col`` with the Rust regex
     engine, then a flat explode and filter. Normalization adds a constant
     number of additional regex passes over the (much shorter) URL column.
+    The per-post dedup is an O(M log M) ``unique`` over the M extracted rows.
 
     Examples
     --------
@@ -384,21 +368,32 @@ def extract_urls(
     """
     _validate_input(df, sender_col, post_col, datetime_col)
 
-    result = _extract_long(
-        df,
-        sender_col=sender_col,
-        post_col=post_col,
-        datetime_col=datetime_col,
-        pattern=_URL_PATTERN,
-        out_col=url_col,
+    # Tag each input post with a row index so we can dedupe URLs within a
+    # single post *after* standardization. Two raw URLs that differ only in
+    # tracking params would otherwise produce two identical edges, which over-
+    # counts the sender→URL relationship in the downstream bipartite graph.
+    row_idx_col = "_glp_post_idx"
+    carry = _carry_cols(sender_col, datetime_col)
+    result = (
+        df.with_row_index(name=row_idx_col)
+        .select(
+            [pl.col(row_idx_col), *[pl.col(c) for c in carry],
+             pl.col(post_col).str.extract_all(_URL_PATTERN).alias(url_col)]
+        )
+        .explode(url_col)
+        .filter(pl.col(url_col).is_not_null())
     )
 
     if normalize:
         url_expr = _normalize_url_expr(pl.col(url_col))
     else:
         url_expr = pl.col(url_col).str.strip_chars_end(_TRAILING_PUNCT)
+    result = result.with_columns(url_expr.alias(url_col))
 
-    return result.with_columns(url_expr.alias(url_col))
+    return (
+        result.unique(subset=[row_idx_col, url_col], maintain_order=True)
+        .drop(row_idx_col)
+    )
 
 
 def extract_domains(
@@ -449,9 +444,11 @@ def extract_domains(
     -------
     pl.DataFrame
         Long-form edge list with columns
-        ``[sender_col, domain_col(, datetime_col)]``, one row per extracted
-        domain (one per URL — duplicates within a post are kept, so a post
-        linking ``x.com`` twice produces two rows).
+        ``[sender_col, domain_col(, datetime_col)]``, one row per URL kept
+        by :func:`extract_urls`. Two different URLs sharing a domain still
+        produce two domain rows (e.g. ``x.com/a`` and ``x.com/b`` → two
+        ``x.com`` rows), but identical normalized URLs within the same post
+        are deduped upstream and therefore appear once in the domain output.
 
     Raises
     ------
@@ -665,8 +662,11 @@ def extract_keywords(
           ``output="long"``/``"lazy"`` and explicit ``keywords=`` are not
           supported in this mode. Requires a non-empty ``stop_words`` (RAKE
           splits phrases at stop words, so passing ``stop_words=False`` would
-          make every post a single phrase). Pure-Python implementation — no
-          extra dependency beyond what ``stop_words=`` already needs.
+          make every post a single phrase). Note that ``max_phrase_length``
+          is a soft cap, not a hard filter — see its parameter docs below for
+          the full rule and a one-line recipe for hard filtering. Pure-Python
+          implementation — no extra dependency beyond what ``stop_words=``
+          already needs.
     top_n : int or tuple[int, int], default 50
         ``method="rake"`` only: number of top-scoring phrases to keep per
         sender. Senders with fewer distinct candidate phrases keep all they
@@ -681,15 +681,31 @@ def extract_keywords(
         gets ``high`` and the midpoint respectively. Tuple must satisfy
         ``1 <= low <= high``.
     max_phrase_length : int, default 3
-        ``method="rake"`` only: preferred maximum number of words per output
-        phrase. Defaults to 3 = unigrams + bigrams + trigrams. Set to 1 to
-        prefer unigrams, 2 for unigrams + bigrams. This is a *soft* cap, not
-        a hard filter: when ranking each sender's top-``top_n`` phrases,
-        phrases meeting the length cap sort before longer phrases, but if a
-        sender doesn't have ``top_n`` conforming phrases the remainder is
-        filled in from their longer phrases. This guarantees every sender
-        with any extractable content gets at least one keyphrase edge
-        (important when the output feeds bipartite graph construction).
+        ``method="rake"`` only: **soft** preferred maximum number of words per
+        output phrase. Defaults to 3 = unigrams + bigrams + trigrams. Set to
+        1 to prefer unigrams, 2 for unigrams + bigrams.
+
+        .. warning::
+           This is *not* a hard filter — phrases longer than
+           ``max_phrase_length`` can still appear in the output. Per-sender
+           sorting puts conforming phrases first, but if a sender has fewer
+           than ``top_n`` conforming phrases the rest of their slot is back-
+           filled from their longer phrases. This deliberate trade-off keeps
+           every sender represented in the bipartite edge list (a
+           requirement when the output feeds
+           :func:`guidedLP.network.construction.build_graph_from_edgelist`).
+           If you genuinely need a hard cap, drop the over-long rows after
+           the call::
+
+               result = extract_keywords(df, method="rake",
+                                         max_phrase_length=3, ...)
+               result = result.filter(
+                   pl.col("keyword").str.count_matches(r"\\S+") <= 3
+               )
+
+           Senders whose only phrases exceed the cap will then produce no
+           edges.
+
         Longer phrases are also always used to compute the corpus-level word
         scores, so e.g. "climate" in "global climate crisis" still accrues
         degree from the 3-word phrase even at ``max_phrase_length=1``.
