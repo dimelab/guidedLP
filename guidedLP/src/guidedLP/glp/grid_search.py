@@ -444,13 +444,21 @@ class GLPGridSearch:
                         f"FAILED ({row['error']})"
                     )
 
-        self.results = pl.DataFrame(rows)
-        # Force `error` to a string column so it concatenates cleanly across
-        # runs even when all cells succeeded (would otherwise be Null dtype).
-        if "error" in self.results.columns:
-            self.results = self.results.with_columns(
-                pl.col("error").cast(pl.Utf8)
-            )
+        # Pin dtypes for columns that are int-or-None or str-or-None across
+        # success/failure rows. Without this, Polars' default schema
+        # inference (first 100 rows) locks the column to Null dtype if all
+        # of those rows are on the all-None side, and the first mixed row
+        # later in the grid then fails to append. Seen in the wild with
+        # 100+ successful cells followed by a single propagation failure.
+        schema_overrides = {
+            "total_errors": pl.Int64,
+            "noise_errors": pl.Int64,
+            "hard_errors": pl.Int64,
+            "train_count": pl.Int64,
+            "test_count": pl.Int64,
+            "error": pl.Utf8,
+        }
+        self.results = pl.DataFrame(rows, schema_overrides=schema_overrides)
         return self.results
 
     def _run_cell(
