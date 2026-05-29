@@ -96,13 +96,14 @@ print(f"Classified {len(results)} nodes with community probabilities")
 
 ## Preprocessing: Raw Posts → Edge Lists
 
-When the input is a `[sender, post, datetime]` post table (e.g. a social-media corpus) rather than a pre-built edge list, the `preprocessing` module turns that text column into the bipartite edge-list shape `build_graph_from_edgelist` expects. The three extractors share the same `[sender, content(, datetime)]` output schema, so they all drop straight into graph construction:
+When the input is a `[sender, post, datetime]` post table (e.g. a social-media corpus) rather than a pre-built edge list, the `preprocessing` module turns that text column into the bipartite edge-list shape `build_graph_from_edgelist` expects. The four extractors share the same `[sender, content(, datetime)]` output schema, so they all drop straight into graph construction:
 
 - **`extract_urls`** — one row per URL in `post`
 - **`extract_domains`** — one row per URL, reduced to its host
-- **`extract_keywords`** — words / tokens per sender, with optional NLP preprocessing
+- **`extract_keywords`** — words / tokens per sender, with optional NLP preprocessing and an opt-in RAKE keyphrase mode
+- **`extract_embedding_features`** — semantic embeddings per post, mean-pooled per sender, exploded into one edge per embedding dimension
 
-All three run as a single vectorized pass over the Polars column (Rust regex engine, no Python row loops), preserve original sender IDs end-to-end, and explode multi-match posts into one row per match. Posts with no matches contribute no rows. `datetime_col=None` drops the timestamp column if you don't need it.
+The first three run as a single vectorized pass over the Polars column (Rust regex engine, no Python row loops). All four preserve original sender IDs end-to-end and emit a long-form edge list. Posts with no matches (or no embedding) contribute no rows. `datetime_col=None` drops the timestamp column if you don't need it.
 
 ```python
 import polars as pl
@@ -173,6 +174,56 @@ extract_keywords(posts, output="lazy").sink_parquet("words.parquet")
 ```
 
 When NLP preprocessing is on, the user-supplied `keywords=` list is also stemmed/lemmatized before comparison, so `keywords=["climate"]` with `stem=True` still matches the stemmed form (`"climat"`) of words like *climate*, *climates*, *climatic* in the corpus.
+
+### Semantic embedding features
+
+`extract_embedding_features` is the "what *kind of content* does this sender post, semantically?" counterpart to the literal-text extractors. Each post is mapped to a fixed-dimensional embedding vector, those vectors are mean-pooled per sender, and the resulting per-sender vector is exploded into one edge per dimension (`dim_0`, `dim_1`, …). The output schema is `[sender, feature, weight(, first_seen)]` — the same shape the other extractors produce, just with continuous-valued weights instead of mention counts. Two senders who post about the same topics end up with high weights on the same `dim_*` features, so a bipartite projection of senders → dimensions yields a semantic similarity graph.
+
+```python
+from guidedLP.preprocessing import extract_embedding_features
+
+# Path 1: pre-embedded posts (no optional dependency).
+# `embedding_col` must be a List/Array column of equal-length numeric vectors.
+posts_with_vecs = pl.DataFrame({
+    "sender":    ["alice", "alice", "bob"],
+    "embedding": [[0.1, 0.8, -0.2], [0.2, 0.7, -0.1], [-0.5, 0.1, 0.9]],
+    "datetime":  ["2024-01-01", "2024-01-02", "2024-01-03"],
+})
+edges = extract_embedding_features(posts_with_vecs, embedding_col="embedding")
+# Columns: [sender, feature, weight, first_seen]
+# Three senders × three dims = up to 9 rows (alice's two posts mean-pooled to one vector).
+
+# Path 2: encode posts from scratch with sentence-transformers.
+# Requires `pip install "guidedLP[embeddings]"` — pulls in torch.
+# Default model is multilingual MiniLM (384-dim, handles 50+ languages).
+edges = extract_embedding_features(
+    posts,
+    model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",  # default
+    batch_size=64,
+    device="cuda",                    # "cuda" / "cpu" / "mps" — None = auto
+    save_path="cache/posts.npy",      # cache the encoded matrix on disk
+    create_new=False,                 # reuse cache on subsequent runs
+    aggregation="mean",               # "mean" / "sum" / "max"
+    top_k=64,                         # keep each sender's top-64 features by |weight|
+)
+```
+
+By default the function L2-normalizes every per-post vector before pooling and then shifts the aggregated values by `+2` so output weights lie in `[1, 3]` — positive, but the relative ordering and magnitudes of the original components are preserved exactly, so two senders that are component-wise *anti*-aligned end up with a weight gap that a downstream Jaccard / weighted projection registers correctly. Pass `weight_transform="abs"` to use pure magnitude (drops sign) or `weight_transform="raw"` to keep signed weights (downstream code must handle negatives). `top_k` and `min_weight` sparsify each sender's output before emitting edges, useful when the embedding is high-dimensional (384 dims × 1M senders = 384M edges if you keep everything).
+
+The on-disk cache (`save_path`) is the big speedup when iterating: model inference dominates the from-scratch path, so caching the encoded matrix lets you re-run with different `aggregation` / `weight_transform` / `top_k` choices in seconds instead of minutes. The cache is normalize-agnostic — flipping `normalize_embeddings` doesn't require `create_new=True`.
+
+```python
+# Hand-off: senders ↔ embedding dimensions as a weighted bipartite.
+graph, mapper = build_graph_from_edgelist(
+    edges,
+    source_col="sender", target_col="feature", weight_col="weight",
+    bipartite=True,
+)
+user_graph, user_mapper = project_bipartite(
+    graph, mapper, projection_mode="source", weight_method="jaccard",
+)
+# user_graph now connects senders whose semantic profiles overlap — feed to GLP.
+```
 
 ### Hand-off to graph construction
 
