@@ -132,6 +132,19 @@ def _validate_embedding_input(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_encoder(model: Union[str, Any], device: Optional[str]) -> Any:
+    """Return an encoder object, loading a ``SentenceTransformer`` lazily if
+    ``model`` is a string identifier.
+    """
+    if isinstance(model, str):
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(_EMBEDDINGS_INSTALL_HINT) from e
+        return SentenceTransformer(model, device=device)
+    return model
+
+
 def _encode_posts(
     posts: list,
     model: Union[str, Any],
@@ -153,15 +166,7 @@ def _encode_posts(
     ignored — set it on the model itself before calling, and ``sentence-
     transformers`` does not need to be importable).
     """
-    if isinstance(model, str):
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as e:  # pragma: no cover
-            raise ImportError(_EMBEDDINGS_INSTALL_HINT) from e
-        encoder = SentenceTransformer(model, device=device)
-    else:
-        encoder = model
-
+    encoder = _resolve_encoder(model, device)
     raw = encoder.encode(
         posts,
         batch_size=batch_size,
@@ -170,6 +175,63 @@ def _encode_posts(
         normalize_embeddings=False,
     )
     return np.asarray(raw, dtype=np.float64)
+
+
+def _encode_posts_to_disk(
+    posts: list,
+    model: Union[str, Any],
+    batch_size: int,
+    chunk_size: int,
+    show_progress: bool,
+    device: Optional[str],
+    out_path: Path,
+) -> None:
+    """
+    Encode ``posts`` in chunks of ``chunk_size`` rows, streaming each chunk
+    directly into a memory-mapped ``.npy`` file at ``out_path``.
+
+    Peak RAM during encoding is bounded by ``chunk_size × D`` (plus the model's
+    own working memory), not the full ``N_posts × D`` output array that
+    :func:`_encode_posts` would materialize. The on-disk file is a standard
+    ``.npy`` array — reopen with ``np.load(path, mmap_mode='r')`` or via
+    :func:`_load_embeddings_cache`.
+
+    The first chunk is encoded eagerly to probe the embedding dimension ``D``;
+    the file is then preallocated at ``(N, D)`` and remaining chunks are
+    written into their target slice in place.
+    """
+    encoder = _resolve_encoder(model, device)
+    n = len(posts)
+    if n == 0:
+        return  # main function short-circuits empty inputs; defensive guard
+
+    def _encode_batch(batch: list) -> np.ndarray:
+        raw = encoder.encode(
+            batch,
+            batch_size=batch_size,
+            show_progress_bar=show_progress,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+        )
+        return np.asarray(raw, dtype=np.float64)
+
+    first_end = min(chunk_size, n)
+    first = _encode_batch(posts[:first_end])
+    dim = first.shape[1]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.lib.format.open_memmap(
+        out_path, mode="w+", dtype=np.float64, shape=(n, dim)
+    )
+    arr[:first_end] = first
+    del first
+
+    for start in range(chunk_size, n, chunk_size):
+        end = min(start + chunk_size, n)
+        arr[start:end] = _encode_batch(posts[start:end])
+
+    arr.flush()
+    del arr
 
 
 def _embeddings_from_column(
@@ -224,7 +286,9 @@ def _save_embeddings_cache(path: Path, arr: np.ndarray) -> None:
     np.save(path, arr)
 
 
-def _load_embeddings_cache(path: Path, expected_n: int) -> np.ndarray:
+def _load_embeddings_cache(
+    path: Path, expected_n: int, *, mmap: bool = False
+) -> np.ndarray:
     """Load a previously-saved embeddings matrix, validating its shape.
 
     The cache is row-aligned with the input post table (after null filtering).
@@ -232,8 +296,12 @@ def _load_embeddings_cache(path: Path, expected_n: int) -> np.ndarray:
     (hashes, column comparison) would couple the cache to specific input
     columns. If the count doesn't match, the caller almost certainly fed in
     a different corpus and needs to regenerate via ``create_new=True``.
+
+    Set ``mmap=True`` to return the array as a read-only memory map instead
+    of loading it fully into RAM — the chunked-aggregation path uses this to
+    keep peak memory bounded by the chunk size rather than the full corpus.
     """
-    arr = np.load(path)
+    arr = np.load(path, mmap_mode="r" if mmap else None)
     if arr.ndim != 2:
         raise ValidationError(
             f"Cached embeddings at '{path}' must be 2-D, got shape {arr.shape}. "
@@ -266,6 +334,9 @@ def _aggregate_per_sender(
     senders: np.ndarray,
     embeddings: np.ndarray,
     aggregation: str,
+    *,
+    normalize: bool = False,
+    chunk_size: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Group rows of ``embeddings`` by ``senders`` and aggregate componentwise.
@@ -274,32 +345,48 @@ def _aggregate_per_sender(
     ``(n_unique, D)``. Done in numpy (``np.add.at`` / ``np.maximum.at``) rather
     than polars because materializing D columns just to group-mean them is
     wasteful when ``D`` is large (typical SBERT: 384 or 768).
+
+    ``embeddings`` may be a memory-mapped ndarray. When ``chunk_size`` is set,
+    rows are read in slices of at most ``chunk_size`` and L2 normalization is
+    folded into the loop — peak RAM is bounded by the chunk plus the
+    ``(n_unique, D)`` accumulator, with no extra full-array copy. When
+    ``chunk_size`` is ``None`` the loop runs exactly once over all rows, so
+    numerics are identical to the pre-chunking implementation.
     """
+    if aggregation not in _VALID_AGGREGATIONS:
+        raise ValidationError(
+            f"aggregation must be one of {sorted(_VALID_AGGREGATIONS)}, "
+            f"got {aggregation!r}",
+            field="aggregation",
+            value=aggregation,
+        )
+
     unique, inverse = np.unique(senders, return_inverse=True)
     n_unique, dim = len(unique), embeddings.shape[1]
-
-    if aggregation == "mean":
-        counts = np.bincount(inverse, minlength=n_unique).astype(np.float64)
-        summed = np.zeros((n_unique, dim), dtype=np.float64)
-        np.add.at(summed, inverse, embeddings)
-        return unique, summed / counts[:, None]
-
-    if aggregation == "sum":
-        summed = np.zeros((n_unique, dim), dtype=np.float64)
-        np.add.at(summed, inverse, embeddings)
-        return unique, summed
+    n = embeddings.shape[0]
+    # Falsy chunk_size (None or 0) collapses to one pass over the whole array.
+    # `max(n, 1)` keeps `range(0, 0, cs)` legal when there is no data at all.
+    cs = chunk_size if chunk_size else max(n, 1)
 
     if aggregation == "max":
         out = np.full((n_unique, dim), -np.inf, dtype=np.float64)
-        np.maximum.at(out, inverse, embeddings)
-        return unique, out
+    else:
+        out = np.zeros((n_unique, dim), dtype=np.float64)
 
-    raise ValidationError(
-        f"aggregation must be one of {sorted(_VALID_AGGREGATIONS)}, "
-        f"got {aggregation!r}",
-        field="aggregation",
-        value=aggregation,
-    )
+    for start in range(0, n, cs):
+        end = min(start + cs, n)
+        chunk = np.asarray(embeddings[start:end], dtype=np.float64)
+        if normalize:
+            chunk = _l2_normalize_rows(chunk)
+        if aggregation == "max":
+            np.maximum.at(out, inverse[start:end], chunk)
+        else:
+            np.add.at(out, inverse[start:end], chunk)
+
+    if aggregation == "mean":
+        counts = np.bincount(inverse, minlength=n_unique).astype(np.float64)
+        return unique, out / counts[:, None]
+    return unique, out
 
 
 def _apply_weight_transform(
@@ -347,6 +434,8 @@ def extract_embedding_features(
     # On-disk cache for the from-scratch path
     save_path: Optional[Union[str, Path]] = None,
     create_new: bool = False,
+    # Memory control
+    chunk_size: Optional[int] = None,
     # Aggregation per sender
     aggregation: str = "mean",
     # Weight transformation
@@ -430,6 +519,25 @@ def extract_embedding_features(
         Force re-encoding even if ``save_path`` points at an existing cache,
         and overwrite the file with the freshly-encoded matrix. Has no effect
         when ``save_path`` is ``None``.
+    chunk_size : int, optional
+        Cap on rows held in RAM at once during encoding and aggregation. Set
+        this when the per-post embedding matrix would not fit in memory:
+        peak RAM drops from ``~N_posts × D × 8 bytes`` to
+        ``~chunk_size × D × 8 bytes``. Distinct from ``batch_size``, which
+        controls the model's per-forward-pass batch (a throughput knob, not a
+        memory knob — ``encoder.encode`` still accumulates the full output in
+        RAM regardless of ``batch_size``).
+
+        On the from-scratch path, ``chunk_size`` **requires** ``save_path``:
+        chunks are streamed to a memory-mapped ``.npy`` file as they are
+        encoded, then aggregation reopens that file via ``mmap_mode='r'`` and
+        reads it back in chunks. On the pre-embedded path, ``chunk_size`` only
+        affects the aggregation pass — the input ``embedding_col`` is still
+        materialized in RAM by polars, so the savings come from skipping the
+        full-array L2-normalization copy.
+
+        Numerics are bit-identical to ``chunk_size=None`` (same accumulation
+        order). Default ``None`` keeps the original single-pass behavior.
     aggregation : {"mean", "sum", "max"}, default "mean"
         How to collapse a sender's per-post vectors into a single vector.
         ``"mean"`` is the safest with the default shift (the mean of
@@ -526,6 +634,21 @@ def extract_embedding_features(
             value=top_k,
         )
 
+    if chunk_size is not None and chunk_size <= 0:
+        raise ValidationError(
+            "chunk_size must be a positive integer",
+            field="chunk_size",
+            value=chunk_size,
+        )
+
+    if chunk_size is not None and embedding_col is None and save_path is None:
+        raise ValidationError(
+            "chunk_size requires save_path on the from-scratch path: chunked "
+            "encoding streams each chunk to a memory-mapped .npy file, so a "
+            "path to write it is mandatory.",
+            field="chunk_size",
+        )
+
     # ---- Empty input: short-circuit before loading a model ----------------
     if df_work.height == 0:
         empty_schema: dict = {
@@ -542,27 +665,56 @@ def extract_embedding_features(
         embeddings = _embeddings_from_column(df_work, embedding_col)
     else:
         cache_p = _cache_path(save_path) if save_path is not None else None
-        if cache_p is not None and not create_new and cache_p.exists():
-            embeddings = _load_embeddings_cache(cache_p, df_work.height)
-        else:
-            posts = df_work.get_column(post_col).to_list()
-            embeddings = _encode_posts(
-                posts,
-                model=model,
-                batch_size=batch_size,
-                show_progress=show_progress,
-                device=device,
-            )
-            if cache_p is not None:
-                _save_embeddings_cache(cache_p, embeddings)
+        cache_hit = (
+            cache_p is not None and not create_new and cache_p.exists()
+        )
 
-    if normalize_embeddings:
-        embeddings = _l2_normalize_rows(embeddings)
+        if not cache_hit:
+            posts = df_work.get_column(post_col).to_list()
+            if chunk_size is not None:
+                # Stream chunks straight to disk — never holds the full
+                # (N_posts, D) array in RAM.
+                _encode_posts_to_disk(
+                    posts,
+                    model=model,
+                    batch_size=batch_size,
+                    chunk_size=chunk_size,
+                    show_progress=show_progress,
+                    device=device,
+                    out_path=cache_p,
+                )
+            else:
+                embeddings = _encode_posts(
+                    posts,
+                    model=model,
+                    batch_size=batch_size,
+                    show_progress=show_progress,
+                    device=device,
+                )
+                if cache_p is not None:
+                    _save_embeddings_cache(cache_p, embeddings)
+
+        # Chunked path always loads via memmap (even right after writing the
+        # cache) so the aggregation step can stream rows back instead of
+        # pulling the whole file into RAM.
+        if chunk_size is not None:
+            embeddings = _load_embeddings_cache(
+                cache_p, df_work.height, mmap=True
+            )
+        elif cache_hit:
+            embeddings = _load_embeddings_cache(cache_p, df_work.height)
 
     # ---- Aggregate per sender ---------------------------------------------
+    # Normalization is folded into _aggregate_per_sender so the chunked path
+    # never materializes a full normalized copy. With chunk_size=None the
+    # function runs a single pass and reproduces the prior numerics exactly.
     senders = df_work.get_column(sender_col).to_numpy()
     unique_senders, aggregated = _aggregate_per_sender(
-        senders, embeddings, aggregation
+        senders,
+        embeddings,
+        aggregation,
+        normalize=normalize_embeddings,
+        chunk_size=chunk_size,
     )
     aggregated = _apply_weight_transform(
         aggregated, weight_transform, shift_amount

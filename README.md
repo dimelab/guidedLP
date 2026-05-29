@@ -235,6 +235,18 @@ By default the function L2-normalizes every per-post vector before pooling and t
 
 The on-disk cache (`save_path`) is the big speedup when iterating: model inference dominates the from-scratch path, so caching the encoded matrix lets you re-run with different `aggregation` / `weight_transform` / `top_k` choices in seconds instead of minutes. The cache is normalize-agnostic — flipping `normalize_embeddings` doesn't require `create_new=True`.
 
+**For corpora too large to encode in RAM**, pass `chunk_size`. The encoder normally accumulates the full `N_posts × D × 8 byte` output in memory before returning (a knob `batch_size` does *not* fix — that just controls the per-forward-pass size, not the total). At ~10M posts × 384 dims that's ~30 GB just for the raw float64 array, plus another full copy when L2-normalization runs. With `chunk_size` set, posts are encoded in slices and streamed straight into a memory-mapped `.npy` file as they come out of the model; aggregation then reopens the file via `mmap_mode='r'` and reads it back in chunks, folding normalization into the loop so no full copy is ever materialized. Peak RAM during encoding drops from `~N_posts × D × 8` to `~chunk_size × D × 8` (e.g. 50k × 384 × 8 ≈ 150 MB). Numerics are bit-identical to the single-pass path. `chunk_size` requires `save_path` on the from-scratch path — we need somewhere to put the memmap.
+
+```python
+edges = extract_embedding_features(
+    posts,                            # millions of rows
+    save_path="cache/posts.npy",
+    chunk_size=50_000,                # ~150 MB peak per chunk at D=384
+    batch_size=64,                    # still tunes throughput on the GPU
+    device="cuda",
+)
+```
+
 ```python
 # Hand-off: senders ↔ embedding dimensions as a weighted bipartite.
 graph, mapper = build_graph_from_edgelist(
