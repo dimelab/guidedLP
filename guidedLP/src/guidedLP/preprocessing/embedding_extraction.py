@@ -562,6 +562,138 @@ def _apply_weight_transform(
 
 
 # ---------------------------------------------------------------------------
+# Shared embedding-acquisition pipeline
+# ---------------------------------------------------------------------------
+
+
+def _get_aggregated_embeddings(
+    df_work: pl.DataFrame,
+    *,
+    sender_col: str,
+    post_col: str,
+    embedding_col: Optional[str],
+    model: Union[str, Any],
+    batch_size: int,
+    show_progress: bool,
+    device: Optional[str],
+    normalize_embeddings: bool,
+    save_path: Optional[Path],
+    create_new: bool,
+    aggregate_inline: bool,
+    chunk_size: Optional[int],
+    aggregation: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Run the encode-and-aggregate pipeline and return ``(unique_senders, aggregated)``.
+
+    Shared by ``extract_embedding_features`` (bipartite path) and
+    ``extract_embedding_similarity_edgelist`` (direct unipartite path) so both
+    surface the same encoding / caching / chunking / aggregation semantics
+    behind a single code path.
+
+    Assumes ``df_work`` is non-empty and has already been validated and
+    null-filtered. Validates nothing itself — that responsibility stays with the
+    callers, which have output-specific constraints to enforce.
+    """
+    senders = df_work.get_column(sender_col).to_numpy()
+
+    if embedding_col is not None:
+        # Pre-embedded path: no encoding to cache. Read embeddings, then
+        # aggregate them per sender. aggregate_inline has no effect here.
+        embeddings = _embeddings_from_column(df_work, embedding_col)
+        return _aggregate_per_sender(
+            senders,
+            embeddings,
+            aggregation,
+            normalize=normalize_embeddings,
+            chunk_size=chunk_size,
+        )
+
+    if aggregate_inline:
+        # Fold encoding and per-sender aggregation into one pass. The on-disk
+        # cache stores only the (n_unique_senders, D) aggregated matrix —
+        # typically 10–100× smaller than the per-post cache produced by the
+        # legacy path. The cache is keyed by sender, so it bakes in the current
+        # `aggregation` and `normalize_embeddings` choices; changing either
+        # requires create_new=True.
+        cache_p = _cache_path(save_path) if save_path is not None else None
+        cache_hit = (
+            cache_p is not None and not create_new and cache_p.exists()
+        )
+
+        if cache_hit:
+            unique_senders = np.unique(senders)
+            aggregated = _load_aggregated_cache(cache_p, len(unique_senders))
+            return unique_senders, aggregated
+
+        posts = df_work.get_column(post_col).to_list()
+        unique_senders, aggregated = _encode_and_aggregate(
+            posts,
+            senders,
+            model=model,
+            batch_size=batch_size,
+            chunk_size=chunk_size,
+            show_progress=show_progress,
+            device=device,
+            aggregation=aggregation,
+            normalize=normalize_embeddings,
+        )
+        if cache_p is not None:
+            _save_aggregated_cache(cache_p, aggregated)
+        return unique_senders, aggregated
+
+    # LEGACY: cache per-post embeddings on disk so downstream choices
+    # (aggregation, normalization, weight transform) can be iterated on without
+    # re-running model inference. The on-disk file holds the raw un-normalized
+    # model outputs, keeping the cache normalize- and aggregation-agnostic.
+    cache_p = _cache_path(save_path) if save_path is not None else None
+    cache_hit = cache_p is not None and not create_new and cache_p.exists()
+
+    if not cache_hit:
+        posts = df_work.get_column(post_col).to_list()
+        if chunk_size is not None:
+            # Stream chunks straight to disk — never holds the full
+            # (N_posts, D) array in RAM.
+            _encode_posts_to_disk(
+                posts,
+                model=model,
+                batch_size=batch_size,
+                chunk_size=chunk_size,
+                show_progress=show_progress,
+                device=device,
+                out_path=cache_p,
+            )
+        else:
+            embeddings = _encode_posts(
+                posts,
+                model=model,
+                batch_size=batch_size,
+                show_progress=show_progress,
+                device=device,
+            )
+            if cache_p is not None:
+                _save_embeddings_cache(cache_p, embeddings)
+
+    # Chunked path always loads via memmap (even right after writing the cache)
+    # so the aggregation step can stream rows back instead of pulling the whole
+    # file into RAM.
+    if chunk_size is not None:
+        embeddings = _load_embeddings_cache(
+            cache_p, df_work.height, mmap=True
+        )
+    elif cache_hit:
+        embeddings = _load_embeddings_cache(cache_p, df_work.height)
+
+    return _aggregate_per_sender(
+        senders,
+        embeddings,
+        aggregation,
+        normalize=normalize_embeddings,
+        chunk_size=chunk_size,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public extractor
 # ---------------------------------------------------------------------------
 
@@ -876,104 +1008,22 @@ def extract_embedding_features(
         return pl.DataFrame(schema=empty_schema)
 
     # ---- Acquire (and aggregate) embeddings -------------------------------
-    senders = df_work.get_column(sender_col).to_numpy()
-
-    if embedding_col is not None:
-        # Pre-embedded path: no encoding to cache. Read embeddings, then
-        # aggregate them per sender. aggregate_inline has no effect here.
-        embeddings = _embeddings_from_column(df_work, embedding_col)
-        unique_senders, aggregated = _aggregate_per_sender(
-            senders,
-            embeddings,
-            aggregation,
-            normalize=normalize_embeddings,
-            chunk_size=chunk_size,
-        )
-    elif aggregate_inline:
-        # NEW DEFAULT: fold encoding and per-sender aggregation into one pass.
-        # The on-disk cache stores only the (n_unique_senders, D) aggregated
-        # matrix — typically 10–100× smaller than the per-post cache produced
-        # by the legacy path. The cache is keyed by sender, so it bakes in the
-        # current `aggregation` and `normalize_embeddings` choices; changing
-        # either requires create_new=True.
-        cache_p = _cache_path(save_path) if save_path is not None else None
-        cache_hit = (
-            cache_p is not None and not create_new and cache_p.exists()
-        )
-
-        if cache_hit:
-            unique_senders = np.unique(senders)
-            aggregated = _load_aggregated_cache(
-                cache_p, len(unique_senders)
-            )
-        else:
-            posts = df_work.get_column(post_col).to_list()
-            unique_senders, aggregated = _encode_and_aggregate(
-                posts,
-                senders,
-                model=model,
-                batch_size=batch_size,
-                chunk_size=chunk_size,
-                show_progress=show_progress,
-                device=device,
-                aggregation=aggregation,
-                normalize=normalize_embeddings,
-            )
-            if cache_p is not None:
-                _save_aggregated_cache(cache_p, aggregated)
-    else:
-        # LEGACY: cache per-post embeddings on disk so downstream choices
-        # (aggregation, normalization, weight transform) can be iterated on
-        # without re-running model inference. The on-disk file holds the raw
-        # un-normalized model outputs, keeping the cache normalize- and
-        # aggregation-agnostic.
-        cache_p = _cache_path(save_path) if save_path is not None else None
-        cache_hit = (
-            cache_p is not None and not create_new and cache_p.exists()
-        )
-
-        if not cache_hit:
-            posts = df_work.get_column(post_col).to_list()
-            if chunk_size is not None:
-                # Stream chunks straight to disk — never holds the full
-                # (N_posts, D) array in RAM.
-                _encode_posts_to_disk(
-                    posts,
-                    model=model,
-                    batch_size=batch_size,
-                    chunk_size=chunk_size,
-                    show_progress=show_progress,
-                    device=device,
-                    out_path=cache_p,
-                )
-            else:
-                embeddings = _encode_posts(
-                    posts,
-                    model=model,
-                    batch_size=batch_size,
-                    show_progress=show_progress,
-                    device=device,
-                )
-                if cache_p is not None:
-                    _save_embeddings_cache(cache_p, embeddings)
-
-        # Chunked path always loads via memmap (even right after writing the
-        # cache) so the aggregation step can stream rows back instead of
-        # pulling the whole file into RAM.
-        if chunk_size is not None:
-            embeddings = _load_embeddings_cache(
-                cache_p, df_work.height, mmap=True
-            )
-        elif cache_hit:
-            embeddings = _load_embeddings_cache(cache_p, df_work.height)
-
-        unique_senders, aggregated = _aggregate_per_sender(
-            senders,
-            embeddings,
-            aggregation,
-            normalize=normalize_embeddings,
-            chunk_size=chunk_size,
-        )
+    unique_senders, aggregated = _get_aggregated_embeddings(
+        df_work,
+        sender_col=sender_col,
+        post_col=post_col,
+        embedding_col=embedding_col,
+        model=model,
+        batch_size=batch_size,
+        show_progress=show_progress,
+        device=device,
+        normalize_embeddings=normalize_embeddings,
+        save_path=Path(save_path) if save_path is not None else None,
+        create_new=create_new,
+        aggregate_inline=aggregate_inline,
+        chunk_size=chunk_size,
+        aggregation=aggregation,
+    )
     aggregated = _apply_weight_transform(
         aggregated, weight_transform, shift_amount, power
     )

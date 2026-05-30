@@ -33,10 +33,12 @@ from .text_extraction import (
     extract_keywords,
 )
 from .embedding_extraction import extract_embedding_features
+from .embedding_similarity import extract_embedding_similarity_edgelist
 
 __all__ = [
     "extract_urls",
     "extract_domains",
     "extract_keywords",
     "extract_embedding_features",
+    "extract_embedding_similarity_edgelist",
 ]

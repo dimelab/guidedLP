@@ -260,6 +260,65 @@ user_graph, user_mapper = project_bipartite(
 # user_graph now connects senders whose semantic profiles overlap — feed to GLP.
 ```
 
+**Skip the projection — build the unipartite graph directly.** When the end goal is a sender↔sender graph, the bipartite + projection path above goes through an intermediate sender→dim graph and reconstructs pairwise similarity from co-occurrence counts. `extract_embedding_similarity_edgelist` computes cosine similarity directly on the per-sender embedding vectors instead, and emits a unipartite edge list filtered by a **hybrid top-k + similarity-floor** rule: two senders get an edge only if (a) one of them is in the other's top-`k` most similar neighbors *and* (b) their cosine similarity is at least `similarity_threshold`. The top-`k` cap bounds the maximum degree (no hub explosion in dense embedding regions); the threshold floor isolates esoteric actors whose top-`k` are still dissimilar in absolute terms — the failure mode pure k-NN graphs have. All the encoding / caching / aggregation knobs (`model`, `save_path`, `aggregate_inline`, `chunk_size`, `aggregation`, …) behave identically to `extract_embedding_features`, so swapping between the two paths is a one-function-call change.
+
+```python
+from guidedLP.preprocessing import extract_embedding_similarity_edgelist
+from guidedLP.network.construction import build_graph_from_edgelist
+
+# Pre-embedded path: same `posts_with_vecs` table as above.
+edges = extract_embedding_similarity_edgelist(
+    posts_with_vecs,
+    embedding_col="embedding",
+    aggregation="mean",
+    k=30,                       # cap each sender at 30 candidate neighbors
+    similarity_threshold=0.2,   # drop pairs below 0.2 cosine similarity
+    mutual=False,               # symmetrized top-k; True = require both directions
+    weight_transform="shift",   # +2 → positive weights for build_graph_from_edgelist
+)
+# Columns: [source, target, weight] — one row per undirected pair, source <= target.
+
+# Drops straight into a unipartite graph — no project_bipartite step needed.
+graph, mapper = build_graph_from_edgelist(
+    edges,
+    source_col="source", target_col="target", weight_col="weight",
+    bipartite=False,
+)
+```
+
+**Picking the filter parameters.**
+
+- `k` is the maximum degree per sender. For a few thousand to tens of thousands of senders, `k = 20–50` is a good starting point; larger `k` densifies the graph at the cost of more weak edges.
+- `similarity_threshold` is the lever for isolating outliers. For L2-normalized sentence-transformer embeddings, unrelated documents typically score near 0, so a small positive value (`0.2`–`0.4`) is the usual "must be moderately similar" floor. Default `0.0` means "must be at least non-negatively correlated" — the most permissive non-degenerate threshold. The filter is applied to **raw** cosine similarity (before any `weight_transform`), so switching transforms never silently shifts the effective filter level.
+- `mutual=True` keeps an edge only when both senders have each other in their top-`k`. Sparser and more outlier-resistant — and known to improve downstream label propagation (Ozaki et al., CoNLL 2011) — at the cost of potentially disconnecting parts of the graph.
+- `weight_transform` is the same machinery `extract_embedding_features` uses. Default `"raw"` keeps signed cosine similarity (`[similarity_threshold, 1]`); `"shift"` adds 2 so weights land in `[1, 3]` (which `build_graph_from_edgelist` requires, since it rejects negative weights); `"abs"` and `"power_shift"` work identically to the bipartite path.
+
+**From scratch with caching.** Combine with `save_path` to reuse the encoded matrix across runs — same cache file as `extract_embedding_features`, so you can iterate on `k` / `similarity_threshold` / `mutual` in seconds without re-encoding:
+
+```python
+edges = extract_embedding_similarity_edgelist(
+    posts,                              # [sender, post, datetime]
+    model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",  # default
+    save_path="cache/posts.npy",        # reuse the encoded matrix across runs
+    aggregation="mean",
+    k=30,
+    similarity_threshold=0.3,
+    mutual=True,                        # outlier-resistant, sparser graph
+    weight_transform="shift",
+)
+```
+
+**Scaling and `n_jobs`.** The internal `N×N` cosine similarity matrix is held in `float32` (output weights are cast back to `float64` so downstream code sees no dtype change), capping in-RAM `N` at roughly **130k senders on 192 GB** of memory. Above ~10k senders the bottleneck shifts from the BLAS `X @ X.T` (already multi-threaded) to NumPy's single-threaded `argpartition` top-k selection. Pass `n_jobs=-1` to spread the top-k step across all CPU cores — on a 64-core server, this drops N=50k from ~30s to a few seconds. `n_jobs=1` (the default) runs serially with zero overhead; workloads below 512 senders ignore the setting and use the serial path regardless.
+
+```python
+edges = extract_embedding_similarity_edgelist(
+    posts_with_vecs, embedding_col="embedding",
+    k=30, similarity_threshold=0.3, n_jobs=-1,
+)
+```
+
+The hybrid construction follows a well-studied pattern in graph-based semi-supervised learning: Maier, Hein & von Luxburg (ALT 2009) on how graph construction shapes downstream clustering; Ozaki et al. (CoNLL 2011) on mutual k-NN specifically for label propagation; Jebara, Wang & Chang (ICML 2009) on degree-constrained alternatives to pure k-NN.
+
 ### Hand-off to graph construction
 
 The output of any extractor drops straight into `build_graph_from_edgelist` as a bipartite edge list — senders on one side, content (URL / domain / keyword) on the other. Project to either partition to run GLP downstream, or feed the bipartite directly through stat-user augmentation (Example 5) when labels live on the content side.
@@ -730,6 +789,44 @@ Key differences vs `run_canonical_pipeline`:
 - **`content_seeds` emits each anchor edge once.** The undirected projection treats both orientations as equivalent, so the `forward + reverse` mirroring used in Example 5 isn't needed here — supply `("__lbl_left", "u1", 1.0)` and you're done.
 
 Memory modes (`"fast"` / `"balanced"` / `"low"`), `result.stage_stats`, `keep_intermediates`, `protected_nodes`, and the optional `content_seeds` stage all work identically to the canonical wrapper above — the only knobs that change are the stage-3 ones (`projection_mode`, `projection_weight_method`). Use this pipeline for symmetric similarity / community-style analyses; use `run_canonical_pipeline` when later-sharer → earlier-sharer attribution direction matters (PageRank / HITS-flavored analyses).
+
+#### Direct similarity variant — `run_undirected_unipartite_pipeline`
+
+The embedding-direct sibling of the two pipelines above. When sender similarity comes from the *semantic geometry of an embedding model* (sentence-transformer vectors over posts) rather than from shared discrete items (hashtags / URLs / domains / keywords), the bipartite + projection chain is the wrong shape: there is no item partition to backbone, and reconstructing pairwise similarity from a `sender → dim_i` co-occurrence projection discards the signed geometry that makes embeddings useful in the first place. This pipeline computes pairwise cosine similarity directly via `extract_embedding_similarity_edgelist`, applies the hybrid top-`k` + similarity-floor filter, and runs the same unipartite `noise_corrected` backbone as the bipartite sibling — but with no bipartite stages.
+
+```python
+from guidedLP.pipelines import run_undirected_unipartite_pipeline
+
+result = run_undirected_unipartite_pipeline(
+    "posts.parquet",                    # [sender, post, datetime] (or pass embedding_col)
+    sender_col="sender",
+    post_col="post",
+    # Embedding model + caching — same knobs as extract_embedding_features
+    model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    save_path="cache/posts.npy",
+    aggregation="mean",
+    # Hybrid filter
+    k=30,
+    similarity_threshold=0.3,
+    mutual=True,                        # outlier-resistant, sparser graph
+    similarity_n_jobs=-1,               # parallel top-k on many-core machines
+    # Backbone (same noise_corrected stage as the bipartite sibling)
+    projection_target_fraction=0.5,
+    memory_mode="balanced",
+    verbose=True,
+)
+backbone = result.edgelist              # undirected, weighted EdgeList
+mapper = result.id_mapper
+```
+
+Key differences vs `run_undirected_bipartite_pipeline`:
+
+- **No bipartite SVN or projection.** Stages 1–3 of the bipartite pipeline (`build_edgelist_from_frame(bipartite=True)` → `bipartite_svn` → `project_bipartite`) collapse into a single `extract_embedding_similarity_edgelist` call. `result.stage_stats` reports `extract_embedding_similarity_edgelist`, `build_edgelist_from_frame`, optional `attach_content_seeds`, and `apply_backbone(noise_corrected)` — that's it.
+- **`weight_transform` defaults to `"shift"`**, not the underlying function's `"raw"`. The `noise_corrected` backbone needs non-negative weights, and raw cosine similarity can dip below zero (anti-aligned senders). The `+2` shift maps `[-1, 1] → [1, 3]` losslessly. Pass `weight_transform="raw"` if you've already restricted `similarity_threshold` to a non-negative value.
+- **No `min_source_degree` pre-filter.** There is no bipartite to compute source degrees from. Pre-filter low-post-count senders in the input DataFrame before passing it in.
+- **`enable_backbone=False`** skips the Stage 3 `noise_corrected` pass entirely — useful when `k` and `similarity_threshold` have already sized the graph and an additional statistical pass would over-prune.
+
+When to reach for this one: actor similarity is best captured semantically (post text, captions, transcripts) rather than by explicit shared items, and the corpus is small enough that the `N²` similarity matrix fits in RAM (~130k senders on 192 GB, float32 internal — see the "Semantic embedding features" section above for the full scaling story). Otherwise stay with `run_undirected_bipartite_pipeline` over hashtags / URLs / domains / keywords or `run_canonical_pipeline` when temporal attribution direction matters.
 
 ### 7. Evaluating GLP Quality with Held-Out Seeds
 

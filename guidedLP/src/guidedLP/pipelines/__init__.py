@@ -18,6 +18,14 @@ Current pipelines:
   → projection backbone. Produces an **undirected** co-occurrence
   graph weighted by jaccard / count / overlap similarity. Useful for
   symmetric similarity / community-style analyses.
+
+- :func:`run_undirected_unipartite_pipeline` — posts/embeddings →
+  hybrid top-``k`` + similarity-floor unipartite EdgeList → unipartite
+  backbone. Skips the bipartite stages entirely; the similarity step
+  compresses the sender↔dimension structure into pairwise sender
+  similarity in one shot. Use when actor similarity is best captured
+  by the semantic geometry of an embedding model rather than by
+  shared discrete items.
 """
 
 from guidedLP.pipelines.canonical import (
@@ -28,12 +36,18 @@ from guidedLP.pipelines.undirected_bipartite import (
     UndirectedBipartitePipelineResult,
     run_undirected_bipartite_pipeline,
 )
+from guidedLP.pipelines.undirected_unipartite import (
+    UndirectedUnipartitePipelineResult,
+    run_undirected_unipartite_pipeline,
+)
 from guidedLP.pipelines._runtime import StageStats
 
 __all__ = [
     "CanonicalPipelineResult",
     "StageStats",
     "UndirectedBipartitePipelineResult",
+    "UndirectedUnipartitePipelineResult",
     "run_canonical_pipeline",
     "run_undirected_bipartite_pipeline",
+    "run_undirected_unipartite_pipeline",
 ]
