@@ -338,6 +338,7 @@ def run_undirected_unipartite_pipeline(
             shift_amount=shift_amount,
             power=power,
             n_jobs=similarity_n_jobs,
+            verbose=verbose,
         )
         # Free the raw input frame; downstream stages don't need it.
         del df_in

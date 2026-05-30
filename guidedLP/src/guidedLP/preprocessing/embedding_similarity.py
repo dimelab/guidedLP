@@ -123,6 +123,36 @@ def _topk_indices(
     return out
 
 
+def _print_filter_summary(
+    n_input_senders: int,
+    n_output_edges: int,
+    n_retained_senders: int,
+    k: int,
+    similarity_threshold: float,
+    mutual: bool,
+) -> None:
+    """Single-line stats summary printed when ``verbose=True``.
+
+    Matches the formatting used by ``build_edgelist_from_frame`` /
+    ``apply_backbone``: bracketed function tag, then pipe-separated key
+    figures. Reports total input sender count, output edge count, and the
+    fraction of senders that ended up with at least one edge (the others got
+    isolated by the threshold filter — the "outliers dropped" diagnostic).
+    """
+    if n_input_senders > 0:
+        pct = 100.0 * n_retained_senders / n_input_senders
+    else:
+        pct = 0.0
+    mutual_str = f" mutual={mutual}" if mutual else ""
+    print(
+        f"[extract_embedding_similarity_edgelist] "
+        f"{n_input_senders:,} senders → "
+        f"{n_retained_senders:,} retained ({pct:.1f}%), "
+        f"{n_output_edges:,} edges | "
+        f"k={k} threshold={similarity_threshold}{mutual_str}"
+    )
+
+
 def extract_embedding_similarity_edgelist(
     df: pl.DataFrame,
     *,
@@ -159,6 +189,8 @@ def extract_embedding_similarity_edgelist(
     power: float = 0.5,
     # Performance
     n_jobs: int = 1,
+    # Logging
+    verbose: bool = True,
 ) -> pl.DataFrame:
     """
     Build a unipartite actor-actor edgelist directly from per-actor embeddings.
@@ -270,6 +302,14 @@ def extract_embedding_similarity_edgelist(
         servers (16+ cores) at ``N >= ~10k``, where the single-threaded
         argpartition becomes the dominant cost. Workloads below ~512 senders
         ignore the setting and run serially.
+    verbose : bool, default True
+        Print a one-line summary of the filter outcome when the function
+        returns: total senders in, edges out, fraction of senders retained
+        (i.e. ended up with at least one above-threshold neighbor — the
+        complement is the "isolated by threshold" cohort). Same formatting as
+        :func:`~guidedLP.network.construction.build_graph_from_edgelist` /
+        :func:`~guidedLP.network.backboning.apply_backbone`. Set ``False`` in
+        tight loops or scripted runs.
 
     Returns
     -------
@@ -404,6 +444,8 @@ def extract_embedding_similarity_edgelist(
         weight_col: pl.Float64,
     }
     if df_work.height == 0:
+        if verbose:
+            _print_filter_summary(0, 0, 0, k, similarity_threshold, mutual)
         return pl.DataFrame(schema=empty_schema)
 
     # ---- Acquire (and aggregate) embeddings -------------------------------
@@ -427,6 +469,10 @@ def extract_embedding_similarity_edgelist(
     n_senders = aggregated.shape[0]
     if n_senders < 2:
         # One sender, no pairs to compare.
+        if verbose:
+            _print_filter_summary(
+                n_senders, 0, 0, k, similarity_threshold, mutual
+            )
         return pl.DataFrame(schema=empty_schema)
 
     # ---- Pairwise similarity ----------------------------------------------
@@ -460,6 +506,10 @@ def extract_embedding_similarity_edgelist(
     # ---- Apply similarity floor -------------------------------------------
     keep = top_sim >= similarity_threshold
     if not keep.any():
+        if verbose:
+            _print_filter_summary(
+                n_senders, 0, 0, k, similarity_threshold, mutual
+            )
         return pl.DataFrame(schema=empty_schema)
 
     src_int = row_idx[keep]
@@ -509,7 +559,19 @@ def extract_embedding_similarity_edgelist(
         )
 
     if pair_df.height == 0:
+        if verbose:
+            _print_filter_summary(
+                n_senders, 0, 0, k, similarity_threshold, mutual
+            )
         return pl.DataFrame(schema=empty_schema)
+
+    # Count senders with at least one surviving edge. Done on the still-coded
+    # pair_df (cheaper than the original-ID join below) — the mapping from
+    # codes to original sender IDs is 1:1, so the unique count is the same.
+    n_retained_senders = (
+        pl.concat([pair_df["_src"], pair_df["_tgt"]]).n_unique()
+    )
+    n_output_edges = pair_df.height
 
     # ---- Map internal indices back to original sender IDs -----------------
     sender_lookup = pl.DataFrame(
@@ -527,5 +589,15 @@ def extract_embedding_similarity_edgelist(
         .rename({"_w": weight_col})
         .select([source_col, target_col, weight_col])
     )
+
+    if verbose:
+        _print_filter_summary(
+            n_senders,
+            n_output_edges,
+            n_retained_senders,
+            k,
+            similarity_threshold,
+            mutual,
+        )
 
     return pair_df
