@@ -165,27 +165,33 @@ def compute_phrase_scores(
 
 
 def attach_phrase_scores(
-    phrased: pl.DataFrame,
+    aggregated: pl.DataFrame,
     keyword_col: str,
+    count_col: str,
     score_col: str,
 ) -> pl.DataFrame:
     """
-    Compute corpus-level RAKE phrase scores and join them onto ``phrased``.
+    Compute corpus-level RAKE phrase scores and join them onto the
+    ``(sender, phrase)``-aggregated frame.
 
-    ``phrased`` is the exploded ``(sender, keyword(, datetime))`` table where
-    each row is one phrase occurrence. We group to count occurrences per
-    unique phrase, score those, and broadcast the score back onto every row.
+    ``aggregated`` has one row per ``(sender, phrase)`` with the per-sender
+    mention count in ``count_col``. Corpus-level phrase counts are derived
+    by summing ``count_col`` across senders — equivalent to counting raw
+    occurrences in the exploded frame, but on an N_senders × vocab-sized
+    input rather than total_occurrences-sized. The resulting score is joined
+    onto the aggregated frame (small fan-out), so peak RAM is bounded by the
+    aggregated shape, not by total phrase occurrences.
     """
     counts_df = (
-        phrased.group_by(keyword_col)
-        .agg(pl.len().alias("_glp_rake_count"))
+        aggregated.group_by(keyword_col)
+        .agg(pl.col(count_col).sum().alias("_glp_rake_corpus_count"))
     )
 
     phrases = counts_df[keyword_col].to_list()
-    counts = counts_df["_glp_rake_count"].to_list()
+    counts = counts_df["_glp_rake_corpus_count"].to_list()
     scores = compute_phrase_scores(phrases, counts)
 
     score_df = pl.DataFrame(
         {keyword_col: phrases, score_col: scores}
     )
-    return phrased.join(score_df, on=keyword_col)
+    return aggregated.join(score_df, on=keyword_col)

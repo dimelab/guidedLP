@@ -24,7 +24,14 @@ The default pipeline preserves the similarity geometry of the embedding space:
 Set ``weight_transform="abs"`` if you want pure magnitude (loses sign
 information — anti-aligned senders look the same as aligned ones), or
 ``weight_transform="raw"`` to keep signed values (downstream code must
-handle negatives).
+handle negatives). Use ``weight_transform="power_shift"`` with ``power < 1``
+to spread out the tightly-clustered small components that L2-normalized
+high-dimensional vectors produce (each component averages ``1/√D``, so
+after the default shift most weights crowd into a narrow band around the
+shift amount).
+
+All weight transforms are applied *after* the on-disk cache, so any of
+them can be flipped or re-tuned between runs without re-encoding.
 
 The from-scratch encoding path requires the optional ``[embeddings]`` extra:
 ``pip install 'guidedLP[embeddings]'`` (sentence-transformers + torch). The
@@ -47,7 +54,7 @@ from guidedLP.common.exceptions import ValidationError
 _DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 _VALID_AGGREGATIONS = frozenset({"mean", "sum", "max"})
-_VALID_WEIGHT_TRANSFORMS = frozenset({"shift", "abs", "raw"})
+_VALID_WEIGHT_TRANSFORMS = frozenset({"shift", "abs", "raw", "power_shift"})
 
 _EMBEDDINGS_INSTALL_HINT = (
     "Embedding from raw text requires the 'sentence-transformers' package. "
@@ -531,6 +538,7 @@ def _apply_weight_transform(
     weights: np.ndarray,
     transform: str,
     shift_amount: float,
+    power: float,
 ) -> np.ndarray:
     """Apply the configured sign/shift transformation to the aggregated weights."""
     if transform == "shift":
@@ -539,6 +547,12 @@ def _apply_weight_transform(
         return np.abs(weights)
     if transform == "raw":
         return weights
+    if transform == "power_shift":
+        # sign(x) * |x|^power preserves signed geometry while reshaping the
+        # magnitude distribution. power < 1 spreads small values (the usual
+        # need for L2-normalized high-dim embeddings whose components crowd
+        # near zero); power > 1 compresses them.
+        return np.sign(weights) * np.abs(weights) ** power + shift_amount
     raise ValidationError(
         f"weight_transform must be one of {sorted(_VALID_WEIGHT_TRANSFORMS)}, "
         f"got {transform!r}",
@@ -580,6 +594,7 @@ def extract_embedding_features(
     # Weight transformation
     weight_transform: str = "shift",
     shift_amount: float = 2.0,
+    power: float = 0.5,
     # Sparsification
     top_k: Optional[int] = None,
     min_weight: Optional[float] = None,
@@ -710,9 +725,10 @@ def extract_embedding_features(
         ``[-1, 1]`` components is also in ``[-1, 1]``); ``"sum"`` and ``"max"``
         can land outside the assumed range and may interact poorly with the
         default shift amount.
-    weight_transform : {"shift", "abs", "raw"}, default "shift"
+    weight_transform : {"shift", "abs", "raw", "power_shift"}, default "shift"
         How to convert the aggregated (potentially negative) values into edge
-        weights:
+        weights. All four are applied *after* the on-disk cache, so any of
+        them can be flipped or re-tuned between runs without re-encoding.
 
         - ``"shift"`` — ``weight = value + shift_amount``. With the defaults
           (L2-normalized + ``shift_amount=2.0``), output weights lie in
@@ -721,8 +737,23 @@ def extract_embedding_features(
           look identical to aligned ones.
         - ``"raw"`` — ``weight = value``. Keeps negatives; downstream code
           must handle them.
+        - ``"power_shift"`` — ``weight = sign(value) * |value|^power +
+          shift_amount``. Use ``power < 1`` (default ``0.5``) to spread out
+          the tightly-clustered small components that L2-normalized high-
+          dimensional vectors produce; ``power > 1`` compresses them. Signed
+          geometry is preserved (an anti-aligned pair still ends up with a
+          ``2·|value|^power`` weight gap), and with the default
+          ``shift_amount=2.0`` weights stay positive as long as
+          ``|value| <= 1`` (true for L2-normalized inputs).
     shift_amount : float, default 2.0
-        Constant added when ``weight_transform="shift"``. Ignored otherwise.
+        Constant added when ``weight_transform`` is ``"shift"`` or
+        ``"power_shift"``. Ignored otherwise.
+    power : float, default 0.5
+        Exponent applied to ``|value|`` when ``weight_transform="power_shift"``.
+        Must be positive. ``< 1`` spreads small magnitudes apart (the usual
+        intent — diagnostic for clustered weights around the shift amount);
+        ``= 1`` reduces to plain ``"shift"``; ``> 1`` compresses small
+        magnitudes together. Ignored for other transforms.
     top_k : int, optional
         If set, keep only each sender's top-``k`` features by ``|weight|``.
         Default ``None`` means keep all dimensions.
@@ -805,6 +836,13 @@ def extract_embedding_features(
             "chunk_size must be a positive integer",
             field="chunk_size",
             value=chunk_size,
+        )
+
+    if weight_transform == "power_shift" and power <= 0:
+        raise ValidationError(
+            "power must be > 0 for weight_transform='power_shift'",
+            field="power",
+            value=power,
         )
 
     # chunk_size + save_path requirement only applies to the legacy per-post
@@ -937,7 +975,7 @@ def extract_embedding_features(
             chunk_size=chunk_size,
         )
     aggregated = _apply_weight_transform(
-        aggregated, weight_transform, shift_amount
+        aggregated, weight_transform, shift_amount, power
     )
 
     # ---- Build long-form directly (avoid melt cost on wide schemas) -------

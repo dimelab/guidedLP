@@ -1104,8 +1104,21 @@ def _extract_keywords_rake(
     )
 
     carry = _carry_cols(sender_col, datetime_col)
-    phrased = (
-        df.select(
+    agg_exprs: List[pl.Expr] = [pl.len().alias(count_col)]
+    if datetime_col is not None:
+        agg_exprs.append(pl.col(datetime_col).min().alias(first_seen_col))
+
+    # Build the extract → explode → filter → (sender, phrase) group_by as a
+    # single lazy plan and let the streaming engine handle it. The previous
+    # implementation materialized the full exploded (sender, datetime, phrase)
+    # frame and then joined a corpus-level score column onto every row before
+    # collapsing — peak RAM scaled with total phrase occurrences (typically
+    # 50–100M rows on a 10M-post corpus). Aggregating first means the score
+    # join below operates on the (n_senders × vocab) frame instead, and
+    # streaming the explode + group_by bounds peak RAM during this pass.
+    aggregated = (
+        df.lazy()
+        .select(
             carry
             + [
                 pl.col(post_col)
@@ -1117,9 +1130,12 @@ def _extract_keywords_rake(
         .filter(
             pl.col(keyword_col).is_not_null() & (pl.col(keyword_col) != "")
         )
+        .group_by([sender_col, keyword_col])
+        .agg(agg_exprs)
+        .collect(engine="streaming")
     )
 
-    if phrased.height == 0:
+    if aggregated.height == 0:
         # No candidate phrases anywhere — return an empty frame with the
         # correct schema so downstream code doesn't crash on a missing column.
         cols = [pl.Series(sender_col, [], dtype=df.schema[sender_col]),
@@ -1131,17 +1147,13 @@ def _extract_keywords_rake(
             )
         return pl.DataFrame(cols)
 
+    # Compute corpus-level scores from the small aggregated frame: summing
+    # per-sender mention counts per phrase reproduces the corpus-wide count
+    # exactly, without re-traversing the exploded form.
     score_col = "_glp_rake_score"
-    phrased = attach_phrase_scores(phrased, keyword_col, score_col)
-
-    agg_exprs: List[pl.Expr] = [
-        pl.len().alias(count_col),
-        pl.col(score_col).first().alias(score_col),
-    ]
-    if datetime_col is not None:
-        agg_exprs.append(pl.col(datetime_col).min().alias(first_seen_col))
-
-    aggregated = phrased.group_by([sender_col, keyword_col]).agg(agg_exprs)
+    aggregated = attach_phrase_scores(
+        aggregated, keyword_col, count_col, score_col
+    )
 
     # max_phrase_length is treated as a soft preference, not a hard cap:
     # phrases of acceptable length sort first, longer phrases backfill if a
