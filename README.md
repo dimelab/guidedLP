@@ -293,7 +293,7 @@ graph, mapper = build_graph_from_edgelist(
 - `mutual=True` keeps an edge only when both senders have each other in their top-`k`. Sparser and more outlier-resistant — and known to improve downstream label propagation (Ozaki et al., CoNLL 2011) — at the cost of potentially disconnecting parts of the graph.
 - `weight_transform` is the same machinery `extract_embedding_features` uses. Default `"raw"` keeps signed cosine similarity (`[similarity_threshold, 1]`); `"shift"` adds 2 so weights land in `[1, 3]` (which `build_graph_from_edgelist` requires, since it rejects negative weights); `"abs"` and `"power_shift"` work identically to the bipartite path.
 
-**From scratch with caching.** Combine with `save_path` to reuse the encoded matrix across runs — same cache file as `extract_embedding_features`, so you can iterate on `k` / `similarity_threshold` / `mutual` in seconds without re-encoding:
+**From scratch with caching.** Combine with `save_path` to reuse the encoded matrix across runs:
 
 ```python
 edges = extract_embedding_similarity_edgelist(
@@ -307,6 +307,32 @@ edges = extract_embedding_similarity_edgelist(
     weight_transform="shift",
 )
 ```
+
+**Sharing the cache with `extract_embedding_features`.** Both functions go through the same `_get_aggregated_embeddings` helper, so they read and write the same cache file. If you're running *both* on the same corpus — e.g., the bipartite hashtag-projection path *and* the direct similarity graph for a side-by-side comparison — pass the same `save_path` to both calls and the second one is a cache hit: no model inference, no aggregation pass, just the cosine similarity step. The cache is keyed by sender × dimension, so the two calls must agree on `aggregation`, `normalize_embeddings`, and (transitively) the input corpus — anything else can differ freely.
+
+```python
+# First call: encodes posts, aggregates per sender, writes the cache.
+features = extract_embedding_features(
+    posts,
+    save_path="cache/posts.npy",
+    aggregation="mean",
+    normalize_embeddings=True,
+    weight_transform="shift",           # for the bipartite path
+)
+
+# Second call: cache hit — no model loaded, no encoding, no aggregation.
+# Just reads `cache/posts.npy` and runs the cosine-similarity filter.
+sim_edges = extract_embedding_similarity_edgelist(
+    posts,
+    save_path="cache/posts.npy",        # same file as above
+    aggregation="mean",                 # must match
+    normalize_embeddings=True,          # must match
+    k=30, similarity_threshold=0.3, mutual=True,
+    weight_transform="shift",
+)
+```
+
+The two functions then disagree only on their *output* stage: `extract_embedding_features` unrolls to per-dimension bipartite edges (with whatever `weight_transform` you chose for that path), `extract_embedding_similarity_edgelist` computes pairwise similarity directly from the same cached aggregated matrix. The cached `.npy` itself is independent of `weight_transform` — that's applied after the cache read on both sides — so the two calls can pick *different* transforms without conflict.
 
 **Scaling and `n_jobs`.** The internal `N×N` cosine similarity matrix is held in `float32` (output weights are cast back to `float64` so downstream code sees no dtype change), capping in-RAM `N` at roughly **130k senders on 192 GB** of memory. Above ~10k senders the bottleneck shifts from the BLAS `X @ X.T` (already multi-threaded) to NumPy's single-threaded `argpartition` top-k selection. Pass `n_jobs=-1` to spread the top-k step across all CPU cores — on a 64-core server, this drops N=50k from ~30s to a few seconds. `n_jobs=1` (the default) runs serially with zero overhead; workloads below 512 senders ignore the setting and use the serial path regardless.
 
