@@ -816,43 +816,56 @@ Key differences vs `run_canonical_pipeline`:
 
 Memory modes (`"fast"` / `"balanced"` / `"low"`), `result.stage_stats`, `keep_intermediates`, `protected_nodes`, and the optional `content_seeds` stage all work identically to the canonical wrapper above — the only knobs that change are the stage-3 ones (`projection_mode`, `projection_weight_method`). Use this pipeline for symmetric similarity / community-style analyses; use `run_canonical_pipeline` when later-sharer → earlier-sharer attribution direction matters (PageRank / HITS-flavored analyses).
 
-#### Direct similarity variant — `run_undirected_unipartite_pipeline`
+#### Already-unipartite variant — `run_undirected_unipartite_pipeline`
 
-The embedding-direct sibling of the two pipelines above. When sender similarity comes from the *semantic geometry of an embedding model* (sentence-transformer vectors over posts) rather than from shared discrete items (hashtags / URLs / domains / keywords), the bipartite + projection chain is the wrong shape: there is no item partition to backbone, and reconstructing pairwise similarity from a `sender → dim_i` co-occurrence projection discards the signed geometry that makes embeddings useful in the first place. This pipeline computes pairwise cosine similarity directly via `extract_embedding_similarity_edgelist`, applies the hybrid top-`k` + similarity-floor filter, and runs the same unipartite `noise_corrected` backbone as the bipartite sibling — but with no bipartite stages.
+When the input is **already a unipartite edge frame** (`source, target, weight` between nodes of a single partition), neither bipartite pipeline above is the right shape — there is no item partition to SVN-backbone, no projection to compute. Use this pipeline to wrap such a frame as a coded `EdgeList`, optionally attach caller-supplied edges, and run the same unipartite `noise_corrected` backbone as the bipartite sibling — with no bipartite stages.
+
+The pipeline is **agnostic about how the unipartite edges were produced**. Embedding-cosine similarity is one common provider; manually scored ties, signed-network outputs, and any other upstream construction work the same way.
 
 ```python
+import polars as pl
+from guidedLP.preprocessing.embedding_similarity import extract_embedding_similarity_edgelist
 from guidedLP.pipelines import run_undirected_unipartite_pipeline
 
-result = run_undirected_unipartite_pipeline(
-    "posts.parquet",                    # [sender, post, datetime] (or pass embedding_col)
+# Stage 0 (caller's responsibility): produce the unipartite edge frame.
+# Embedding-cosine example — but any `(source, target, weight)` frame works.
+posts = pl.read_parquet("posts.parquet")     # [sender, post, datetime]
+sim_edges = extract_embedding_similarity_edgelist(
+    posts,
     sender_col="sender",
     post_col="post",
-    # Embedding model + caching — same knobs as extract_embedding_features
     model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     save_path="cache/posts.npy",
     aggregation="mean",
-    # Hybrid filter
     k=30,
     similarity_threshold=0.3,
-    mutual=True,                        # outlier-resistant, sparser graph
-    similarity_n_jobs=-1,               # parallel top-k on many-core machines
-    # Backbone (same noise_corrected stage as the bipartite sibling)
+    mutual=True,                             # outlier-resistant, sparser graph
+    weight_transform="shift",                # noise_corrected needs ≥0 weights
+    n_jobs=-1,
+)
+
+# Stages 1–2: wrap + (optional attach) + noise_corrected backbone.
+result = run_undirected_unipartite_pipeline(
+    sim_edges,
+    source_col="source",                     # defaults shown
+    target_col="target",
+    weight_col="weight",
     projection_target_fraction=0.5,
     memory_mode="balanced",
     verbose=True,
 )
-backbone = result.edgelist              # undirected, weighted EdgeList
+backbone = result.edgelist                   # undirected, weighted EdgeList
 mapper = result.id_mapper
 ```
 
 Key differences vs `run_undirected_bipartite_pipeline`:
 
-- **No bipartite SVN or projection.** Stages 1–3 of the bipartite pipeline (`build_edgelist_from_frame(bipartite=True)` → `bipartite_svn` → `project_bipartite`) collapse into a single `extract_embedding_similarity_edgelist` call. `result.stage_stats` reports `extract_embedding_similarity_edgelist`, `build_edgelist_from_frame`, optional `attach_content_seeds`, and `apply_backbone(noise_corrected)` — that's it.
-- **`weight_transform` defaults to `"shift"`**, not the underlying function's `"raw"`. The `noise_corrected` backbone needs non-negative weights, and raw cosine similarity can dip below zero (anti-aligned senders). The `+2` shift maps `[-1, 1] → [1, 3]` losslessly. Pass `weight_transform="raw"` if you've already restricted `similarity_threshold` to a non-negative value.
-- **No `min_source_degree` pre-filter.** There is no bipartite to compute source degrees from. Pre-filter low-post-count senders in the input DataFrame before passing it in.
-- **`enable_backbone=False`** skips the Stage 3 `noise_corrected` pass entirely — useful when `k` and `similarity_threshold` have already sized the graph and an additional statistical pass would over-prune.
+- **No bipartite SVN or projection.** The caller has already collapsed to a unipartite edge frame. `result.stage_stats` reports `build_edgelist_from_frame`, optional `attach_content_seeds`, and `apply_backbone(noise_corrected)` — that's it.
+- **Input must already have non-negative weights.** The `noise_corrected` backbone in Stage 2 assumes weights ≥ 0. Raw cosine similarity dips below zero for anti-aligned pairs — use `weight_transform="shift"` (or similar) in your upstream similarity call, or pre-shift / threshold the frame yourself.
+- **No degree pre-filters in the pipeline.** Drop low-degree nodes upstream before constructing the unipartite frame if needed.
+- **`enable_backbone=False`** skips Stage 2 entirely — useful when the upstream construction has already sized the graph and an additional statistical pass would over-prune.
 
-When to reach for this one: actor similarity is best captured semantically (post text, captions, transcripts) rather than by explicit shared items, and the corpus is small enough that the `N²` similarity matrix fits in RAM (~130k senders on 192 GB, float32 internal — see the "Semantic embedding features" section above for the full scaling story). Otherwise stay with `run_undirected_bipartite_pipeline` over hashtags / URLs / domains / keywords or `run_canonical_pipeline` when temporal attribution direction matters.
+When to reach for this one: you already have a unipartite similarity / interaction frame and just want the standard wrap + backbone treatment. For embedding-cosine specifically, the corpus needs to be small enough that the `N²` similarity matrix fits in RAM (~130k senders on 192 GB, float32 internal — see the "Semantic embedding features" section above for the full scaling story). Otherwise stay with `run_undirected_bipartite_pipeline` over hashtags / URLs / domains / keywords or `run_canonical_pipeline` when temporal attribution direction matters.
 
 ### 7. Evaluating GLP Quality with Held-Out Seeds
 

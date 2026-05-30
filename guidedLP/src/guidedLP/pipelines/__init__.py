@@ -19,13 +19,14 @@ Current pipelines:
   graph weighted by jaccard / count / overlap similarity. Useful for
   symmetric similarity / community-style analyses.
 
-- :func:`run_undirected_unipartite_pipeline` — posts/embeddings →
-  hybrid top-``k`` + similarity-floor unipartite EdgeList → unipartite
-  backbone. Skips the bipartite stages entirely; the similarity step
-  compresses the sender↔dimension structure into pairwise sender
-  similarity in one shot. Use when actor similarity is best captured
-  by the semantic geometry of an embedding model rather than by
-  shared discrete items.
+- :func:`run_undirected_unipartite_pipeline` — already-unipartite
+  ``(source, target, weight)`` edge frame → unipartite backbone. Wraps
+  the frame as a coded :class:`EdgeList`, optionally attaches caller-
+  supplied edges, and runs ``noise_corrected``. Agnostic about the
+  provenance of the input edges: pair it with
+  :func:`extract_embedding_similarity_edgelist` for embedding-cosine
+  graphs, or feed it any other unipartite construction (manual scoring,
+  signed-network output, etc.).
 """
 
 from guidedLP.pipelines.canonical import (

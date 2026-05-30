@@ -598,16 +598,33 @@ def _get_aggregated_embeddings(
     senders = df_work.get_column(sender_col).to_numpy()
 
     if embedding_col is not None:
-        # Pre-embedded path: no encoding to cache. Read embeddings, then
-        # aggregate them per sender. aggregate_inline has no effect here.
+        # Pre-embedded path: no encoding to cache, but the aggregated per-sender
+        # matrix is cache-worthy in its own right — it's the same shape and
+        # contract as the cache produced by the from-scratch aggregate_inline
+        # branch, so a downstream call sharing this save_path can hit it without
+        # going through the embedding column again. (aggregate_inline has no
+        # other effect on this path — the per-post embeddings already live in
+        # df_work, so there is nothing to fold into the encoding pass.)
+        cache_p = _cache_path(save_path) if save_path is not None else None
+        cache_hit = (
+            cache_p is not None and not create_new and cache_p.exists()
+        )
+        if cache_hit:
+            unique_senders = np.unique(senders)
+            aggregated = _load_aggregated_cache(cache_p, len(unique_senders))
+            return unique_senders, aggregated
+
         embeddings = _embeddings_from_column(df_work, embedding_col)
-        return _aggregate_per_sender(
+        unique_senders, aggregated = _aggregate_per_sender(
             senders,
             embeddings,
             aggregation,
             normalize=normalize_embeddings,
             chunk_size=chunk_size,
         )
+        if cache_p is not None:
+            _save_aggregated_cache(cache_p, aggregated)
+        return unique_senders, aggregated
 
     if aggregate_inline:
         # Fold encoding and per-sender aggregation into one pass. The on-disk
@@ -794,24 +811,39 @@ def extract_embedding_features(
         assumes bounded ``[-1, 1]`` components, which is only true for
         L2-normalized vectors.
     save_path : str or pathlib.Path, optional
-        If set, model outputs are cached on disk at this path (as ``.npy``;
-        the ``.npy`` suffix is appended if missing). On subsequent calls with
-        ``create_new=False`` (default) and the file present, encoding is
-        skipped — a large win when iterating on downstream choices, since
-        model inference is by far the most expensive step. Only meaningful
-        for the from-scratch path: passing ``save_path`` together with
-        ``embedding_col`` raises ``ValidationError``.
+        If set, results are cached on disk at this path (as ``.npy``; the
+        ``.npy`` suffix is appended if missing). On subsequent calls with
+        ``create_new=False`` (default) and the file present, the cached
+        result is reused — a large win when iterating on downstream
+        choices, since model inference / aggregation is by far the most
+        expensive step.
+
+        Honored on **both** input paths:
+
+        - **From-scratch path** (``embedding_col=None``): caches either the
+          raw per-post embeddings (``aggregate_inline=False``) or the
+          per-sender aggregated matrix (``aggregate_inline=True``), per the
+          shape conventions below.
+        - **Pre-embedded path** (``embedding_col`` set): caches the
+          per-sender aggregated matrix. The model is never loaded on this
+          path, so there is no encoding to skip, but the aggregation pass
+          is itself non-trivial on large corpora — and more importantly,
+          sharing this cache file with
+          :func:`extract_embedding_similarity_edgelist` lets the two
+          functions reuse the same per-sender matrix without re-aggregating.
 
         The cache contents depend on ``aggregate_inline``:
 
-        - ``aggregate_inline=True`` (default) — stores the per-sender
-          aggregated matrix of shape ``(n_unique_senders, D)``. The cache is
-          keyed by sender, so it bakes in ``aggregation`` and
-          ``normalize_embeddings``; changing either requires
-          ``create_new=True``. Typically 10–100× smaller than the legacy form.
-        - ``aggregate_inline=False`` — stores the raw per-post matrix of shape
-          ``(N_posts, D)``. The cache stays normalize- and aggregation-
-          agnostic, so those settings can be iterated on without re-encoding.
+        - ``aggregate_inline=True`` (default, also implicit on the
+          pre-embedded path) — stores the per-sender aggregated matrix of
+          shape ``(n_unique_senders, D)``. The cache is keyed by sender, so
+          it bakes in ``aggregation`` and ``normalize_embeddings``; changing
+          either requires ``create_new=True``. Typically 10–100× smaller
+          than the legacy form.
+        - ``aggregate_inline=False`` — from-scratch path only. Stores the
+          raw per-post matrix of shape ``(N_posts, D)``. The cache stays
+          normalize- and aggregation-agnostic, so those settings can be
+          iterated on without re-encoding.
 
         Either way, feeding in a different corpus must be paired with
         ``create_new=True``.
@@ -943,13 +975,6 @@ def extract_embedding_features(
     """
     # ---- Validate + pick the embeddings source ----------------------------
     if embedding_col is not None:
-        if save_path is not None:
-            raise ValidationError(
-                "save_path is only meaningful for the from-scratch encoding "
-                "path; when embedding_col is provided no encoding step runs, "
-                "so there is nothing to cache.",
-                field="save_path",
-            )
         _validate_embedding_input(df, sender_col, embedding_col, datetime_col)
         df_work = df.drop_nulls(subset=[sender_col, embedding_col])
     else:

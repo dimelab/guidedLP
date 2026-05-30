@@ -238,6 +238,11 @@ def extract_embedding_similarity_edgelist(
         :func:`extract_embedding_features` for full semantics — the cache file
         produced by either function is interchangeable as long as the
         ``aggregation`` / ``normalize_embeddings`` / corpus are unchanged.
+        ``save_path`` is honored on **both** input paths — when
+        ``embedding_col`` is set, the per-sender aggregated matrix is still
+        cached (the encoding step is skipped because the per-post vectors
+        already live in the input column, but the aggregation pass is
+        cache-worthy in its own right).
     metric : {"cosine"}, default "cosine"
         Pairwise similarity metric. Cosine is the standard choice for
         sentence-transformer embeddings (their training objective makes
@@ -407,13 +412,6 @@ def extract_embedding_similarity_edgelist(
 
     # ---- Validate inputs (delegate to extract_embedding_features's helpers)
     if embedding_col is not None:
-        if save_path is not None:
-            raise ValidationError(
-                "save_path is only meaningful for the from-scratch encoding "
-                "path; when embedding_col is provided no encoding step runs, "
-                "so there is nothing to cache.",
-                field="save_path",
-            )
         _validate_embedding_input(df, sender_col, embedding_col, datetime_col)
         df_work = df.drop_nulls(subset=[sender_col, embedding_col])
     else:
