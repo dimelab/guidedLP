@@ -508,6 +508,31 @@ user_graph, user_mapper = project_bipartite(
 # The new mapper contains only users — verify with check_seed_coverage(user_mapper, seeds).
 ```
 
+**Weight methods at a glance** (full table in [`docs/api/network.md`](guidedLP/docs/api/network.md#project_bipartite)):
+
+| Method | Formula | When to use |
+|---|---|---|
+| `count` | `\|N_u ∩ N_v\|` | Raw, intuitive; treats all items as equally informative. |
+| `jaccard` | `\|N_u ∩ N_v\| / \|N_u ∪ N_v\|` | Bounded `[0, 1]`; the safe default. |
+| `overlap` | `\|N_u ∩ N_v\| / min(\|N_u\|, \|N_v\|)` | Asymmetric; one set ⊂ the other. |
+| `hyperbolic` | `Σ_z 1/(k_z − 1)` | **Down-weights hub items.** Newman 2001. Recommended for URL/domain/keyword projections where a few viral items dominate. |
+| `probs` | `Σ_z 1/(k_u · k_z)` | Resource Allocation; discounts both sender activity and item popularity. Zhou-Medo 2007. Often the best-performing weighting on social-media style data. |
+
+`count`/`jaccard`/`overlap` are *set-based* — they treat sharing `youtube.com` as worth the same evidence as sharing some niche URL. For URL/domain/keyword bipartites with heavy item-side degree skew, `hyperbolic` and `probs` correct for the item-popularity bias that the set-based methods don't see.
+
+**Weighted projection.** By default the projection binarizes the bipartite — duplicate `(src, tgt)` rows are deduped and `A` is `0/1`. This matches the established "weights inform Stage 2 backbone significance, projection itself is binary" paradigm (Tumminello et al. 2011; Saracco et al. 2017). When you want the bipartite weights to *also* shape the projection, pass `weighted_projection=True` — the numerator becomes a weighted dot product. Supported only with `hyperbolic` and `probs` (set methods would silently shift their semantics).
+
+```python
+# Hub-aware projection on a weighted bipartite.
+# Each (sender, URL) pair carries a count of how often the URL was shared.
+user_graph, user_mapper = project_bipartite(
+    bipartite, full_mapper,
+    projection_mode="source",
+    weight_method="hyperbolic",
+    weighted_projection=True,   # consume the bipartite 'weight' column
+)
+```
+
 **For hub-heavy bipartites at scale** — datasets where a few popular intermediate items (a viral hashtag, a popular URL) are touched by thousands of users — switch to the `EdgeList` path. The projection edge count can explode by orders of magnitude through a single hub, and the coded path delivers ~3–7× peak-RSS reduction. On a 20K-user × 2K-item Zipf-popular bipartite (~240K input edges → 199M projection edges), the legacy graph path runs out of memory; the EdgeList path completes cleanly.
 
 ```python
@@ -785,7 +810,7 @@ Use the wrapper when running the canonical four-stage pipeline as-is. Skip it wh
 
 #### Undirected variant — `run_undirected_bipartite_pipeline`
 
-When you want a symmetric co-occurrence graph (e.g. Jaccard similarity between users who share content) rather than directed citation attribution, use the undirected sibling. Same four-stage shape — bipartite EdgeList → `bipartite_svn` backbone → projection → `noise_corrected` backbone — but stage 3 swaps `temporal_bipartite_to_unipartite` for `project_bipartite`, so the output is undirected and weighted by a topological similarity (`"jaccard"`, `"count"`, or `"overlap"`).
+When you want a symmetric co-occurrence graph (e.g. Jaccard similarity between users who share content) rather than directed citation attribution, use the undirected sibling. Same four-stage shape — bipartite EdgeList → `bipartite_svn` backbone → projection → `noise_corrected` backbone — but stage 3 swaps `temporal_bipartite_to_unipartite` for `project_bipartite`, so the output is undirected and weighted by a topological similarity (`"jaccard"`, `"count"`, `"overlap"`, `"hyperbolic"`, or `"probs"`).
 
 ```python
 from guidedLP.pipelines import run_undirected_bipartite_pipeline
@@ -794,7 +819,7 @@ result = run_undirected_bipartite_pipeline(
     source="shares.parquet",
     source_col="user", target_col="item",
     projection_mode="source",                  # collapse items, keep users
-    projection_weight_method="jaccard",        # "count" | "jaccard" | "overlap"
+    projection_weight_method="jaccard",        # see "Picking a projection_weight_method" below
     min_source_degree=25,
     bipartite_alpha=0.01, bipartite_correction="fdr_bh",
     projection_target_fraction=0.2,
@@ -807,10 +832,26 @@ mapper = result.id_mapper
 print(f"{backbone.number_of_edges():,} edges, {backbone.n_nodes:,} nodes")
 ```
 
+**Picking a `projection_weight_method`.** `jaccard` is the safe default — bounded in `[0, 1]` and well-behaved under `noise_corrected` backboning. For URL/domain/keyword bipartites where a few viral items connect huge subsets of users, switch to `hyperbolic` (or `probs`) — both down-weight contributions from hub items so niche co-shares carry more evidence (see Section 3 above for the comparison table and citations). For `auto_weight=True` or `weight_col=...` inputs where you want the bipartite weights to *also* shape the projection itself (not just the Stage 2 backbone), add `weighted_projection=True`:
+
+```python
+result = run_undirected_bipartite_pipeline(
+    source="shares.parquet",
+    source_col="user", target_col="url",
+    weight_col="post_count",                   # per-(user, URL) frequency
+    projection_weight_method="hyperbolic",
+    weighted_projection=True,                  # consume the weights in Stage 3 too
+    bipartite_alpha=0.01, bipartite_correction="fdr_bh",
+    projection_target_fraction=0.2,
+)
+```
+
+`weighted_projection=True` requires `projection_weight_method ∈ {"hyperbolic", "probs"}` (the set-based methods would silently shift their semantics from intersection to weighted dot products).
+
 Key differences vs `run_canonical_pipeline`:
 
-- **No temporal inputs.** No `timestamp_col`, `weight_col`, `time_decay`, or `presort_temporal` — `project_bipartite` computes edge weights from shared-neighbor topology, ignoring per-edge weights and timestamps.
-- **Default weight is Jaccard.** `projection_weight_method="jaccard"` is bounded in `[0, 1]`, which tends to behave better under `noise_corrected` backboning and downstream GLP than the raw `"count"` weights.
+- **No temporal inputs.** No `timestamp_col`, `time_decay`, or `presort_temporal` — `project_bipartite` produces an undirected similarity graph. `weight_col` and `auto_weight` are supported and inform Stage 2's null model; by default Stage 3 binarizes (the historical contract), but `weighted_projection=True` propagates the weights through Stage 3 too.
+- **Default weight is Jaccard.** Bounded in `[0, 1]`, well-behaved under `noise_corrected` backboning and downstream GLP. `hyperbolic`/`probs` are typically better when the bipartite has heavy item-side degree skew.
 - **Output is undirected** → run downstream GLP with `directional=False` (a single `predictions_df`, not the `(out_df, in_df)` tuple the canonical pipeline produces).
 - **`content_seeds` emits each anchor edge once.** The undirected projection treats both orientations as equivalent, so the `forward + reverse` mirroring used in Example 5 isn't needed here — supply `("__lbl_left", "u1", 1.0)` and you're done.
 

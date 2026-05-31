@@ -1590,6 +1590,7 @@ def project_bipartite(
     verbose: bool = True,
     *,
     output_format: Optional[str] = None,
+    weighted_projection: bool = False,
 ) -> Union[Tuple[nk.Graph, IDMapper], Tuple[EdgeList, IDMapper], pl.DataFrame]:
     """
     Project a bipartite network to unipartite by connecting nodes with shared neighbors.
@@ -1620,9 +1621,17 @@ def project_bipartite(
         - "target": Project onto the target partition.
     weight_method : str, default "count"
         Method for calculating projection weights:
-        - "count": Number of shared neighbors.
+        - "count": Number of shared neighbors (binary; ignores ``weight``).
         - "jaccard": |A ∩ B| / |A ∪ B|.
         - "overlap": |A ∩ B| / min(|A|, |B|).
+        - "hyperbolic": Newman (2001) — Σ_{z ∈ N_u ∩ N_v} 1/(k_z − 1),
+          where ``k_z`` is the item-side degree (count of distinct
+          source-partition nodes touching item ``z``). Down-weights
+          contributions from hub items. Items with ``k_z = 1``
+          contribute 0.
+        - "probs": Zhou-Medo (2007) Resource Allocation /
+          ProbS — Σ_{z ∈ N_u ∩ N_v} 1/(k_u · k_z). Naturally
+          asymmetric; symmetrized via mean for the undirected output.
     verbose : bool, default True
         Print a one-line summary at the end.
     output_format : str, optional
@@ -1630,6 +1639,26 @@ def project_bipartite(
         match input). ``output_format="graph"`` with a frame input is not
         supported (call :func:`build_graph_from_edgelist` on the returned
         frame instead).
+    weighted_projection : bool, default False
+        Keyword-only. If True, the bipartite weights are consumed by the
+        projection kernel (the numerator becomes a weighted dot product
+        ``Σ_z B[u,z]·B[v,z]`` instead of a binary intersection count).
+        For ``"hyperbolic"``, ``k_z`` remains the count of distinct
+        senders (column nnz, not column sum) so item-informativeness
+        semantics are preserved across binary and weighted inputs. For
+        ``"probs"``, both ``k_u`` and ``k_z`` become weighted degrees,
+        matching Coscia §26.4. Supported only on the EdgeList and frame
+        paths (the NetworkIt-graph dict path never sees edge weights and
+        raises ``ValidationError``) and only for ``"hyperbolic"`` and
+        ``"probs"`` weight methods (``"count"``/``"jaccard"``/``"overlap"``
+        with weighted bipartite weights would silently shift their
+        semantics from set-based intersection to weighted dot products,
+        so they raise ``ValidationError``). When True on an EdgeList,
+        the EdgeList must carry a ``weight`` column; when True on a
+        frame, the frame must include a ``weight`` column.
+        Default ``False`` preserves the historical binary-projection
+        contract (weights inform Stage 2 backboning, projection itself
+        is binary).
 
     Returns
     -------
@@ -1705,10 +1734,21 @@ def project_bipartite(
     - **Count**: Simple count of shared neighbors. Fast and intuitive.
     - **Jaccard**: |A ∩ B| / |A ∪ B|. Normalized similarity measure.
     - **Overlap**: |A ∩ B| / min(|A|, |B|). Asymmetric similarity measure.
+    - **Hyperbolic**: Σ_{z ∈ N_u ∩ N_v} 1/(k_z − 1). Down-weights hub
+      items so a niche-item co-share carries more evidence than a
+      hub-item co-share (Newman 2001; Coscia §26.3).
+    - **ProbS**: Σ_{z ∈ N_u ∩ N_v} 1/(k_u · k_z). Discounts both
+      sender posting volume and item popularity in one step. Asymmetric
+      by construction; mean-symmetrized for the undirected output
+      (Zhou et al. 2007; Coscia §26.4).
     """
     # Validate parameters (do this before any dispatch so messages are consistent).
     validate_parameter(projection_mode, ["source", "target"], "projection_mode", "project_bipartite")
-    validate_parameter(weight_method, ["count", "jaccard", "overlap"], "weight_method", "project_bipartite")
+    validate_parameter(
+        weight_method,
+        ["count", "jaccard", "overlap", "hyperbolic", "probs"],
+        "weight_method", "project_bipartite",
+    )
     if output_format not in (None, "graph", "edgelist", "dataframe"):
         raise ValidationError(
             f"output_format must be 'graph', 'edgelist', 'dataframe', or None; "
@@ -1727,6 +1767,7 @@ def project_bipartite(
         return _project_bipartite_edgelist_path(
             edges, id_mapper, projection_mode, weight_method,
             output_format, verbose, _t_start,
+            weighted_projection=weighted_projection,
         )
 
     # Frame-input branch.
@@ -1739,6 +1780,18 @@ def project_bipartite(
         return _project_bipartite_frame_path(
             edges, projection_mode, weight_method, verbose, _t_start,
             output_format=output_format,
+            weighted_projection=weighted_projection,
+        )
+
+    # Graph-input branch (dict path). The Set-based neighbor map never sees
+    # edge weights, so we can't honor weighted_projection here. Fail clearly
+    # rather than silently binarizing.
+    if weighted_projection:
+        raise ValidationError(
+            "weighted_projection=True is not supported for NetworkIt-graph "
+            "input — the dict-based neighbor-map construction discards edge "
+            "weights. Pass an EdgeList or DataFrame (which carry the "
+            "'weight' column) instead."
         )
 
     if not isinstance(edges, nk.Graph):
@@ -2066,6 +2119,7 @@ def _project_bipartite_frame_path(
     verbose: bool,
     t_start: float,
     output_format: Optional[str] = None,
+    weighted_projection: bool = False,
 ) -> Union[pl.DataFrame, Tuple[EdgeList, IDMapper]]:
     """Frame-input branch of :func:`project_bipartite`.
 
@@ -2082,6 +2136,10 @@ def _project_bipartite_frame_path(
         original-IDs ``source_id``/``target_id``/``weight`` frame),
         ``"edgelist"`` (return ``(EdgeList, IDMapper)`` for the projected
         unipartite graph). ``"graph"`` is rejected upstream.
+    weighted_projection : bool, default False
+        If True, propagate the frame's ``weight`` column through to the
+        kernel (requires ``weight`` to be present; raises
+        ``ValidationError`` otherwise).
     """
     required = {"source_id", "target_id"}
     missing = required - set(df.columns)
@@ -2091,23 +2149,34 @@ def _project_bipartite_frame_path(
             f"Expected {sorted(required)}."
         )
 
+    if weighted_projection and "weight" not in df.columns:
+        raise ValidationError(
+            "weighted_projection=True requires the input frame to have a "
+            "'weight' column."
+        )
+
     # Build a coded EdgeList from the frame, then run the vectorized
     # kernel on its UInt32 src/tgt columns. The replace_strict in
-    # build_edgelist_from_frame plus the np.unique inside the kernel
-    # replace the legacy Dict[Any, Set[Any]] neighbor-map step.
+    # build_edgelist_from_frame plus the np.unique / group_by inside the
+    # kernel replace the legacy Dict[Any, Set[Any]] neighbor-map step.
+    # For weighted_projection, we carry the 'weight' column through so the
+    # kernel can sum it per (src, tgt) pair.
     edge_list, mapper = build_edgelist_from_frame(
         df,
         source_col="source_id",
         target_col="target_id",
+        weight_col="weight" if weighted_projection else None,
         bipartite=True,
-        auto_weight=False,        # projection treats each (src, tgt) once
-        remove_duplicates=False,  # _compute_projection_arrays_coded dedupes
+        auto_weight=False,        # projection treats each (src, tgt) once for binary;
+                                  # weighted path sums duplicates inside the kernel
+        remove_duplicates=False,  # _compute_projection_arrays_coded dedupes / sums
         verbose=False,
     )
 
     projection_side = "src" if projection_mode == "source" else "tgt"
     i_arr, j_arr, weights, sorted_projection = _compute_projection_arrays_coded(
         edge_list, mapper, projection_side, weight_method,
+        weighted_projection=weighted_projection,
     )
 
     logger.info(
@@ -2155,6 +2224,7 @@ def _project_bipartite_edgelist_path(
     output_format: Optional[str],
     verbose: bool,
     t_start: float,
+    weighted_projection: bool = False,
 ) -> Union[Tuple[EdgeList, IDMapper], Tuple[nk.Graph, IDMapper], pl.DataFrame]:
     """EdgeList-input branch of :func:`project_bipartite`.
 
@@ -2162,11 +2232,14 @@ def _project_bipartite_edgelist_path(
     :func:`_compute_projection_arrays_coded` kernel directly — no
     re-encoding, no neighbor-map construction. The output format defaults
     to a coded :class:`EdgeList` (match input) but can be forced to
-    ``"graph"`` or ``"dataframe"`` via ``output_format``.
+    ``"graph"`` or ``"dataframe"`` via ``output_format``. When
+    ``weighted_projection=True``, the kernel consumes the EdgeList's
+    ``weight`` column.
     """
     projection_side = "src" if projection_mode == "source" else "tgt"
     i_arr, j_arr, weights, sorted_projection = _compute_projection_arrays_coded(
         edge_list, id_mapper, projection_side, weight_method,
+        weighted_projection=weighted_projection,
     )
 
     logger.info(
@@ -2277,33 +2350,74 @@ def _compute_projection_arrays(
         shape=(n, n_intermediates),
     )
 
-    # Shared-neighbor counts; keep strict upper triangle only (undirected, no self-loops).
-    AAT = (A @ A.T).tocsr()
-    AAT_upper = sp.triu(AAT, k=1).tocoo()
+    if weight_method in ("count", "jaccard", "overlap"):
+        # Shared-neighbor backbone; strict upper triangle only.
+        AAT_upper = sp.triu((A @ A.T).tocsr(), k=1).tocoo()
 
-    if AAT_upper.nnz == 0:
-        return empty_arrays
+        if AAT_upper.nnz == 0:
+            return empty_arrays
 
-    i_arr = AAT_upper.row.astype(np.int64, copy=False)
-    j_arr = AAT_upper.col.astype(np.int64, copy=False)
-    shared = AAT_upper.data.astype(np.int64, copy=False)
+        i_arr = AAT_upper.row.astype(np.int64, copy=False)
+        j_arr = AAT_upper.col.astype(np.int64, copy=False)
+        shared = AAT_upper.data.astype(np.int64, copy=False)
 
-    if weight_method == "count":
-        # Integer counts cast to float so they round-trip through NetworkIt
-        # the same way the legacy ``float(len(...))`` did.
-        weights = shared.astype(np.float64)
-    elif weight_method == "jaccard":
-        degrees = np.asarray(A.sum(axis=1)).flatten().astype(np.int64)
-        union = degrees[i_arr] + degrees[j_arr] - shared
-        # union == 0 only when both nodes have zero neighbors AND zero shared,
-        # i.e. the entry wouldn't be in AAT_upper anyway; guard for safety.
-        with np.errstate(divide="ignore", invalid="ignore"):
-            weights = np.where(union > 0, shared / union, 0.0)
-    elif weight_method == "overlap":
-        degrees = np.asarray(A.sum(axis=1)).flatten().astype(np.int64)
-        min_deg = np.minimum(degrees[i_arr], degrees[j_arr])
-        with np.errstate(divide="ignore", invalid="ignore"):
-            weights = np.where(min_deg > 0, shared / min_deg, 0.0)
+        if weight_method == "count":
+            # Integer counts cast to float so they round-trip through NetworkIt
+            # the same way the legacy ``float(len(...))`` did.
+            weights = shared.astype(np.float64)
+        elif weight_method == "jaccard":
+            degrees = np.asarray(A.sum(axis=1)).flatten().astype(np.int64)
+            union = degrees[i_arr] + degrees[j_arr] - shared
+            # union == 0 only when both nodes have zero neighbors AND zero shared,
+            # i.e. the entry wouldn't be in AAT_upper anyway; guard for safety.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                weights = np.where(union > 0, shared / union, 0.0)
+        else:  # overlap
+            degrees = np.asarray(A.sum(axis=1)).flatten().astype(np.int64)
+            min_deg = np.minimum(degrees[i_arr], degrees[j_arr])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                weights = np.where(min_deg > 0, shared / min_deg, 0.0)
+
+    elif weight_method == "hyperbolic":
+        # Σ_{z ∈ N_u ∩ N_v} 1/(k_z − 1) where k_z is item-side degree.
+        # Items with k_z = 1 contribute zero (matches Coscia §26.3's
+        # "ignore single-author papers" semantic).
+        k_z = np.asarray(A.sum(axis=0)).flatten().astype(np.int64)
+        inv_kz = np.zeros_like(k_z, dtype=np.float64)
+        mask = k_z > 1
+        inv_kz[mask] = 1.0 / (k_z[mask] - 1)
+        W_upper = sp.triu(
+            (A @ sp.diags(inv_kz) @ A.T).tocsr(), k=1
+        ).tocoo()
+
+        if W_upper.nnz == 0:
+            return empty_arrays
+
+        i_arr = W_upper.row.astype(np.int64, copy=False)
+        j_arr = W_upper.col.astype(np.int64, copy=False)
+        weights = W_upper.data.astype(np.float64, copy=False)
+
+    elif weight_method == "probs":
+        # Σ_{z ∈ N_u ∩ N_v} 1/(k_u · k_z), then mean-symmetrize. Asymmetric
+        # by construction (k_u differs from k_v); we average W and W.T so
+        # the undirected projection output is symmetric.
+        k_u = np.asarray(A.sum(axis=1)).flatten().astype(np.float64)
+        k_z = np.asarray(A.sum(axis=0)).flatten().astype(np.float64)
+        inv_ku = np.zeros_like(k_u, dtype=np.float64)
+        inv_ku[k_u > 0] = 1.0 / k_u[k_u > 0]
+        inv_kz = np.zeros_like(k_z, dtype=np.float64)
+        inv_kz[k_z > 0] = 1.0 / k_z[k_z > 0]
+        W_raw = sp.diags(inv_ku) @ (A @ sp.diags(inv_kz)) @ A.T
+        W = ((W_raw + W_raw.T) * 0.5).tocsr()
+        W_upper = sp.triu(W, k=1).tocoo()
+
+        if W_upper.nnz == 0:
+            return empty_arrays
+
+        i_arr = W_upper.row.astype(np.int64, copy=False)
+        j_arr = W_upper.col.astype(np.int64, copy=False)
+        weights = W_upper.data.astype(np.float64, copy=False)
+
     else:
         raise ValueError(f"Unknown weight method: {weight_method}")
 
@@ -2322,15 +2436,17 @@ def _compute_projection_arrays_coded(
     id_mapper: IDMapper,
     projection_side: str,
     weight_method: str,
+    *,
+    weighted_projection: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Any]]:
     """Vectorized projection kernel that consumes a coded :class:`EdgeList`.
 
-    Computes the same bipartite co-occurrence projection as
-    :func:`_compute_projection_arrays` (``AAT[i,j] = |N(i) ∩ N(j)|`` then
-    weight-method normalization), but skips the
+    Computes the bipartite co-occurrence projection
+    (``AAT[i,j] = |N(i) ∩ N(j)|`` then weight-method normalization, or
+    a hyperbolic / ProbS weighted sum), skipping the
     ``Dict[Any, Set[Any]]`` neighbor-map construction entirely. The
     EdgeList's ``src``/``tgt`` columns already hold compact integer codes,
-    so we can hand them straight to ``np.unique(return_inverse=True)`` to
+    so we hand them straight to ``np.unique(return_inverse=True)`` to
     build a dense bipartite incidence and let SciPy do the rest.
 
     Parameters
@@ -2347,7 +2463,18 @@ def _compute_projection_arrays_coded(
         ``"src"`` (project onto unique src codes, target codes are
         intermediates) or ``"tgt"`` (the other direction).
     weight_method : str
-        ``"count"``, ``"jaccard"``, or ``"overlap"``.
+        ``"count"``, ``"jaccard"``, ``"overlap"``, ``"hyperbolic"``,
+        or ``"probs"``.
+    weighted_projection : bool, default False
+        Keyword-only. If True, the EdgeList's ``weight`` column is
+        aggregated by summation per ``(proj, inter)`` pair and the
+        resulting weighted incidence is fed into the projection
+        formula. Only supported for ``weight_method ∈ {"hyperbolic",
+        "probs"}`` (raises ``ValidationError`` otherwise). If True and
+        the EdgeList lacks a ``weight`` column, raises
+        ``ValidationError``. See the ``project_bipartite`` docstring
+        for the weighted-formula semantics (``k_z`` is column nnz for
+        hyperbolic, weighted column sum for probs).
 
     Returns
     -------
@@ -2367,13 +2494,17 @@ def _compute_projection_arrays_coded(
     order as ``sorted(partition, key=str)`` would.
 
     Memory: peak roughly proportional to the bipartite EdgeList (~4 bytes
-    per coded edge) plus the projection's CSR adjacency (sparse). The
-    Python ``Dict[Any, Set[Any]]`` step in the legacy kernel is gone, so
-    huge hub-heavy projections (where a single popular intermediate node
-    fans out to millions of projection-edge pairs) stay tractable.
+    per coded edge for binary; ~12 bytes per edge for weighted because
+    of the float64 weight column) plus the projection's CSR adjacency
+    (sparse). The Python ``Dict[Any, Set[Any]]`` step in the legacy
+    kernel is gone, so huge hub-heavy projections (where a single
+    popular intermediate node fans out to millions of projection-edge
+    pairs) stay tractable.
 
-    Time Complexity: O(E) for Polars dedup + O(E_proj) for the SciPy
-    sparse multiply, where E_proj is the number of projection edges.
+    Time Complexity: O(E) for the Polars unique/group_by + O(E_proj) for
+    the SciPy sparse multiply, where E_proj is the number of projection
+    edges. ProbS does one additional sparse add (``W + W.T``) and an
+    elementwise halving for mean-symmetrization.
     """
     if projection_side == "src":
         proj_col, inter_col = "src", "tgt"
@@ -2383,6 +2514,25 @@ def _compute_projection_arrays_coded(
         raise ValueError(
             f"projection_side must be 'src' or 'tgt', got {projection_side!r}"
         )
+
+    if weighted_projection:
+        if weight_method not in ("hyperbolic", "probs"):
+            raise ValidationError(
+                f"weighted_projection=True is supported only with "
+                f"weight_method in {{'hyperbolic', 'probs'}}; got "
+                f"weight_method={weight_method!r}. For 'count'/'jaccard'/"
+                f"'overlap', weighted bipartite weights would silently "
+                f"change the semantics from set-based intersection to "
+                f"weighted dot products — pass weighted_projection=False "
+                f"to preserve the set-based interpretation."
+            )
+        if "weight" not in edge_list.df.columns:
+            raise ValidationError(
+                "weighted_projection=True requires the EdgeList to carry "
+                "a 'weight' column. Build the EdgeList with `weight_col=...` "
+                "or `auto_weight=True` so duplicate (src, tgt) rows produce "
+                "a weight."
+            )
 
     empty_arrays = (
         np.zeros(0, dtype=np.int64),
@@ -2394,10 +2544,20 @@ def _compute_projection_arrays_coded(
     if edge_list.number_of_edges() == 0:
         return empty_arrays
 
-    # Dedupe (proj, inter) pairs to mirror the set() semantics of
-    # _neighbor_map_from_edges. Without this, a duplicate edge would
-    # contribute 2 to A[i,k] and inflate AAT shared-neighbor counts.
-    pairs = edge_list.df.select(proj_col, inter_col).unique()
+    # Build the per-(proj, inter) aggregate. Binary mode dedupes (set
+    # semantics, mirrors _neighbor_map_from_edges). Weighted mode sums
+    # duplicate-row weights so each cell of A holds the total bipartite
+    # weight for that (proj, inter) pair.
+    if weighted_projection:
+        pairs = (
+            edge_list.df
+            .group_by(proj_col, inter_col, maintain_order=True)
+            .agg(pl.col("weight").sum().alias("weight"))
+        )
+        weight_vals = pairs["weight"].to_numpy().astype(np.float64, copy=False)
+    else:
+        pairs = edge_list.df.select(proj_col, inter_col).unique()
+        weight_vals = None  # filled with ones at A-construction time
 
     proj_codes = pairs[proj_col].to_numpy()
     inter_codes = pairs[inter_col].to_numpy()
@@ -2426,41 +2586,114 @@ def _compute_projection_arrays_coded(
             sorted_projection,
         )
 
-    # int32 incidence values — binary (0/1) entries, with headroom for
-    # A @ A.T to accumulate up to ~2.1B shared neighbors per cell before
-    # overflow. int8 would overflow at 127.
-    A = sp.csr_matrix(
-        (np.ones(len(proj_dense), dtype=np.int32),
-         (proj_dense, inter_dense)),
-        shape=(n_proj, n_inter),
-    )
-
-    AAT_upper = sp.triu((A @ A.T).tocsr(), k=1).tocoo()
-
-    if AAT_upper.nnz == 0:
-        return (
-            np.zeros(0, dtype=np.int64),
-            np.zeros(0, dtype=np.int64),
-            np.zeros(0, dtype=np.float64),
-            sorted_projection,
+    # Binary path: int32 incidence values with headroom for A @ A.T to
+    # accumulate up to ~2.1B shared neighbors per cell before overflow
+    # (int8 would overflow at 127). Weighted path: float64 incidence
+    # carrying the aggregated per-pair weights.
+    if weighted_projection:
+        A = sp.csr_matrix(
+            (weight_vals, (proj_dense, inter_dense)),
+            shape=(n_proj, n_inter),
+            dtype=np.float64,
+        )
+    else:
+        A = sp.csr_matrix(
+            (np.ones(len(proj_dense), dtype=np.int32),
+             (proj_dense, inter_dense)),
+            shape=(n_proj, n_inter),
         )
 
-    i_arr = AAT_upper.row.astype(np.int64, copy=False)
-    j_arr = AAT_upper.col.astype(np.int64, copy=False)
-    shared = AAT_upper.data.astype(np.int64, copy=False)
+    if weight_method in ("count", "jaccard", "overlap"):
+        # Shared-neighbor backbone: AAT[i,j] = |N_i ∩ N_j| (binary A).
+        AAT_upper = sp.triu((A @ A.T).tocsr(), k=1).tocoo()
 
-    if weight_method == "count":
-        weights = shared.astype(np.float64)
-    elif weight_method == "jaccard":
-        degrees = np.asarray(A.sum(axis=1)).flatten().astype(np.int64)
-        union = degrees[i_arr] + degrees[j_arr] - shared
-        with np.errstate(divide="ignore", invalid="ignore"):
-            weights = np.where(union > 0, shared / union, 0.0)
-    elif weight_method == "overlap":
-        degrees = np.asarray(A.sum(axis=1)).flatten().astype(np.int64)
-        min_deg = np.minimum(degrees[i_arr], degrees[j_arr])
-        with np.errstate(divide="ignore", invalid="ignore"):
-            weights = np.where(min_deg > 0, shared / min_deg, 0.0)
+        if AAT_upper.nnz == 0:
+            return (
+                np.zeros(0, dtype=np.int64),
+                np.zeros(0, dtype=np.int64),
+                np.zeros(0, dtype=np.float64),
+                sorted_projection,
+            )
+
+        i_arr = AAT_upper.row.astype(np.int64, copy=False)
+        j_arr = AAT_upper.col.astype(np.int64, copy=False)
+        shared = AAT_upper.data.astype(np.int64, copy=False)
+
+        if weight_method == "count":
+            weights = shared.astype(np.float64)
+        elif weight_method == "jaccard":
+            degrees = np.asarray(A.sum(axis=1)).flatten().astype(np.int64)
+            union = degrees[i_arr] + degrees[j_arr] - shared
+            with np.errstate(divide="ignore", invalid="ignore"):
+                weights = np.where(union > 0, shared / union, 0.0)
+        else:  # overlap
+            degrees = np.asarray(A.sum(axis=1)).flatten().astype(np.int64)
+            min_deg = np.minimum(degrees[i_arr], degrees[j_arr])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                weights = np.where(min_deg > 0, shared / min_deg, 0.0)
+
+    elif weight_method == "hyperbolic":
+        # k_z = item-side degree as count of distinct senders touching z.
+        # For binary A this is just A.sum(axis=0); for weighted A we use
+        # nnz so item-informativeness semantics survive the weighting
+        # (an item shared by 2 senders is informative regardless of total
+        # mention volume — guards against bot/cascade inflation).
+        if weighted_projection:
+            k_z = np.asarray((A != 0).sum(axis=0)).flatten().astype(np.int64)
+        else:
+            k_z = np.asarray(A.sum(axis=0)).flatten().astype(np.int64)
+        inv_kz = np.zeros_like(k_z, dtype=np.float64)
+        mask = k_z > 1
+        inv_kz[mask] = 1.0 / (k_z[mask] - 1)
+        W_upper = sp.triu(
+            (A @ sp.diags(inv_kz) @ A.T).tocsr(), k=1
+        ).tocoo()
+
+        if W_upper.nnz == 0:
+            return (
+                np.zeros(0, dtype=np.int64),
+                np.zeros(0, dtype=np.int64),
+                np.zeros(0, dtype=np.float64),
+                sorted_projection,
+            )
+
+        i_arr = W_upper.row.astype(np.int64, copy=False)
+        j_arr = W_upper.col.astype(np.int64, copy=False)
+        weights = W_upper.data.astype(np.float64, copy=False)
+
+    elif weight_method == "probs":
+        # ProbS / Resource Allocation. Asymmetric by construction:
+        #   W_raw[u,v] = (1/k_u) · Σ_{z ∈ N_u∩N_v} A[u,z] · (1/k_z) · A[v,z]
+        # For binary A, k_u and k_z are nnz degrees (Coscia §26.4 binary
+        # case). For weighted A, both are weighted degrees (sum), matching
+        # the random-walk semantics of Coscia §26.4's weighted formula.
+        # We symmetrize via mean for the undirected projection output.
+        if weighted_projection:
+            k_u = np.asarray(A.sum(axis=1)).flatten().astype(np.float64)
+            k_z = np.asarray(A.sum(axis=0)).flatten().astype(np.float64)
+        else:
+            k_u = np.asarray((A != 0).sum(axis=1)).flatten().astype(np.float64)
+            k_z = np.asarray((A != 0).sum(axis=0)).flatten().astype(np.float64)
+        inv_ku = np.zeros_like(k_u, dtype=np.float64)
+        inv_ku[k_u > 0] = 1.0 / k_u[k_u > 0]
+        inv_kz = np.zeros_like(k_z, dtype=np.float64)
+        inv_kz[k_z > 0] = 1.0 / k_z[k_z > 0]
+        W_raw = sp.diags(inv_ku) @ (A @ sp.diags(inv_kz)) @ A.T
+        W = ((W_raw + W_raw.T) * 0.5).tocsr()
+        W_upper = sp.triu(W, k=1).tocoo()
+
+        if W_upper.nnz == 0:
+            return (
+                np.zeros(0, dtype=np.int64),
+                np.zeros(0, dtype=np.int64),
+                np.zeros(0, dtype=np.float64),
+                sorted_projection,
+            )
+
+        i_arr = W_upper.row.astype(np.int64, copy=False)
+        j_arr = W_upper.col.astype(np.int64, copy=False)
+        weights = W_upper.data.astype(np.float64, copy=False)
+
     else:
         raise ValueError(f"Unknown weight method: {weight_method}")
 
@@ -2726,6 +2959,18 @@ def temporal_bipartite_to_unipartite(
     item accumulates incoming edges from everyone who shared it later, which is
     how PageRank, HITS-Authority, and similar centrality metrics surface
     influential sources.
+
+    .. note::
+        For *similarity-based* projection (one undirected weight per pair
+        aggregated across all shared items), use :func:`project_bipartite`,
+        which supports ``"count"``, ``"jaccard"``, ``"overlap"``,
+        ``"hyperbolic"``, and ``"probs"`` weight methods and an optional
+        ``weighted_projection`` flag. This function is intentionally
+        scoped to directional citation-flow semantics, where the
+        per-item time-ordering of edges is the primary signal — those
+        similarity-aggregation methods don't have a clean directional
+        analog (combining hyperbolic/ProbS with citation direction is an
+        open design question).
 
     Accepts a file path (CSV/Parquet), a Polars DataFrame, or a coded
     :class:`EdgeList` (with its paired :class:`IDMapper`). The output

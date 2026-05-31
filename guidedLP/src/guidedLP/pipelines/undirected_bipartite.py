@@ -118,6 +118,7 @@ def run_undirected_bipartite_pipeline(
     # Projection orientation.
     projection_mode: str = "source",
     projection_weight_method: str = "jaccard",
+    weighted_projection: bool = False,
     # Stage 1: build_edgelist.
     min_source_degree: Optional[int] = None,
     min_target_degree: Optional[int] = None,
@@ -164,13 +165,32 @@ def run_undirected_bipartite_pipeline(
         :func:`project_bipartite`. ``"source"`` collapses the target
         partition (e.g. content) and produces a graph on the source
         partition (e.g. users).
-    projection_weight_method : {"count", "jaccard", "overlap"}, default "jaccard"
+    projection_weight_method : {"count", "jaccard", "overlap", "hyperbolic", "probs"}, default "jaccard"
         Shared-neighbor weight formula. ``"jaccard"`` is the default
         because it's bounded in ``[0, 1]`` (well-behaved for downstream
         GLP and noise-corrected backboning); ``"count"`` is the raw
         number of shared neighbors; ``"overlap"`` is asymmetric
-        (``|A ∩ B| / min(|A|, |B|)``). Forwarded to
-        :func:`project_bipartite`.
+        (``|A ∩ B| / min(|A|, |B|)``). ``"hyperbolic"`` (Newman 2001;
+        Coscia §26.3) is ``Σ_{z ∈ N_u ∩ N_v} 1/(k_z − 1)`` — down-weights
+        contributions from hub items so niche-item co-shares carry more
+        evidence. ``"probs"`` (Zhou-Medo 2007 Resource Allocation;
+        Coscia §26.4) is ``Σ_{z ∈ N_u ∩ N_v} 1/(k_u · k_z)``,
+        mean-symmetrized for the undirected output. Both new methods
+        target the item-side degree bias (popular URLs/domains/keywords
+        creating cliques) that ``count``/``jaccard``/``overlap`` don't
+        correct for. Forwarded to :func:`project_bipartite`.
+    weighted_projection : bool, default False
+        Forwarded to :func:`project_bipartite`. When True, Stage 3
+        consumes the surviving bipartite ``weight`` column (post-Stage 2
+        backbone) instead of binarizing. Supported only with
+        ``projection_weight_method ∈ {"hyperbolic", "probs"}`` (the
+        set-based methods would silently change their semantics). When
+        False (default), Stage 3 preserves the historical contract:
+        bipartite weights inform Stage 2's null model only; the
+        projection itself is binary. Note that for this flag to have an
+        effect, the bipartite edges entering Stage 3 must carry a
+        ``weight`` column — i.e., you must have passed ``weight_col=...``
+        or ``auto_weight=True`` at Stage 1.
     min_source_degree, min_target_degree : int, optional
         Degree filters applied during the build step.
     weight_col : str, optional
@@ -181,13 +201,16 @@ def run_undirected_bipartite_pipeline(
         **first occurrence's weight** (no summation — pre-aggregate
         upstream if you want sum semantics). The resulting weights feed
         Stage 2's weighted bipartite_svn. Stage 3
-        (:func:`project_bipartite`) ignores edge weights and computes
-        its own topological weight, so this only affects Stage 2.
-        Mutually exclusive with ``auto_weight=True``.
+        (:func:`project_bipartite`) ignores edge weights by default and
+        computes its own topological weight — set
+        ``weighted_projection=True`` to have Stage 3 also consume the
+        surviving weights. Mutually exclusive with ``auto_weight=True``.
     auto_weight : bool, default False
         If True, count duplicate ``(source, target)`` rows to set the
         bipartite edge weight. The resulting weights feed Stage 2's
-        weighted bipartite_svn. Mutually exclusive with ``weight_col``.
+        weighted bipartite_svn (and Stage 3 too if
+        ``weighted_projection=True``). Mutually exclusive with
+        ``weight_col``.
     bipartite_overlap : str, default "drop"
         Overlap-resolution policy when nodes appear on both sides of
         the bipartite. ``"drop"`` removes the offending nodes; see
@@ -290,12 +313,13 @@ def run_undirected_bipartite_pipeline(
 
     try:
         # Stage 1: build the bipartite EdgeList. No timestamp
-        # passthrough; project_bipartite (Stage 3) overwrites edge
-        # weights with its own topological score, so weights here only
-        # affect the bipartite_svn backbone at Stage 2. When weight_col
-        # is set, we pair it with remove_duplicates=True (keep-first on
-        # (src, tgt)); the alternative weight-sum branch is incompatible
-        # with the auto_weight kwarg's contract and is not exposed here.
+        # passthrough; by default project_bipartite (Stage 3) overwrites
+        # edge weights with its own topological score, so weights here
+        # affect the bipartite_svn backbone at Stage 2 — and Stage 3 too
+        # when weighted_projection=True. When weight_col is set, we
+        # pair it with remove_duplicates=True (keep-first on (src, tgt));
+        # the alternative weight-sum branch is incompatible with the
+        # auto_weight kwarg's contract and is not exposed here.
         t0 = _time.perf_counter()
         el_bp, mapper_bp = build_edgelist_from_frame(
             source,
@@ -368,6 +392,7 @@ def run_undirected_bipartite_pipeline(
             weight_method=projection_weight_method,
             output_format="edgelist",
             verbose=verbose,
+            weighted_projection=weighted_projection,
         )
         stats.append(StageStats(
             name="project_bipartite",
