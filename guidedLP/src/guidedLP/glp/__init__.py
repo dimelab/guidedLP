@@ -52,3 +52,9 @@ from .grid_search import (
     GLPGridSearch,
     get_grid_search_summary,
 )
+
+# Multilayer GLP (supra-adjacency joint propagation over multiple graphs)
+from .multilayer import (
+    multilayer_guided_label_propagation,
+    make_multilayer_propagator,
+)
