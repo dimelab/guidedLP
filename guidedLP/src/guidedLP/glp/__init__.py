@@ -57,4 +57,5 @@ from .grid_search import (
 from .multilayer import (
     multilayer_guided_label_propagation,
     make_multilayer_propagator,
+    ensemble_multilayer_label_propagation,
 )

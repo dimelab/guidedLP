@@ -26,6 +26,8 @@ the rationale for the locked-in design choices.
 """
 
 import random
+import time as _time
+import warnings
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 import networkit as nk
@@ -1133,3 +1135,339 @@ def make_multilayer_propagator(
         )
 
     return propagator, union_mapper, anchor_graph
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 (post-v1, addresses v2 backlog "ensemble multilayer"):
+# bagging-style wrapper around multilayer_guided_label_propagation. Each
+# epoch resamples noise seeds with ``random_seed = base_seed + epoch_idx``
+# routed through :func:`_generate_union_noise_seeds`, then Welford-averages
+# the resulting F matrices. Mirrors :func:`ensemble_label_propagation`'s
+# conventions: ``n_epochs >= 2``, ``enable_noise_category=False`` short-
+# circuits to a single call with a warning, ``return_variance`` adds
+# ``{label}_prob_std`` columns. The auto-noise seeds are excluded from the
+# final ``is_seed`` flag (only the user's original seeds get ``True``).
+# ---------------------------------------------------------------------------
+
+
+def ensemble_multilayer_label_propagation(
+    layers: List[Tuple[nk.Graph, IDMapper]],
+    seed_labels: SeedInput,
+    labels: List[str],
+    *,
+    # Ensemble-specific
+    n_epochs: int = 10,
+    base_seed: int = 42,
+    return_variance: bool = False,
+    # Multilayer-specific
+    gammas: Optional[Sequence[float]] = None,
+    coupling: float = 0.3,
+    aggregation: Literal["weighted_mean", "mean", "max"] = "weighted_mean",
+    # GLP knobs
+    alpha: float = 0.85,
+    max_iterations: int = 100,
+    convergence_threshold: float = 1e-6,
+    normalize: bool = True,
+    enable_noise_category: bool = True,
+    noise_ratio: float = 0.1,
+    confidence_threshold: float = 0.0,
+    seed_node_col: str = "node_id",
+    seed_label_col: str = "label",
+    exclude_from_output: Optional[Set[Any]] = None,
+    verbose: bool = True,
+) -> Union[pl.DataFrame, Tuple[pl.DataFrame, pl.DataFrame]]:
+    """
+    Bagging-style multilayer GLP: average ``n_epochs`` runs with resampled noise.
+
+    Each epoch uses ``random_seed = base_seed + epoch_idx`` to draw a fresh
+    set of noise seeds from the union node space (via
+    :func:`_generate_union_noise_seeds`), feeds them as explicit seeds into
+    :func:`multilayer_guided_label_propagation`, and the resulting per-epoch
+    probability matrices are combined with Welford's online algorithm. This
+    is the multilayer analog of :func:`ensemble_label_propagation`'s
+    bagging-over-noise variance reduction.
+
+    Only meaningful when ``enable_noise_category=True`` — otherwise every
+    epoch produces an identical deterministic result. A warning is emitted
+    in that case and a single :func:`multilayer_guided_label_propagation`
+    run is returned instead.
+
+    Auto-noise seeds are **excluded from the output's ``is_seed`` column**
+    (only the user's original seeds get ``True``) so that per-epoch noise
+    sampling doesn't leak into the final result — matches the convention
+    in :func:`ensemble_label_propagation`.
+
+    Parameters
+    ----------
+    layers, seed_labels, labels
+        Same as :func:`multilayer_guided_label_propagation`.
+    n_epochs : int, default 10
+        Number of independent runs to average. Must be ``>= 2``.
+    base_seed : int, default 42
+        Each epoch ``i`` uses ``random_seed = base_seed + i``. Together with
+        ``n_epochs`` this makes the ensemble fully deterministic for a
+        given input.
+    return_variance : bool, default False
+        If True, return a ``(df, df_var)`` tuple. The variance DataFrame
+        has the same row order and a ``{label}_prob_std`` column per label
+        (sample standard deviation across epochs, Bessel-corrected).
+    gammas, coupling, aggregation, alpha, max_iterations, convergence_threshold,
+    normalize, enable_noise_category, noise_ratio, confidence_threshold,
+    seed_node_col, seed_label_col, exclude_from_output
+        Forwarded to :func:`multilayer_guided_label_propagation`.
+        ``confidence_threshold`` and ``exclude_from_output`` are applied
+        to the **averaged** result, not per epoch — excluded nodes still
+        participate in every epoch's propagation.
+    verbose : bool, default True
+        Print a one-line summary at completion.
+
+    Returns
+    -------
+    pl.DataFrame
+        Same schema as :func:`multilayer_guided_label_propagation`, with
+        ``{label}_prob`` columns holding averaged probabilities and
+        ``dominant_label`` / ``confidence`` recomputed from those averages.
+    Tuple[pl.DataFrame, pl.DataFrame]
+        ``(df, df_var)`` when ``return_variance=True``. ``df_var`` has
+        ``node_id`` plus ``{label}_prob_std`` columns.
+
+    Raises
+    ------
+    ValidationError
+        If ``n_epochs < 2``, plus all the validation cases inherited from
+        :func:`multilayer_guided_label_propagation`.
+
+    Notes
+    -----
+    - **Cost**: the supra-adjacency is currently rebuilt per epoch (inside
+      the per-epoch call to :func:`multilayer_guided_label_propagation`).
+      A future optimization could share it across epochs the way
+      :func:`ensemble_label_propagation` shares the transition matrix ``P``.
+    - **No threading**: epochs run serially. Single-layer ensemble uses a
+      ``ThreadPoolExecutor``; adding the same here is a small follow-up.
+    - **Reproducibility parity with single-layer ensemble**: both use the
+      ``base_seed + epoch_idx`` RNG derivation. *Bit-identical noise seed
+      draws* between single-layer and multilayer ensembles on the same
+      node set are **not** guaranteed because the two functions sample
+      from differently-ordered pools (single-layer samples internal IDs
+      from ``list(set(...))`` whose order is hash-bucket-dependent;
+      multilayer samples original IDs from ``sorted(...)``). Each ensemble
+      is independently reproducible for a given ``base_seed``.
+
+    Examples
+    --------
+    >>> # 20 noise-resampled runs with per-label std
+    >>> df, df_var = ensemble_multilayer_label_propagation(
+    ...     layers=[(g_url, m_url), (g_dom, m_dom)],
+    ...     seed_labels=seeds, labels=["left", "right"],
+    ...     n_epochs=20, return_variance=True,
+    ...     gammas=[1.0, 1.0], coupling=0.3,
+    ... )
+    """
+    _t_start = _time.perf_counter()
+
+    if not isinstance(n_epochs, int) or n_epochs < 2:
+        raise ValidationError(
+            f"n_epochs must be an integer >= 2 for ensembling, got {n_epochs}",
+            field="n_epochs",
+            value=n_epochs,
+            expected="integer >= 2",
+        )
+
+    # Short-circuit when noise resampling is disabled — ensembling identical
+    # runs has no variance-reduction benefit. Mirrors ensemble_label_propagation.
+    if not enable_noise_category:
+        warnings.warn(
+            "ensemble_multilayer_label_propagation with enable_noise_category=False "
+            f"produces {n_epochs} identical runs (no noise resampling to ensemble "
+            "over). Returning a single multilayer_guided_label_propagation run "
+            "instead. Pass enable_noise_category=True to get the bagging effect.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return multilayer_guided_label_propagation(
+            layers=layers, seed_labels=seed_labels, labels=labels,
+            gammas=gammas, coupling=coupling, aggregation=aggregation,
+            alpha=alpha, max_iterations=max_iterations,
+            convergence_threshold=convergence_threshold,
+            normalize=normalize, directional=False,
+            enable_noise_category=False, noise_ratio=noise_ratio,
+            confidence_threshold=confidence_threshold,
+            seed_node_col=seed_node_col, seed_label_col=seed_label_col,
+            random_seed=base_seed,
+            exclude_from_output=exclude_from_output,
+            verbose=verbose,
+        )
+
+    # ------------------------------------------------------------------
+    # Shared setup: build the union once and capture the user's original
+    # seeds. The supra-adjacency itself is still rebuilt per epoch inside
+    # multilayer_guided_label_propagation — see "Cost" in the docstring.
+    # ------------------------------------------------------------------
+    _validate_layers_input(layers)
+    union_mapper = _build_union_mapper(layers)
+
+    user_seed_dict = normalize_seed_input(seed_labels, seed_node_col, seed_label_col)
+    if not user_seed_dict:
+        raise ValidationError(
+            "seed_labels is empty after normalization",
+            field="seed_labels",
+        )
+    # Filter seeds not in any layer; per-epoch calls would each emit the
+    # same warning otherwise.
+    missing = [s for s in list(user_seed_dict.keys())
+               if not union_mapper.has_original(s)]
+    if missing:
+        for s in missing:
+            del user_seed_dict[s]
+        logger.warning(
+            "%d seed node(s) not found in any layer and were skipped "
+            "(first few: %s)", len(missing), missing[:5],
+        )
+    if not user_seed_dict:
+        raise ValidationError(
+            "None of the supplied seeds are present in any layer.",
+            field="seed_labels",
+        )
+    user_seed_ids = set(user_seed_dict.keys())
+
+    # Labels for the per-epoch run: extend with "noise" up front so the
+    # column order is stable across epochs and the per-epoch
+    # multilayer_guided_label_propagation call recognizes our pre-supplied
+    # noise seeds without auto-adding more.
+    processed_labels = list(labels)
+    if "noise" not in processed_labels:
+        processed_labels.append("noise")
+    label_cols = [f"{label}_prob" for label in processed_labels]
+
+    # ------------------------------------------------------------------
+    # Per-epoch loop. Welford-update mean (and m2 for variance) over
+    # the per-epoch F matrices.
+    # ------------------------------------------------------------------
+    mean_F: Optional[np.ndarray] = None
+    m2_F: Optional[np.ndarray] = None
+    node_ids: Optional[List[Any]] = None
+
+    with LoggingTimer(
+        f"ensemble_multilayer_label_propagation ({n_epochs} epochs)"
+    ):
+        for epoch_idx in range(n_epochs):
+            epoch_seed = base_seed + epoch_idx
+
+            # Sample THIS epoch's noise seeds against the union node space.
+            # Routed through _generate_union_noise_seeds with the
+            # base_seed + epoch_idx scheme for reproducibility parity with
+            # single-layer ensemble_label_propagation.
+            epoch_noise = _generate_union_noise_seeds(
+                union_mapper, user_seed_dict, noise_ratio,
+                random_seed=epoch_seed,
+            )
+            epoch_seed_dict = dict(user_seed_dict)
+            epoch_seed_dict.update(epoch_noise)
+
+            df_epoch = multilayer_guided_label_propagation(
+                layers=layers,
+                seed_labels=epoch_seed_dict,
+                labels=processed_labels,
+                gammas=gammas,
+                coupling=coupling,
+                aggregation=aggregation,
+                alpha=alpha,
+                max_iterations=max_iterations,
+                convergence_threshold=convergence_threshold,
+                normalize=normalize,
+                directional=False,
+                # Noise is supplied explicitly above; don't let the inner
+                # call sample more on top of ours.
+                enable_noise_category=False,
+                noise_ratio=noise_ratio,
+                # Apply at ensemble level, after averaging:
+                confidence_threshold=0.0,
+                exclude_from_output=None,
+                seed_node_col=seed_node_col,
+                seed_label_col=seed_label_col,
+                random_seed=epoch_seed,
+                verbose=False,
+            )
+
+            # Node ordering comes from _format_output's
+            # union_mapper.get_original_batch(range(N_union)) — deterministic
+            # across epochs since the union mapper is fixed.
+            if epoch_idx == 0:
+                node_ids = df_epoch["node_id"].to_list()
+
+            F_epoch = df_epoch.select(label_cols).to_numpy()
+
+            if epoch_idx == 0:
+                mean_F = F_epoch.copy()
+                m2_F = np.zeros_like(F_epoch) if return_variance else None
+            else:
+                # Welford online update; uses the 1-based count.
+                delta = F_epoch - mean_F
+                mean_F = mean_F + delta / (epoch_idx + 1)
+                if m2_F is not None:
+                    delta2 = F_epoch - mean_F
+                    m2_F = m2_F + delta * delta2
+
+    # ------------------------------------------------------------------
+    # Build the averaged-result DataFrame. Matches the schema of
+    # multilayer_guided_label_propagation. ``is_seed`` reflects only the
+    # user-supplied seeds (auto-noise seeds were epoch-local).
+    # ------------------------------------------------------------------
+    dominant_indices = np.argmax(mean_F, axis=1)
+    dominant_labels = [processed_labels[i] for i in dominant_indices]
+    confidence_scores = np.max(mean_F, axis=1)
+    is_seed = [nid in user_seed_ids for nid in node_ids]
+
+    result_data: Dict[str, Any] = {"node_id": node_ids}
+    for i, label in enumerate(processed_labels):
+        result_data[f"{label}_prob"] = mean_F[:, i].tolist()
+    result_data["dominant_label"] = dominant_labels
+    result_data["confidence"] = confidence_scores.tolist()
+    result_data["is_seed"] = is_seed
+
+    df = pl.DataFrame(result_data)
+
+    if confidence_threshold > 0.0:
+        n_uncertain = int((df["confidence"] < confidence_threshold).sum())
+        if n_uncertain > 0:
+            df = df.with_columns(
+                pl.when(pl.col("confidence") < confidence_threshold)
+                .then(pl.lit("uncertain"))
+                .otherwise(pl.col("dominant_label"))
+                .alias("dominant_label")
+            )
+
+    if exclude_from_output:
+        df = df.filter(~pl.col("node_id").is_in(list(exclude_from_output)))
+
+    df_var: Optional[pl.DataFrame] = None
+    if return_variance:
+        # Sample variance (Bessel-corrected) → standard deviation.
+        var_F = m2_F / max(n_epochs - 1, 1)
+        std_F = np.sqrt(var_F)
+        var_data: Dict[str, Any] = {"node_id": node_ids}
+        for i, label in enumerate(processed_labels):
+            var_data[f"{label}_prob_std"] = std_F[:, i].tolist()
+        df_var = pl.DataFrame(var_data)
+        if exclude_from_output:
+            df_var = df_var.filter(
+                ~pl.col("node_id").is_in(list(exclude_from_output))
+            )
+
+    if verbose:
+        total_edges = sum(g.numberOfEdges() for g, _ in layers)
+        dt = _time.perf_counter() - _t_start
+        print(
+            f"[ensemble_multilayer_glp] {dt:.2f}s | "
+            f"n_epochs={n_epochs} base_seed={base_seed} | "
+            f"layers={len(layers)} union_nodes={union_mapper.size():,} "
+            f"edges={total_edges:,} | "
+            f"alpha={alpha} coupling={coupling} aggregation={aggregation} | "
+            f"user_seeds={len(user_seed_ids)} labels={len(processed_labels)} "
+            f"return_variance={return_variance}"
+        )
+
+    if return_variance:
+        return df, df_var
+    return df
