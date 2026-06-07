@@ -197,13 +197,18 @@ output/
 results/
 plots/
 
+# Demo data (not for version control)
+demo_data/
+
 # Benchmark results
 benchmark_results/
 
 # Large test data
 tests/data/large/
 
-# Markdown files: ignore by default, only README.md (at any depth) may be pushed.
+# Markdown files: ignore by default, only README.md and documentation.md
+# (at any depth) may be pushed.
 # Add more exceptions below as needed (e.g. `!CONTRIBUTING.md`).
 *.md
 !README.md
+!documentation.md

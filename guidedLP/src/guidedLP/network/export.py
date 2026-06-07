@@ -344,6 +344,35 @@ def _export_empty_graph(output_path: str, format: str) -> None:
         pl.DataFrame({"source": [], "target": [], "weight": []}).write_parquet(f"{base_path}_edges.parquet")
 
 
+def _polars_dtype_to_gexf_type(dtype: Any) -> str:
+    """Map a Polars dtype to a GEXF attribute type string.
+
+    GEXF 1.2 supports: string, integer, long, float, double, boolean, anyURI,
+    liststring. We collapse signed/unsigned ints to ``integer`` (or ``long`` for
+    64-bit) and use ``double`` for both Float32/Float64.
+    """
+    if dtype == pl.Boolean:
+        return "boolean"
+    if dtype in (pl.Float32, pl.Float64):
+        return "double"
+    if dtype in (pl.Int64, pl.UInt64):
+        return "long"
+    if dtype in (pl.Int8, pl.Int16, pl.Int32, pl.UInt8, pl.UInt16, pl.UInt32):
+        return "integer"
+    return "string"
+
+
+def _format_gexf_value(value: Any, gexf_type: str) -> str:
+    """Format a single value for the GEXF ``attvalue`` attribute.
+
+    Booleans must be lowercase ``true``/``false`` per the GEXF spec; the default
+    ``str(True) == 'True'`` is rejected by strict parsers.
+    """
+    if gexf_type == "boolean":
+        return "true" if bool(value) else "false"
+    return str(value)
+
+
 def _export_gexf(
     graph: nk.Graph,
     id_mapper: IDMapper,
@@ -354,39 +383,48 @@ def _export_gexf(
     """Export graph to GEXF format."""
     # Create root GEXF element
     gexf = ET.Element("gexf", xmlns="http://www.gexf.net/1.2draft", version="1.2")
-    
+
     # Add meta information
     meta = ET.SubElement(gexf, "meta", lastmodifieddate=str(np.datetime64('today')))
     ET.SubElement(meta, "creator").text = "Guided Label Propagation Library"
     ET.SubElement(meta, "description").text = "Network exported from NetworkIt graph"
-    
+
     # Create graph element
     graph_elem = ET.SubElement(gexf, "graph", mode="static", defaultedgetype="directed" if graph.isDirected() else "undirected")
-    
-    # Define attributes for nodes
+
+    # Define attributes for nodes — infer GEXF type from each column's Polars
+    # dtype so Gephi loads numeric/boolean columns as their real types instead
+    # of falling back to string.
     attributes = ET.SubElement(graph_elem, "attributes", **{"class": "node"})
-    
+
     attr_id = 0
-    attr_map = {}
+    attr_map: Dict[str, str] = {}      # col -> attribute id (string)
+    attr_type: Dict[str, str] = {}     # col -> GEXF type string
+    schema = node_data.schema
     for col in node_data.columns:
         if col != "node_id":
-            attr_elem = ET.SubElement(attributes, "attribute", id=str(attr_id), title=col, type="string")
+            gtype = _polars_dtype_to_gexf_type(schema[col])
+            ET.SubElement(attributes, "attribute",
+                          id=str(attr_id), title=col, type=gtype)
             attr_map[col] = str(attr_id)
+            attr_type[col] = gtype
             attr_id += 1
-    
+
     # Add nodes
     nodes_elem = ET.SubElement(graph_elem, "nodes")
     for row in node_data.iter_rows(named=True):
         node_id = str(row["node_id"])
         node_elem = ET.SubElement(nodes_elem, "node", id=node_id, label=node_id)
-        
+
         # Add attributes
         if len(attr_map) > 0:
             attvalues = ET.SubElement(node_elem, "attvalues")
-            for col, attr_id in attr_map.items():
+            for col, aid in attr_map.items():
                 value = row.get(col)
                 if value is not None:
-                    ET.SubElement(attvalues, "attvalue", **{"for": attr_id, "value": str(value)})
+                    ET.SubElement(attvalues, "attvalue",
+                                  **{"for": aid,
+                                     "value": _format_gexf_value(value, attr_type[col])})
     
     # Add edges
     edges_elem = ET.SubElement(graph_elem, "edges")
