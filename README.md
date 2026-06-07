@@ -184,3 +184,17 @@ All attrs typed (`double` / `boolean` / `string`) → sliders + filters work dir
 - If you have very large data, you still need a large machine
 
 **See also** - 
+
+
+---
+
+<div align="center">
+
+## Guided Label Propagation
+
+<img src="README_files/Q612I5.png" alt="QR code" width="220" />
+
+**Jakob Bæk Kristensen**
+RUC Digital Media Lab
+
+</div>

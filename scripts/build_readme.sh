@@ -49,6 +49,25 @@ banner = """> 📓 **[View the full notebook (with code) →](Tool%20demo/glp_to
 if "View the full notebook" not in content:
     content = banner + content
 
+# 3. Footer (idempotent).
+footer = """
+
+---
+
+<div align="center">
+
+## Guided Label Propagation
+
+<img src="README_files/Q612I5.png" alt="QR code" width="220" />
+
+**Jakob Bæk Kristensen**
+RUC Digital Media Lab
+
+</div>
+"""
+if "RUC Digital Media Lab" not in content:
+    content = content + footer
+
 p.write_text(content)
 PY
 
